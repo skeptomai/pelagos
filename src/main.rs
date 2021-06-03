@@ -1,49 +1,52 @@
+#![crate_name = "remora"]
+
 use core::panic;
 use std::env::args;
 use std::ffi::CString;
 use std::ptr;
-use unshare::{Command, Stdio};
 
-fn fork_exec() {
-    let self_exe= palaver::env::exe_path();
+use unshare::{Child, Command, Error, Stdio};
+
+/// Not really 'fork_exec' but plays the role here
+fn fork_exec() -> Result<Child, Error> {
+    let self_exe = palaver::env::exe_path();
     let new_args: Vec<_> = std::env::args_os().skip(1).collect();
-    let _child_self_status = Command::new(self_exe.unwrap())
+    Command::new(self_exe.unwrap())
         .args(&new_args)
         .arg0("child")
-        .unshare([unshare::Namespace::Uts, 
-                unshare::Namespace::Pid].iter())
+        .unshare([unshare::Namespace::Uts, unshare::Namespace::Pid].iter())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .status()
-        .expect("Failed to execute command");
+        .spawn()
 }
 
-fn mount_proc() -> std::io::Result<()>{
+/// callback that mounts a new proc filesystem
+/// this cannot allocate
+fn mount_proc() -> std::io::Result<()> {
     let c_to_print = CString::new("proc")?;
-    unsafe {libc::mount(c_to_print.as_ptr(),
-        c_to_print.as_ptr(), 
-        c_to_print.as_ptr(),
-        0, 
-        ptr::null());}
+    unsafe {
+        libc::mount(
+            c_to_print.as_ptr(),
+            c_to_print.as_ptr(),
+            c_to_print.as_ptr(),
+            0,
+            ptr::null(),
+        );
+    }
     Ok(())
 }
 
-fn child() {
+/// launch actual child process in new uts and pid namespaces
+/// with chroot and new proc filesystem
+fn child() -> Result<Child, Error> {
     unsafe {
-        let command_launch_status = Command::new(args().nth(1).unwrap())
-            .unshare([unshare::Namespace::Uts, 
-                    unshare::Namespace::Pid].iter())
+        Command::new(args().nth(1).unwrap())
+            .unshare([unshare::Namespace::Uts, unshare::Namespace::Pid].iter())
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .chroot_dir("/home/rootfs")
             .pre_exec(mount_proc)
-            .status()
-            .expect("Failed to execute command");
-
-        match command_launch_status.code() {
-            Some(code) => println!("Exited with status code: {}", code),
-            None => println!("Process terminated by signal"),
-        }    
+            .spawn()
     }
 }
 
@@ -54,17 +57,25 @@ fn main() {
         panic!("Not enough argument supplied.  Gotta run something!")
     }
 
+    // first launch is normal exe with process name
+    // second launch is a spawn of same exe with 'child' as argv[0]
     match args().nth(0).as_deref() {
         Some("child") => {
             println!("CHILD: {}", std::process::id());
-            child();
-        },
+            panic_spawn(&child);
+        }
         Some(_) => {
-            println!("PARENT: {}", std::process::id());            
-            fork_exec();
-        },
+            println!("PARENT: {}", std::process::id());
+            panic_spawn(&fork_exec);
+        }
         _ => {
             panic!("NEITHER PARENT NOR CHILD?");
         }
     }
+}
+
+fn panic_spawn(p: &(dyn Fn() -> Result<Child, Error>)) {
+    p().expect("failed to fork child")
+        .wait()
+        .expect("failed to wait for child to exit");
 }
