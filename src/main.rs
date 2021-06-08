@@ -94,7 +94,7 @@ fn main() {
 
 fn panic_spawn<I>(
     which: &'static str,
-    p: fn(PathBuf, I) -> Result<Child, Error>,
+    p: impl Fn(PathBuf, I) -> Result<Child, Error>,
     to_run: PathBuf,
     args: I,
 ) where
