@@ -2,19 +2,14 @@
 
 use core::panic;
 use std::env::args;
-use std::env::ArgsOs;
 use std::ffi::CString;
 use std::ffi::OsString;
-use std::iter::Skip;
 use std::path::PathBuf;
 use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
-fn fork_exec<'a, I>(to_run: PathBuf, args: I) -> Result<Child, Error>
-where
-    I: Iterator<Item = OsString>,
-{
-    let new_args: Vec<_> = args.collect();
+fn fork_exec(to_run: PathBuf, args: impl IntoIterator<Item = OsString>) -> Result<Child, Error> {
+    let new_args: Vec<_> = args.into_iter().collect();
     println!("fork exec to_run: {:?}, args: {:?}", to_run, new_args);
     Command::new(to_run)
         .args(&new_args)
@@ -48,12 +43,9 @@ where
 
 /// launch actual child process in new uts and pid namespaces
 /// with chroot and new proc filesystem
-fn child<'a, I>(to_run: PathBuf, args: I) -> Result<Child, Error>
-where
-    I: Iterator<Item = OsString>,
-{
+fn child(to_run: PathBuf, args: impl IntoIterator<Item = OsString>) -> Result<Child, Error> {
     unsafe {
-        let new_args: Vec<_> = args.collect();
+        let new_args: Vec<_> = args.into_iter().collect();
         println!("child to_run: {:?}, new args: {:?}", to_run, new_args);
         Command::new(to_run)
             .args(&new_args)
@@ -81,7 +73,7 @@ fn main() {
             let new_args = std::env::args_os().skip(2);
             panic_spawn(
                 "child",
-                &child,
+                child,
                 PathBuf::from(args().nth(1).unwrap()),
                 new_args,
             );
@@ -92,7 +84,7 @@ fn main() {
 
             let self_exe = palaver::env::exe_path().unwrap();
             let new_args = std::env::args_os().skip(1);
-            panic_spawn("fork exec", &fork_exec, self_exe, new_args);
+            panic_spawn("fork exec", fork_exec, self_exe, new_args);
         }
         _ => {
             panic!("NEITHER PARENT NOR CHILD?");
@@ -100,12 +92,14 @@ fn main() {
     }
 }
 
-fn panic_spawn(
+fn panic_spawn<I>(
     which: &'static str,
-    p: &(dyn Fn(PathBuf, Skip<ArgsOs>) -> Result<Child, Error>),
+    p: fn(PathBuf, I) -> Result<Child, Error>,
     to_run: PathBuf,
-    args: Skip<ArgsOs>,
-) {
+    args: I,
+) where
+    I: IntoIterator<Item = OsString>,
+{
     println!("spawning '{}'", which);
     p(to_run, args)
         .expect(format!("panicking on {}", which).as_str())
