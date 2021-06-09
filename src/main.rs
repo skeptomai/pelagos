@@ -1,14 +1,21 @@
 #![crate_name = "remora"]
 
 use core::panic;
+use libc::{gid_t, uid_t};
 use std::env::args;
+use std::env::current_dir;
 use std::ffi::CString;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
-fn fork_exec(to_run: PathBuf, args: impl IntoIterator<Item = OsString>) -> Result<Child, Error> {
+fn fork_exec(
+    to_run: PathBuf,
+    args: impl IntoIterator<Item = OsString>,
+    uid_parent: uid_t,
+    gid_parent: gid_t,
+) -> Result<Child, Error> {
     let new_args: Vec<_> = args.into_iter().collect();
     println!("fork exec to_run: {:?}, args: {:?}", to_run, new_args);
     Command::new(to_run)
@@ -27,12 +34,12 @@ fn fork_exec(to_run: PathBuf, args: impl IntoIterator<Item = OsString>) -> Resul
         .set_id_maps(
             vec![UidMap {
                 inside_uid: 0,
-                outside_uid: 1000,
+                outside_uid: uid_parent,
                 count: 1,
             }],
             vec![GidMap {
                 inside_gid: 0,
-                outside_gid: 1000,
+                outside_gid: gid_parent,
                 count: 1,
             }],
         )
@@ -43,23 +50,29 @@ fn fork_exec(to_run: PathBuf, args: impl IntoIterator<Item = OsString>) -> Resul
 
 /// launch actual child process in new uts and pid namespaces
 /// with chroot and new proc filesystem
-fn child(to_run: PathBuf, args: impl IntoIterator<Item = OsString>) -> Result<Child, Error> {
+fn child(
+    to_run: PathBuf,
+    args: impl IntoIterator<Item = OsString>,
+    uid_parent: uid_t,
+    gid_parent: gid_t,
+) -> Result<Child, Error> {
     unsafe {
         let new_args: Vec<_> = args.into_iter().collect();
         println!("child to_run: {:?}, new args: {:?}", to_run, new_args);
+        let mut curdir = current_dir().unwrap();
+        curdir.push("alpine-rootfs");
         Command::new(to_run)
             .args(&new_args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .chroot_dir("/home/rootfs")
+            .chroot_dir(curdir)
             .pre_exec(&mount_proc)
-            .uid(0)
-            .gid(0)
+            .uid(uid_parent)
+            .gid(gid_parent)
             .spawn()
     }
 }
-
 fn main() {
     println!("Entering main!");
 
@@ -67,41 +80,57 @@ fn main() {
         panic!("Not enough arguments supplied.  Gotta run something!")
     }
 
-    match args().nth(0).as_deref() {
-        Some("child") => {
-            println!("CHILD: {}", std::process::id());
-            let new_args = std::env::args_os().skip(2);
-            panic_spawn(
-                "child",
-                child,
-                PathBuf::from(args().nth(1).unwrap()),
-                new_args,
-            );
-        }
-        Some(_) => {
-            println!("PARENT: {}", std::process::id());
-            println!("Gonna run '{:?}'", args());
+    unsafe {
+        let uid_parent = libc::getuid();
+        let gid_parent = libc::getgid();
 
-            let self_exe = palaver::env::exe_path().unwrap();
-            let new_args = std::env::args_os().skip(1);
-            panic_spawn("fork exec", fork_exec, self_exe, new_args);
-        }
-        _ => {
-            panic!("NEITHER PARENT NOR CHILD?");
+        match args().nth(0).as_deref() {
+            Some("child") => {
+                println!("CHILD: {}", std::process::id());
+                let new_args = std::env::args_os().skip(2);
+                panic_spawn(
+                    "child",
+                    child,
+                    PathBuf::from(args().nth(1).unwrap()),
+                    new_args,
+                    uid_parent,
+                    gid_parent,
+                );
+            }
+            Some(_) => {
+                println!("PARENT: {}", std::process::id());
+                println!("Gonna run '{:?}'", args());
+
+                let self_exe = palaver::env::exe_path().unwrap();
+                let new_args = std::env::args_os().skip(1);
+                panic_spawn(
+                    "fork exec",
+                    fork_exec,
+                    self_exe,
+                    new_args,
+                    uid_parent,
+                    gid_parent,
+                );
+            }
+            _ => {
+                panic!("NEITHER PARENT NOR CHILD?");
+            }
         }
     }
 }
 
 fn panic_spawn<I>(
     which: &'static str,
-    p: impl Fn(PathBuf, I) -> Result<Child, Error>,
+    p: impl Fn(PathBuf, I, uid_t, gid_t) -> Result<Child, Error>,
     to_run: PathBuf,
     args: I,
+    uid_parent: uid_t,
+    gid_parent: gid_t,
 ) where
     I: IntoIterator<Item = OsString>,
 {
     println!("spawning '{}'", which);
-    p(to_run, args)
+    p(to_run, args, uid_parent, gid_parent)
         .expect(format!("panicking on {}", which).as_str())
         .wait()
         .expect(format!("failed to wait for {} to exit", which).as_str());
