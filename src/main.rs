@@ -6,6 +6,7 @@ use std::env::args;
 use std::env::current_dir;
 use std::ffi::CString;
 use std::ffi::OsString;
+use std::fs::read_link;
 use std::path::PathBuf;
 use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
@@ -17,7 +18,9 @@ fn fork_exec(
     gid_parent: gid_t,
 ) -> Result<Child, Error> {
     let new_args: Vec<_> = args.into_iter().collect();
-    println!("fork exec to_run: {:?}, args: {:?}", to_run, new_args);
+    let exe_path = read_link(to_run.as_path()).unwrap();
+    println!("fork exec to_run: {:?}, args: {:?}", exe_path, new_args);
+    unsafe {
     Command::new(to_run)
         .args(&new_args)
         .arg0("child")
@@ -28,6 +31,7 @@ fn fork_exec(
                 unshare::Namespace::Uts,
                 unshare::Namespace::Mount,
                 unshare::Namespace::Pid,
+                unshare::Namespace::Cgroup,
             ]
             .iter(),
         )
@@ -46,7 +50,21 @@ fn fork_exec(
         .uid(0)
         .gid(0)
         .spawn()
+    }
 }
+
+/* NOTE: do these in the alpine make rootfs instead?
+
+mknod -m 666 ${chroot_dir}/dev/full c 1 7
+mknod -m 666 ${chroot_dir}/dev/ptmx c 5 2
+mknod -m 644 ${chroot_dir}/dev/random c 1 8
+mknod -m 644 ${chroot_dir}/dev/urandom c 1 9
+mknod -m 666 ${chroot_dir}/dev/zero c 1 5
+mknod -m 666 ${chroot_dir}/dev/tty c 5 0
+
+mount -t proc none ${chroot_dir}/proc
+mount -o bind /sys ${chroot_dir}/sys
+*/
 
 /// launch actual child process in new uts and pid namespaces
 /// with chroot and new proc filesystem
@@ -140,11 +158,12 @@ fn panic_spawn<I>(
 /// this cannot allocate
 fn mount_proc() -> std::io::Result<()> {
     unsafe {
-        let c_to_print = CString::new("proc")?;
+        let proc_str = CString::new("proc")?;
+        let proc_str_ptr = proc_str.as_ptr();
         match libc::mount(
-            c_to_print.as_ptr(),
-            c_to_print.as_ptr(),
-            c_to_print.as_ptr(),
+            proc_str_ptr,
+            proc_str_ptr,
+            proc_str_ptr,
             0,
             ptr::null(),
         ) {
@@ -152,4 +171,56 @@ fn mount_proc() -> std::io::Result<()> {
             _ => Err(std::io::Error::last_os_error()),
         }
     }
+}
+
+#[allow(dead_code)]
+fn mount_cgroup() -> std::io::Result<()> {
+    unsafe {
+        let cgroups_str = CString::new("sys/fs/cgroup")?;
+        let src_str = "cgroup_root";
+        let fs_type_str = "cgroup";
+        let cgroups_str_ptr = cgroups_str.as_ptr();
+        let src_str_ptr = src_str.as_ptr();
+        let fs_type_str_ptr = fs_type_str.as_ptr();
+        match libc::mount(
+            src_str_ptr,
+            cgroups_str_ptr,
+            fs_type_str_ptr,
+            0,
+            ptr::null(),
+        ) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn mount_sys() -> std::io::Result<()> {
+    unsafe {
+        let sysfs_str = CString::new("sys")?;
+        let src_str = "/home/christopherbrown/Projects/remora/alpine-rootfs/sys";
+        let fs_type_str = "sysfs";
+        let sysfs_str_ptr = sysfs_str.as_ptr();
+        let src_str_ptr = src_str.as_ptr();
+        let fs_type_str_ptr = fs_type_str.as_ptr();
+        match libc::mount(
+            src_str_ptr,
+            sysfs_str_ptr,
+            fs_type_str_ptr,
+            0,
+            ptr::null(),
+        ) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn mounts() -> std::io::Result<()> {
+    mount_proc()?;
+    //mount_cgroup()?;
+    mount_sys()?;
+    Ok(())
 }
