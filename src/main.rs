@@ -1,6 +1,7 @@
 #![crate_name = "remora"]
 
 use core::panic;
+use libc::{MS_SHARED, MS_REC, MS_BIND};
 use libc::{gid_t, uid_t};
 use std::env::args;
 use std::env::current_dir;
@@ -10,6 +11,7 @@ use std::fs::read_link;
 use std::path::PathBuf;
 use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
+//use sys_mount::{Mount, MountFlags, SupportedFilesystems};
 
 fn fork_exec(
     to_run: PathBuf,
@@ -20,7 +22,6 @@ fn fork_exec(
     let new_args: Vec<_> = args.into_iter().collect();
     let exe_path = read_link(to_run.as_path()).unwrap();
     println!("fork exec to_run: {:?}, args: {:?}", exe_path, new_args);
-    unsafe {
     Command::new(to_run)
         .args(&new_args)
         .arg0("child")
@@ -50,7 +51,6 @@ fn fork_exec(
         .uid(0)
         .gid(0)
         .spawn()
-    }
 }
 
 /* NOTE: do these in the alpine make rootfs instead?
@@ -118,6 +118,7 @@ fn main() {
             Some(_) => {
                 println!("PARENT: {}", std::process::id());
                 println!("Gonna run '{:?}'", args());
+                mount_sys().unwrap();
 
                 let self_exe = palaver::env::exe_path().unwrap();
                 let new_args = std::env::args_os().skip(1);
@@ -186,7 +187,7 @@ fn mount_cgroup() -> std::io::Result<()> {
             src_str_ptr,
             cgroups_str_ptr,
             fs_type_str_ptr,
-            0,
+            libc::MS_BIND,
             ptr::null(),
         ) {
             0 => Ok(()),
@@ -198,17 +199,23 @@ fn mount_cgroup() -> std::io::Result<()> {
 #[allow(dead_code)]
 fn mount_sys() -> std::io::Result<()> {
     unsafe {
-        let sysfs_str = CString::new("sys")?;
-        let src_str = "/home/christopherbrown/Projects/remora/alpine-rootfs/sys";
-        let fs_type_str = "sysfs";
-        let sysfs_str_ptr = sysfs_str.as_ptr();
-        let src_str_ptr = src_str.as_ptr();
+        let src_str = CString::new("/sys")?;
+        let _src_str_ptr = src_str.as_ptr();
+        println!("source is {:?}", src_str);
+
+        let target_str = CString::new("/home/christopherbrown/Projects/remora/alpine-rootfs/sys")?;
+        let target_str_ptr = target_str.as_ptr();
+        println!("target is {:?}", target_str);
+
+        let fs_type_str = CString::new("sysfs")?;
         let fs_type_str_ptr = fs_type_str.as_ptr();
+        println!("fs_type is {:?}", fs_type_str);
+
         match libc::mount(
-            src_str_ptr,
-            sysfs_str_ptr,
+            _src_str_ptr,
+            target_str_ptr,
             fs_type_str_ptr,
-            0,
+            MS_BIND | MS_SHARED | MS_REC,
             ptr::null(),
         ) {
             0 => Ok(()),
