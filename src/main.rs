@@ -11,7 +11,11 @@ use std::fs::read_link;
 use std::path::PathBuf;
 use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
-//use sys_mount::{Mount, MountFlags, SupportedFilesystems};
+
+const ALPINE_ROOTFS : &str = "alpine-rootfs";
+const ALPINE_SYS : &str = "/home/christopherbrown/Projects/remora/alpine-rootfs/sys";
+const SYSFS : &str = "sysfs";
+const USERNAME : &str = "christopherbrown";
 
 fn fork_exec(
     to_run: PathBuf,
@@ -78,7 +82,7 @@ fn child(
         let new_args: Vec<_> = args.into_iter().collect();
         println!("child to_run: {:?}, new args: {:?}", to_run, new_args);
         let mut curdir = current_dir().unwrap();
-        curdir.push("alpine-rootfs");
+        curdir.push(ALPINE_ROOTFS);
         Command::new(to_run)
             .args(&new_args)
             .stdin(Stdio::inherit())
@@ -99,11 +103,20 @@ fn main() {
     }
 
     unsafe {
-        let uid_parent = libc::getuid();
-        let gid_parent = libc::getgid();
+        let u_name =  CString::new(USERNAME).unwrap();
+        let u_name_ptr = u_name.as_ptr();
+        let passwd = libc::getpwnam(u_name_ptr);
+        let pw_uid = (*passwd).pw_uid;
+        let pw_gid = (*passwd).pw_gid;
+
+
+        println!("uid: {}, gid: {}", pw_uid, pw_gid);
 
         match args().nth(0).as_deref() {
             Some("child") => {
+                let pw_uid = libc::getuid();
+                let pw_gid = libc::getgid();
+
                 println!("CHILD: {}", std::process::id());
                 let new_args = std::env::args_os().skip(2);
                 panic_spawn(
@@ -111,8 +124,8 @@ fn main() {
                     child,
                     PathBuf::from(args().nth(1).unwrap()),
                     new_args,
-                    uid_parent,
-                    gid_parent,
+                    pw_uid,
+                    pw_gid,
                 );
             }
             Some(_) => {
@@ -127,8 +140,8 @@ fn main() {
                     fork_exec,
                     self_exe,
                     new_args,
-                    uid_parent,
-                    gid_parent,
+                    pw_uid,
+                    pw_gid,
                 );
             }
             _ => {
@@ -196,18 +209,17 @@ fn mount_cgroup() -> std::io::Result<()> {
     }
 }
 
-#[allow(dead_code)]
 fn mount_sys() -> std::io::Result<()> {
     unsafe {
         let src_str = CString::new("/sys")?;
         let _src_str_ptr = src_str.as_ptr();
         println!("source is {:?}", src_str);
 
-        let target_str = CString::new("/home/christopherbrown/Projects/remora/alpine-rootfs/sys")?;
+        let target_str = CString::new(ALPINE_SYS)?;
         let target_str_ptr = target_str.as_ptr();
         println!("target is {:?}", target_str);
 
-        let fs_type_str = CString::new("sysfs")?;
+        let fs_type_str = CString::new(SYSFS)?;
         let fs_type_str_ptr = fs_type_str.as_ptr();
         println!("fs_type is {:?}", fs_type_str);
 
