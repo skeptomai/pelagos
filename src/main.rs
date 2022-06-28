@@ -117,7 +117,7 @@ fn main() {
                 let pw_uid = libc::getuid();
                 let pw_gid = libc::getgid();
 
-                println!("CHILD: {}", std::process::id());
+                println!("PID of CHILD: {}", std::process::id());
                 let new_args = std::env::args_os().skip(2);
                 panic_spawn(
                     "child",
@@ -129,8 +129,8 @@ fn main() {
                 );
             }
             Some(_) => {
-                println!("PARENT: {}", std::process::id());
-                println!("Gonna run '{:?}'", args());
+                println!("PID of PARENT: {}", std::process::id());
+                println!("Child to run: '{:?}'", args());
                 mount_sys().unwrap();
 
                 let self_exe = palaver::env::exe_path().unwrap();
