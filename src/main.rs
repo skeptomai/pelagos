@@ -14,9 +14,11 @@ use std::ptr;
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
 const ALPINE_ROOTFS : &str = "alpine-rootfs";
-const ALPINE_SYS : &str = "/home/christopherbrown/Projects/remora/alpine-rootfs/sys";
+#[allow(dead_code)]
+const ALPINE_SYS : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys";
+#[allow(dead_code)]
 const SYSFS : &str = "sysfs";
-const USERNAME : &str = "christopherbrown";
+const USERNAME : &str = "vagrant";
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -101,7 +103,7 @@ fn child(
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .chroot_dir(curdir)
-            .pre_exec(&mount_proc)
+            .pre_exec(&mounts)
             .uid(uid_parent)
             .gid(gid_parent)
             .spawn()
@@ -141,9 +143,8 @@ fn main() {
             }
             "" => {
                 println!("PID of PARENT: {}", std::process::id());
-                //mount_sys().unwrap();
+                mount_sys().unwrap();                
                 //mount_cgroup().unwrap();
-                
 
                 let self_exe = palaver::env::exe_path().unwrap();
                 let mut new_args : Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -226,6 +227,7 @@ fn mount_cgroup() -> std::io::Result<()> {
     }
 }
 
+#[allow(dead_code)]
 fn mount_sys() -> std::io::Result<()> {
     unsafe {
         let src_str = CString::new("/sys")?;
@@ -256,7 +258,7 @@ fn mount_sys() -> std::io::Result<()> {
 #[allow(dead_code)]
 fn mounts() -> std::io::Result<()> {
     mount_proc()?;
-    mount_cgroup()?;
-    mount_sys()?;
+    //mount_cgroup()?;
+    //mount_sys()?;
     Ok(())
 }

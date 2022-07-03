@@ -1,0 +1,6 @@
+Current state of affairs
+1. Can mount sys, but from 'above', i.e. before even pre_exec
+2. requires root to mount sys
+3. Currently doesn't unmount when it exits...
+4. Can't get cgroups to work... was it working before?
+5.
