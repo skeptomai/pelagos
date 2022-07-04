@@ -103,7 +103,7 @@ fn child(
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .chroot_dir(curdir)
-            .pre_exec(&mounts)
+            .pre_exec(&mount_proc)
             .uid(uid_parent)
             .gid(gid_parent)
             .spawn()
@@ -143,7 +143,7 @@ fn main() {
             }
             "" => {
                 println!("PID of PARENT: {}", std::process::id());
-                mount_sys().unwrap();                
+                //mount_sys().unwrap();                
                 //mount_cgroup().unwrap();
 
                 let self_exe = palaver::env::exe_path().unwrap();
@@ -160,6 +160,11 @@ fn main() {
                     pw_uid,
                     pw_gid,
                 );
+                
+//                match umount_sys() {
+//                    Ok(_) => println!("unmounted sys"),
+//                    Err(e) => println!("failed to unmount sys {:?}",e)
+//                }
             },
             _ => { panic!("didn't understand command line");}
         }
@@ -256,9 +261,15 @@ fn mount_sys() -> std::io::Result<()> {
 }
 
 #[allow(dead_code)]
-fn mounts() -> std::io::Result<()> {
-    mount_proc()?;
-    //mount_cgroup()?;
-    //mount_sys()?;
-    Ok(())
+fn umount_sys() -> std::io::Result<()> {
+    let target_str = CString::new(ALPINE_SYS)?;
+    let target_str_ptr = target_str.as_ptr();
+    println!("target is {:?}", target_str);
+
+    unsafe {
+        match libc::umount(target_str_ptr) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
 }
