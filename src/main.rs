@@ -4,6 +4,7 @@
 use clap::Parser;
 use core::{ffi::CStr, panic};
 use libc::{MS_BIND, gid_t, uid_t};
+use log::{info};
 use std::{str::FromStr, env::current_dir, ffi::{CString,OsString}, fs::read_link, path::PathBuf, ptr};
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 
@@ -33,7 +34,7 @@ fn fork_exec(
 ) -> Result<Child, Error> {
     let new_args: Vec<_> = args.into_iter().collect();
     let exe_path = read_link(to_run.as_path()).unwrap();
-    println!("fork exec to_run: {:?}, args: {:?}", exe_path, new_args);
+    info!("fork exec to_run: {:?}, args: {:?}", exe_path, new_args);
     Command::new(exe_path.as_os_str())
         .args(&new_args)
         .arg0(exe_path.as_os_str())
@@ -88,7 +89,7 @@ fn child(
 ) -> Result<Child, Error> {
     unsafe {
         let new_args: Vec<OsString> = vec![];
-        println!("child to_run: {:?}, new args: {:?}", to_run, new_args);
+        info!("child to_run: {:?}, new args: {:?}", to_run, new_args);
         let mut curdir = current_dir().unwrap();
         curdir.push(ALPINE_ROOTFS);
         Command::new(to_run)
@@ -104,30 +105,30 @@ fn child(
     }
 }
 fn main() {
-    println!("Entering main!");
+    env_logger::init();
+    info!("Entering main!");
     let cur_dir = std::env::current_dir().unwrap();
-    println!("current dir: {:?}", cur_dir);
+    info!("current dir: {:?}", cur_dir);
 
     let clap_args = Args::parse();
-    println!("args: {:?}", clap_args);
+    info!("args: {:?}", clap_args);
 
     unsafe {
         let u_name =  CString::new(USERNAME).unwrap();
-        let u_name_ptr = u_name.as_ptr();
-        let passwd = libc::getpwnam(u_name_ptr);
+        let passwd = libc::getpwnam(u_name.as_ptr());
         let pw_uid = (*passwd).pw_uid;
         let pw_gid = (*passwd).pw_gid;
 
-        println!("uid: {}, gid: {}", pw_uid, pw_gid);
+        info!("Before match for parent or child: uid: {}, gid: {}", pw_uid, pw_gid);
 
         match clap_args.forked.as_str() {
             "child" => {
                 let pw_uid = libc::getuid();
                 let pw_gid = libc::getgid();
-
-                println!("PID of CHILD: {}", std::process::id());
+                info!("match for child: uid: {}, gid: {}", pw_uid, pw_gid);
+                info!("PID of CHILD: {}", std::process::id());
                 let new_args = std::env::args_os();
-                println!("new args in child: {:?}", new_args);                
+                info!("new args in child: {:?}", new_args);                
                 panic_spawn(
                     "child",
                     child,
@@ -138,7 +139,7 @@ fn main() {
                 );
             }
             "" => {
-                println!("PID of PARENT: {}", std::process::id());
+                info!("PID of PARENT: {}", std::process::id());
 
                 let mut path = PathBuf::new();
                 path.push(std::env::current_dir().unwrap());
@@ -147,15 +148,15 @@ fn main() {
                 let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
                 
                 match mount_sys(sys_mount.as_ref()) {
-                    Ok(_) => println!("mounted sys"),
-                    Err(e) => println!("failed to mount sys: {:?}", e)
+                    Ok(_) => info!("mounted sys"),
+                    Err(e) => info!("failed to mount sys: {:?}", e)
                 }
 
                 let self_exe = palaver::env::exe_path().unwrap();
                 let mut new_args : Vec<OsString> = std::env::args_os().skip(1).collect();
                 new_args.push(OsString::from_str("--forked").unwrap());
                 new_args.push(OsString::from_str("child").unwrap());
-                println!("new args: {:?}", new_args);
+                info!("new args: {:?}", new_args);
                 
                 panic_spawn(
                     "fork exec",
@@ -167,8 +168,8 @@ fn main() {
                 );
                 
                 match umount_sys(sys_mount.as_ref()) {
-                    Ok(_) => println!("unmounted sys"),
-                    Err(e) => println!("failed to unmount sys {:?}",e)
+                    Ok(_) => info!("unmounted sys"),
+                    Err(e) => info!("failed to unmount sys {:?}",e)
                 }
             },
             _ => { panic!("didn't understand command line");}
@@ -186,7 +187,7 @@ fn panic_spawn<I>(
 ) where
     I: IntoIterator<Item = OsString>,
 {
-    println!("spawning '{}'", which);
+    info!("spawning '{}'", which);
     p(to_run, args, uid_parent, gid_parent)
         .expect(format!("panicking on {}", which).as_str())
         .wait()
@@ -216,9 +217,9 @@ fn mount_proc() -> std::io::Result<()> {
 fn mount_cgroup() -> std::io::Result<()> {
     unsafe {
         let src_str = "cgroup_root";
-        println!("source is {:?}", src_str);        
+        info!("source is {:?}", src_str);        
         let fs_type_str = "cgroup";
-        println!("fs_type is {:?}", fs_type_str);        
+        info!("fs_type is {:?}", fs_type_str);        
         let cgroups_str = CString::new(ALPINE_CGROUP)?;        
         let cgroups_str_ptr = cgroups_str.as_ptr();
         let src_str_ptr = src_str.as_ptr();
@@ -241,12 +242,12 @@ fn mount_sys(target_str: &CStr) -> std::io::Result<()> {
     let src_str = CString::new("/sys").unwrap();
     unsafe {
         let src_str_ptr = src_str.as_ptr();
-        println!("source is {:?}", src_str);
+        info!("source is {:?}", src_str);
         let target_str_ptr = target_str.as_ptr();
-        println!("target is {:?}", target_str);
+        info!("target is {:?}", target_str);
         let fs_type_str = CString::new(SYSFS)?;
         let fs_type_str_ptr = fs_type_str.as_ptr();
-        println!("fs_type is {:?}", fs_type_str);
+        info!("fs_type is {:?}", fs_type_str);
 
         match libc::mount(
             src_str_ptr,
@@ -278,13 +279,13 @@ fn umount_sys(sys_mount: &CStr) -> std::io::Result<()> {
 #[allow(dead_code)]
 fn mounts() -> std::io::Result<()> {
     match mount_proc() {
-        Ok(_) => println!("mounted proc"),
-        Err(e) => println!("failed to mount sys {:?}",e)
+        Ok(_) => info!("mounted proc"),
+        Err(e) => info!("failed to mount sys {:?}",e)
     }
 
     match mount_cgroup() {
-        Ok(_) => println!("mounted cgroup"),
-        Err(e) => println!("failed to mount cgroup {:?}",e)        
+        Ok(_) => info!("mounted cgroup"),
+        Err(e) => info!("failed to mount cgroup {:?}",e)        
     }
     Ok(())
 }
