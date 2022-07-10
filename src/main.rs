@@ -172,9 +172,9 @@ fn mount_proc() -> std::io::Result<()> {
 #[allow(dead_code)]
 fn mount_cgroup() -> std::io::Result<()> {
     unsafe {
-        let src_str = "cgroup_root";
+        let src_str = CString::new("cgroup_root")?;
         info!("source is {:?}", src_str);        
-        let fs_type_str = "cgroup";
+        let fs_type_str = CString::new("cgroup")?;
         info!("fs_type is {:?}", fs_type_str);        
         let cgroups_str = CString::new(ALPINE_CGROUP)?;        
         let cgroups_str_ptr = cgroups_str.as_ptr();
