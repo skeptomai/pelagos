@@ -19,6 +19,10 @@ struct Args {
     rootfs: String,
     #[clap(short, long)]
     exe: String,
+    #[clap(short, long)]
+    uid: u32,
+    #[clap(short, long)]
+    gid: u32,    
 }
 
 /* NOTE: do these in the alpine make rootfs instead?
@@ -89,37 +93,34 @@ fn main() {
     let clap_args = Args::parse();
     info!("args: {:?}", clap_args);
 
-    unsafe {
-        let p_uid = libc::getuid();
-        let p_gid = libc::getgid();
-
-        let mut path = PathBuf::new();
-        path.push(std::env::current_dir().unwrap());
-        path.push(clap_args.rootfs);
-        path.push(r"sys");
-        let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
-        
-        match mount_sys(sys_mount.as_ref()) {
-            Ok(_) => info!("mounted sys"),
-            Err(e) => info!("failed to mount sys: {:?}", e)
-        }
-        
-        let new_args : Vec<OsString> = vec![];
-        let thing_to_launch = &clap_args.exe.as_str();
-        panic_spawn(
-            thing_to_launch,
-            child,
-            PathBuf::from(thing_to_launch),
-            new_args,
-            p_uid,
-            p_gid,
-        );
-        
-        match umount_sys(sys_mount.as_ref()) {
-            Ok(_) => info!("unmounted sys"),
-            Err(e) => info!("failed to unmount sys {:?}",e)
-        }
-
+    let p_uid = clap_args.uid;
+    let p_gid = clap_args.gid;
+    info!("uid: {}, gid: {}", p_uid, p_gid);
+    let mut path = PathBuf::new();
+    path.push(std::env::current_dir().unwrap());
+    path.push(clap_args.rootfs);
+    path.push(r"sys");
+    let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
+    
+    match mount_sys(sys_mount.as_ref()) {
+        Ok(_) => info!("mounted sys"),
+        Err(e) => info!("failed to mount sys: {:?}", e)
+    }
+    
+    let new_args : Vec<OsString> = vec![];
+    let thing_to_launch = &clap_args.exe.as_str();
+    panic_spawn(
+        thing_to_launch,
+        child,
+        PathBuf::from(thing_to_launch),
+        new_args,
+        p_uid,
+        p_gid,
+    );
+    
+    match umount_sys(sys_mount.as_ref()) {
+        Ok(_) => info!("unmounted sys"),
+        Err(e) => info!("failed to unmount sys {:?}",e)
     }
 }
 
