@@ -1,5 +1,6 @@
 #!/bin/sh
-# cp ../alpine-make-rootfs/example-20220708.tar.gz ./ && sudo rm -fr ./alpine-rootfs && mkdir ./alpine-rootfs && pushd ./alpine-rootfs/ && tar zxvf ../example-20220708.tar.gz ./ && popd
+ALPINE_BUILD=example-20220710.tar.gz
+cp ../alpine-make-rootfs/$ALPINE_BUILD ./ && sudo rm -fr ./alpine-rootfs && mkdir ./alpine-rootfs && cd ./alpine-rootfs/ && tar zxvf ../$ALPINE_BUILD ./ && cd ..
 # export RUST_LOG=info
 # export RUST_BACKTRACE=full
-./target/debug/remora --exe /bin/ash --rootfs ./alpine-rootfs
+sudo ./target/debug/remora --exe /bin/ash --rootfs ./alpine-rootfs
