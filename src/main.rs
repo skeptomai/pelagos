@@ -6,25 +6,19 @@ use clap::Parser;
 use core::{ffi::CStr, panic};
 use libc::{MS_BIND, gid_t, uid_t};
 use log::{info,error};
-use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr};
+use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr, os::unix::prelude::OsStrExt};
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 use nix::unistd::{chroot};
 
-#[allow(dead_code)]
-const ALPINE_CGROUP : &str = "/home/vagrant/Projects/remora/alpine-rootfs/sys/fs";
-#[allow(dead_code)]
 const SYSFS : &str = "sysfs";
-const USERNAME : &str = "vagrant";
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     #[clap(short, long)]
     rootfs: String,
-    #[clap(short, long, default_value="")]
+    #[clap(short, long)]
     exe: String,
-    #[clap(short, long, default_value="")]
-    forked: String    
 }
 
 /* NOTE: do these in the alpine make rootfs instead?
@@ -96,12 +90,8 @@ fn main() {
     info!("args: {:?}", clap_args);
 
     unsafe {
-        let u_name =  CString::new(USERNAME).unwrap();
-        let passwd = libc::getpwnam(u_name.as_ptr());
-        let pw_uid = (*passwd).pw_uid;
-        let pw_gid = (*passwd).pw_gid;
-
-        info!("PID of PARENT: {}", std::process::id());
+        let p_uid = libc::getuid();
+        let p_gid = libc::getgid();
 
         let mut path = PathBuf::new();
         path.push(std::env::current_dir().unwrap());
@@ -121,8 +111,8 @@ fn main() {
             child,
             PathBuf::from(thing_to_launch),
             new_args,
-            pw_uid,
-            pw_gid,
+            p_uid,
+            p_gid,
         );
         
         match umount_sys(sys_mount.as_ref()) {
@@ -173,14 +163,17 @@ fn mount_proc() -> std::io::Result<()> {
 fn mount_cgroup() -> std::io::Result<()> {
     unsafe {
         let src_str = CString::new("cgroup_root")?;
-        info!("source is {:?}", src_str);        
         let fs_type_str = CString::new("cgroup")?;
-        info!("fs_type is {:?}", fs_type_str);        
-        let cgroups_str = CString::new(ALPINE_CGROUP)?;        
-        let cgroups_str_ptr = cgroups_str.as_ptr();
-        let src_str_ptr = src_str.as_ptr();
+
+        let mut cwd = std::env::current_dir()?;
+        cwd.push("alpine-rootfs/sys/fs");
+        let alpine_cgroup_dir = cwd.as_os_str().as_bytes();
+        let cgroups_str = CString::new(alpine_cgroup_dir)?;
         
+        let src_str_ptr = src_str.as_ptr();
         let fs_type_str_ptr = fs_type_str.as_ptr();
+        let cgroups_str_ptr = cgroups_str.as_ptr();
+
         match libc::mount(
             src_str_ptr,
             cgroups_str_ptr,
@@ -230,18 +223,4 @@ fn umount_sys(sys_mount: &CStr) -> std::io::Result<()> {
             _ => Err(std::io::Error::last_os_error()),
         }
     }
-}
-
-#[allow(dead_code)]
-fn mounts() -> std::io::Result<()> {
-    match mount_proc() {
-        Ok(_) => info!("mounted proc"),
-        Err(e) => info!("failed to mount sys {:?}",e)
-    }
-
-    match mount_cgroup() {
-        Ok(_) => info!("mounted cgroup"),
-        Err(e) => info!("failed to mount cgroup {:?}",e)        
-    }
-    Ok(())
 }
