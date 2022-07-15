@@ -5,7 +5,7 @@
 use clap::Parser;
 use core::{ffi::CStr, panic};
 use libc::{MS_BIND, gid_t, uid_t};
-use log::{info,error};
+use log::{info,error, warn};
 use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr, os::unix::prelude::OsStrExt};
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
 use nix::unistd::{chroot};
@@ -45,43 +45,67 @@ fn child(
     child_args: impl IntoIterator<Item = OsString>,
     uid_parent: uid_t,
     gid_parent: gid_t,
-) -> Result<Child, Error> {
+) -> Result<Child, Box<dyn std::error::Error>> {
     unsafe {
         let mut curdir = current_dir().unwrap();
-        let clap_args = Args::parse();        
+        let clap_args = Args::parse();
         curdir.push(clap_args.rootfs);
 
-        Command::new(to_run)
-            .args(&(child_args.into_iter().collect::<Vec<OsString>>())[..])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .chroot_dir(curdir)
-            .pre_exec(&mount_proc)
-            .unshare(
-                [
-                    unshare::Namespace::Uts,
-                    unshare::Namespace::Mount,
-                    unshare::Namespace::Pid,
-                    unshare::Namespace::Cgroup,
-                ]
-                .iter(),
-            )
-            .set_id_maps(
-                vec![UidMap {
-                    inside_uid: 0,
-                    outside_uid: uid_parent,
-                    count: 1,
-                }],
-                vec![GidMap {
-                    inside_gid: 0,
-                    outside_gid: gid_parent,
-                    count: 1,
-                }],
-            )
-            .uid(0)
-            .gid(0)            
-            .spawn()
+        let netns = std::fs::File::options().read(true).write(false).open("/var/run/netns/con");
+
+        match netns {
+            Ok(nsf) => {
+                
+                info!("opened net namespace: {:?}", nsf);
+                let mut cmd = Command::new(to_run);
+
+                info!("setting command info");
+                cmd.args(&(child_args.into_iter().collect::<Vec<OsString>>())[..])
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .chroot_dir(curdir)
+                .pre_exec(&mount_proc)
+                .unshare(
+                    [
+                        unshare::Namespace::Uts,
+                        unshare::Namespace::Mount,
+                        unshare::Namespace::Pid,
+                        unshare::Namespace::Cgroup,
+                        //unshare::Namespace::Net,
+                    ]
+                    .iter(),
+                )
+                .set_id_maps(
+                    vec![UidMap {
+                        inside_uid: 0,
+                        outside_uid: uid_parent,
+                        count: 1,
+                    }],
+                    vec![GidMap {
+                        inside_gid: 0,
+                        outside_gid: gid_parent,
+                        count: 1,
+                    }],
+                )
+                .uid(0)
+                .gid(0);
+                
+                info!("setting namespace");
+                match cmd.set_namespace(&nsf, unshare::Namespace::Net){
+                    Ok(c) => {info!("set network namespace in {:?}",c);},
+                    Err(e) => {warn!("failed to set namespace {:?}", e);}
+                };
+ 
+                info!("spawning child process");
+                match cmd.spawn() {
+                    Ok(c) => Ok(c),
+                    Err(e) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                }
+            
+            },
+            Err(e) => {info!("failed to open namespace {:?}", e); Err(Box::new(e))}
+        }
     }
 }
 fn main() {
@@ -126,7 +150,7 @@ fn main() {
 
 fn panic_spawn<I>(
     which: &str,
-    p: impl Fn(PathBuf, I, uid_t, gid_t) -> Result<Child, Error>,
+    p: impl Fn(PathBuf, I, uid_t, gid_t) -> Result<Child, Box<dyn std::error::Error>>,
     to_run: PathBuf,
     args: I,
     uid_parent: uid_t,

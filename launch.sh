@@ -1,5 +1,5 @@
 #!/bin/sh
-ALPINE_BUILD=example-20220710.tar.gz
+ALPINE_BUILD=example-20220714.tar.gz
 cp ../alpine-make-rootfs/$ALPINE_BUILD ./ && sudo rm -fr ./alpine-rootfs && mkdir ./alpine-rootfs && cd ./alpine-rootfs/ && tar zxvf ../$ALPINE_BUILD ./ && cd ..
 export RUST_LOG=info
 export RUST_BACKTRACE=full
