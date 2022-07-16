@@ -132,12 +132,15 @@ fn main() {
     path.push(clap_args.rootfs);
     path.push(r"sys");
     let sys_mount = CString::new(path.into_os_string().into_string().unwrap().as_bytes()).unwrap();
-    
+
+    // mount sys dir from parent process, because we still have privilege
+    // this also brings cgroups along?
     match mount_sys(sys_mount.as_ref()) {
         Ok(_) => info!("mounted sys"),
         Err(e) => info!("failed to mount sys: {:?}", e)
     }
-    
+
+    // spawn child
     let new_args : Vec<OsString> = vec![];
     let thing_to_launch = &clap_args.exe.as_str();
     panic_spawn(
@@ -149,6 +152,7 @@ fn main() {
         p_gid,
     );
     
+    // unmount sys when child returns
     match umount_sys(sys_mount.as_ref()) {
         Ok(_) => info!("unmounted sys"),
         Err(e) => info!("failed to unmount sys {:?}",e)
