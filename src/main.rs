@@ -6,9 +6,9 @@ use clap::Parser;
 use core::{ffi::CStr, panic};
 use libc::{MS_BIND, gid_t, uid_t};
 use log::{info,error, warn};
-use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr, os::unix::prelude::OsStrExt};
+use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr, os::unix::prelude::{OsStrExt, IntoRawFd}};
 use unshare::{Child, Command, Error, GidMap, Stdio, UidMap};
-use nix::unistd::{chroot};
+use nix::unistd::chroot;
 
 const SYSFS : &str = "sysfs";
 
@@ -51,6 +51,8 @@ fn child(
         let clap_args = Args::parse();
         curdir.push(clap_args.rootfs);
 
+        info!("current user and group before spawn: uid {}, gid {}", libc::getuid(), libc::getgid());
+
         let netns = std::fs::File::options().read(true).write(false).open("/var/run/netns/con");
 
         match netns {
@@ -76,7 +78,7 @@ fn child(
                     ]
                     .iter(),
                 )
-                .set_id_maps(
+                 .set_id_maps(
                     vec![UidMap {
                         inside_uid: 0,
                         outside_uid: uid_parent,
@@ -90,16 +92,21 @@ fn child(
                 )
                 .uid(0)
                 .gid(0);
-                
+
+/* 
                 info!("setting namespace");
                 match cmd.set_namespace(&nsf, unshare::Namespace::Net){
                     Ok(c) => {info!("set network namespace in {:?}",c);},
                     Err(e) => {warn!("failed to set namespace {:?}", e);}
                 };
- 
+
+ */
                 info!("spawning child process");
                 match cmd.spawn() {
-                    Ok(c) => Ok(c),
+                    Ok(c) => {
+                        info!("spawned child {}", c.pid());
+                        Ok(c)
+                    },
                     Err(e) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
                 }
             
