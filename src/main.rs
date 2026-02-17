@@ -1,14 +1,11 @@
-#![crate_name = "remora"]
 #![allow(unused_imports)]
-
-mod container;
 
 use clap::Parser;
 use core::{ffi::CStr, panic};
 use libc::{MS_BIND, gid_t, uid_t};
 use log::{info,error, warn};
 use std::{str::FromStr, env::current_dir, ffi::{CString,OsString, OsStr}, fs::read_link, path::PathBuf, ptr, os::unix::prelude::{OsStrExt, IntoRawFd}};
-use container::{Child, Command, Error, GidMap, Stdio, UidMap, Namespace};
+use remora::container::{Child, Command, Error, GidMap, Stdio, UidMap, Namespace};
 use nix::unistd::chroot;
 
 const SYSFS : &str = "sysfs";

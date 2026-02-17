@@ -22,7 +22,7 @@
 //! ```no_run
 //! use remora::container::{Command, Namespace, Stdio};
 //!
-//! let child = Command::new("/bin/sh")
+//! let mut child = Command::new("/bin/sh")
 //!     .with_namespaces(Namespace::UTS | Namespace::PID | Namespace::MOUNT)
 //!     .with_chroot("/path/to/rootfs")
 //!     .stdin(Stdio::Inherit)
@@ -100,6 +100,9 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{self, ExitStatus as StdExitStatus};
+
+// Re-export SeccompProfile for public API
+pub use crate::seccomp::SeccompProfile;
 
 bitflags! {
     /// Linux namespace types that can be unshared.
@@ -296,6 +299,7 @@ pub struct Command {
     pivot_root: Option<(PathBuf, PathBuf)>, // (new_root, put_old)
     // Security configuration
     capabilities: Option<Capability>, // None = keep all, Some = keep only these
+    seccomp_profile: Option<SeccompProfile>, // None = no seccomp, Some = apply profile
     // Resource limits
     rlimits: Vec<ResourceLimit>,
 }
@@ -318,6 +322,7 @@ impl Command {
             mount_dev: false,
             pivot_root: None,
             capabilities: None,
+            seccomp_profile: None,
             rlimits: Vec::new(),
         }
     }
@@ -636,11 +641,84 @@ impl Command {
         self.with_rlimit(libc::RLIMIT_CPU, seconds, seconds)
     }
 
+    /// Apply Docker's default seccomp profile (recommended).
+    ///
+    /// This blocks ~44 dangerous syscalls commonly used in container escapes
+    /// while allowing normal application behavior. Matches Docker's default.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_seccomp_default();
+    /// ```
+    ///
+    /// # Security
+    ///
+    /// Blocked syscalls include: ptrace, mount, reboot, bpf, perf_event_open,
+    /// and many others. See [`crate::seccomp`] module for full list.
+    pub fn with_seccomp_default(mut self) -> Self {
+        self.seccomp_profile = Some(SeccompProfile::Docker);
+        self
+    }
+
+    /// Apply minimal seccomp profile (highly restrictive).
+    ///
+    /// Only allows ~40 essential syscalls needed for basic process execution.
+    /// Use for highly constrained containers where you control the application.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_seccomp_minimal();
+    /// ```
+    pub fn with_seccomp_minimal(mut self) -> Self {
+        self.seccomp_profile = Some(SeccompProfile::Minimal);
+        self
+    }
+
+    /// Set a specific seccomp profile.
+    ///
+    /// Allows choosing between different security profiles programmatically.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// cmd.with_seccomp_profile(SeccompProfile::Docker);
+    /// cmd.with_seccomp_profile(SeccompProfile::Minimal);
+    /// cmd.with_seccomp_profile(SeccompProfile::None); // No filtering
+    /// ```
+    pub fn with_seccomp_profile(mut self, profile: SeccompProfile) -> Self {
+        self.seccomp_profile = Some(profile);
+        self
+    }
+
+    /// Disable seccomp filtering (unsafe, for debugging).
+    ///
+    /// WARNING: Containers without seccomp are less secure and more vulnerable
+    /// to escape attacks. Only use when debugging or when security is not critical.
+    pub fn without_seccomp(mut self) -> Self {
+        self.seccomp_profile = Some(SeccompProfile::None);
+        self
+    }
+
     /// Spawn the child process with configured namespaces and settings.
     ///
     /// This combines namespace creation, chroot, and user pre_exec callbacks
     /// into a single pre_exec hook for std::process::Command.
     pub fn spawn(mut self) -> Result<Child, Error> {
+        // Compile seccomp filter in parent process (requires allocation, can't be done in pre_exec)
+        let seccomp_filter = if let Some(profile) = &self.seccomp_profile {
+            match profile {
+                SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
+                    .map_err(|e| Error::Seccomp(e))?),
+                SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
+                    .map_err(|e| Error::Seccomp(e))?),
+                SeccompProfile::None => None,
+            }
+        } else {
+            None
+        };
+
         // Open namespace files in parent process (can't safely open files in pre_exec)
         // Keep File objects alive so their fds remain valid through spawn
         let join_ns_files: Vec<(File, Namespace)> = self.join_namespaces
@@ -905,6 +983,13 @@ impl Command {
                     }
                 }
 
+                // Step 7 (FINAL): Apply seccomp filter if configured
+                // CRITICAL: This MUST be the last step! Once seccomp is applied, many syscalls
+                // are blocked, so all other setup must be complete.
+                if let Some(ref filter) = seccomp_filter {
+                    crate::seccomp::apply_filter(filter)?;
+                }
+
                 Ok(())
             });
         }
@@ -1017,6 +1102,10 @@ pub enum Error {
     /// Failed to wait for process completion
     #[error("Failed to wait for process: {0}")]
     Wait(#[source] io::Error),
+
+    /// Failed to setup or apply seccomp filter
+    #[error("Seccomp error: {0}")]
+    Seccomp(#[source] io::Error),
 
     /// Generic I/O error
     #[error("I/O error: {0}")]

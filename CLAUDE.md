@@ -1,151 +1,246 @@
 # Remora - Linux Container Runtime
 
+## ⚠️ CRITICAL RULES FOR CLAUDE ⚠️
+
+### ❌ NEVER RUN SUDO COMMANDS
+**YOU CANNOT RUN SUDO** - The user MUST run sudo commands themselves.
+
+**What NOT to do:**
+- ❌ `sudo cargo test`
+- ❌ `sudo -E cargo run`
+- ❌ `sudo ./script.sh`
+- ❌ ANY command starting with `sudo`
+
+**What TO do instead:**
+- ✅ Tell the user: "Please run: sudo -E cargo test --test integration_tests"
+- ✅ Explain what the command will do
+- ✅ Wait for user to run it and report results
+
+### Ask Before Major Decisions
+- API design choices
+- Adding new features not explicitly requested
+- Architectural changes
+- When uncertain about the right approach
+
+### No Time Estimates
+**NEVER include time estimates** in any documentation or planning:
+- ❌ "~3 weeks", "1-2 weeks", "3 days"
+- ✅ Use: "Quick", "Moderate Effort", "Significant Work"
+
+---
+
 ## Project Overview
 
-Remora is a low-level Linux container runtime written in Rust. It creates lightweight containers using Linux namespaces, similar to Docker but at a much lower level. The project launches processes in isolated environments with their own process tree, mount points, and network namespaces.
+Remora is a modern, lightweight Linux container runtime written in Rust. It provides a safe, ergonomic API for creating containerized processes using Linux namespaces, seccomp filtering, capabilities, and resource limits.
 
-## Key Features
+## Current State (Updated Feb 16, 2026)
 
-- **Namespace Isolation**: Uses Linux namespaces (UTS, Mount, PID, Cgroup)
-- **chroot Environment**: Runs processes in a custom Alpine Linux rootfs
-- **Network Namespace Support**: Can attach to existing network namespaces (via `/var/run/netns/con`)
-- **Filesystem Mounting**: Handles mounting of proc, sys, and cgroup filesystems
-- **UID/GID Mapping**: Supports user/group ID mapping for unprivileged containers
+### ✅ Completed Features
 
-## Architecture
+**Core Isolation:**
+- Linux namespaces: UTS, Mount, IPC, User, Net, Cgroup (6/7)
+- PID namespace (works in library, architectural limitation in CLI)
+- Filesystem isolation: chroot and pivot_root
+- Automatic mounts: /proc, /sys, /dev
 
-### Main Components
+**Security:**
+- **Seccomp filtering**: Docker's default profile + minimal profile
+- **Capability management**: Drop/keep specific capabilities
+- **Resource limits**: rlimits for memory, CPU, file descriptors
 
-1. **main.rs** (261 lines)
-   - Entry point: parses CLI arguments, sets up environment
-   - Mounts `/sys` from parent process (requires root privileges)
-   - Spawns child process in isolated namespaces
-   - Handles cleanup (unmounting sys) on exit
+**Advanced:**
+- UID/GID mapping for user namespaces
+- Namespace joining (attach to existing namespaces)
+- Ergonomic builder API
 
-2. **child() function** (lines 42-115)
-   - Creates new namespaces (UTS, Mount, PID, Cgroup)
-   - Sets up chroot environment
-   - Mounts proc filesystem via pre_exec callback
-   - Opens and attaches to network namespace if available
+### 📁 File Structure
 
-3. **Setup Scripts**
-   - `setup.sh`: Creates network namespace with veth pair for container networking
-   - `launch.sh`: Builds Alpine rootfs and launches remora with sudo
+```
+src/
+  lib.rs                  # Library entry point
+  main.rs                 # CLI binary
+  container.rs            # Main API (~1200 lines)
+  seccomp.rs              # Seccomp-BPF filtering (~400 lines)
+
+tests/
+  integration_tests.rs    # 17 integration tests (require root)
+
+examples/
+  seccomp_demo.rs         # Seccomp demonstration
+
+Documentation:
+  README.md                      # Project overview
+  CLAUDE.md                      # This file
+  ROADMAP.md                     # Development plan (NO time estimates!)
+  SECCOMP_DEEP_DIVE.md          # Seccomp implementation details
+  SECCOMP_IMPLEMENTATION.md      # What was implemented
+  CGROUPS.md                     # Cgroups v1 vs v2 analysis
+  RUNTIME_COMPARISON.md          # vs Docker/runc/Podman
+```
 
 ## Dependencies
 
-### Core Dependencies (Cargo.toml:8-17)
+### Current Dependencies (Cargo.toml)
 
-- **unshare** (path = "../unshare") ⚠️ **UNMAINTAINED**
-  - Version: 0.7.0
-  - Last updated: June 7, 2021 (4.5+ years ago)
-  - Purpose: Low-level interface for Linux namespaces
-  - Critical functionality: Command spawning, namespace creation, chroot
-  - Issues: Some deprecation warnings, uses older Rust patterns
-
-- **clap** (3.1.6) - CLI argument parsing
-- **nix** - Unix system calls wrapper
-- **libc** - Direct libc bindings for mount/umount
-- **log** + **env_logger** - Logging infrastructure
-- **subprocess** - Process management utilities
-- **cgroups-fs** - Cgroup filesystem interface
-- **palaver** - (purpose unclear, needs investigation)
-
-## Build Status
-
-✅ **Project currently builds successfully** (tested Feb 16, 2026)
-
-Warnings present:
-- unshare library generates 4 warnings (unused parens, missing ABI declarations)
-- nom v2.2.1 will be rejected by future Rust versions
-- All warnings are in dependencies, not main code
-
-## Current Issues (from TODO.org)
-
-1. ✅ Can mount sys from parent process (requires root)
-2. ⚠️ Requires root privileges to mount sys
-3. ❌ sys doesn't unmount cleanly on exit
-4. ❌ Cgroups not working properly
-5. ❓ Mounting sys seems to include cgroups (unclear why)
-
-## Usage
-
-```bash
-# Setup network namespace
-./setup.sh
-
-# Launch container with Alpine Linux rootfs
-./launch.sh
-
-# Direct usage
-sudo -E ./target/debug/remora \
-  --exe /bin/ash \
-  --rootfs ./alpine-rootfs \
-  --uid 1000 \
-  --gid 1000
+```toml
+log = "*"
+env_logger = "*"
+nix = { version = "0.31.1", features = ["process", "sched", "mount", "fs"] }
+libc = "*"
+clap = { version = "3.1.6", features = ["derive"] }
+thiserror = "2.0"
+bitflags = "2.6"
+cgroups-rs = "0.5.0"      # For future cgroup management
+seccompiler = "0.5.0"     # Pure Rust seccomp-BPF (Firecracker)
 ```
 
-## Environment Variables
+**Removed dependencies:**
+- ~~unshare~~ - Replaced with custom implementation using nix
+- ~~subprocess~~ - Never used
+- ~~cgroups-fs~~ - Replaced with cgroups-rs
+- ~~palaver~~ - Never used
 
-- `RUST_LOG=info` - Enable info-level logging
-- `RUST_BACKTRACE=full` - Full stack traces on panic
+## Root Filesystem
 
-## Critical Path Dependency: unshare
+Remora requires an Alpine Linux rootfs to run containers.
 
-### Why It's Critical
+**Two build options:**
 
-The unshare library provides the core functionality:
-- Process spawning with namespace isolation
-- Namespace management (unshare, setns)
-- UID/GID mapping
-- chroot/pivot_root operations
-- File descriptor forwarding
+1. **With Docker** (recommended):
+   ```bash
+   ./build-rootfs-docker.sh
+   ```
 
-### Replacement Considerations
+2. **Without Docker** (tarball):
+   ```bash
+   ./build-rootfs-tarball.sh
+   ```
 
-The project heavily depends on unshare's `Command` builder pattern:
+See `BUILD_ROOTFS.md` for detailed instructions.
+
+## Usage Examples
+
+### Basic Container
 ```rust
-let mut cmd = Command::new(to_run);
-cmd.unshare([Namespace::Uts, Namespace::Mount, Namespace::Pid, Namespace::Cgroup].iter())
-   .chroot_dir(curdir)
-   .pre_exec(&mount_proc)
-   .stdin(Stdio::inherit())
-   // ...
+use remora::container::{Command, Namespace, Stdio};
+
+let mut child = Command::new("/bin/sh")
+    .with_chroot("/path/to/rootfs")
+    .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
+    .with_proc_mount()
+    .with_seccomp_default()      // Docker's seccomp profile
+    .drop_all_capabilities()     // Least privilege
+    .spawn()?;
+
+child.wait()?;
 ```
 
-Potential alternatives:
-1. **nix** crate - Already a dependency, has some namespace support but less comprehensive
-2. **Fork unshare** - Create maintained fork with modern Rust patterns
-3. **youki/libcontainer** - Modern container runtime libraries (heavier weight)
-4. **Direct syscalls via nix/libc** - More work but gives full control
+### Running Examples (User Must Run)
+```bash
+# User runs:
+sudo -E cargo run --example seccomp_demo
+```
 
-## Network Setup
+## Testing
 
-The setup.sh script creates:
-- Network namespace named "con"
-- veth pair (veth1 ↔ veth2)
-- veth2 placed in container namespace with IP 172.16.0.1
-- veth1 remains in host namespace
-- Routing configured for container ↔ host communication
+### Unit Tests (No Root Required)
+```bash
+cargo test --lib
+```
 
-## Development Notes
+### Integration Tests (Require Root)
+Tell user to run:
+```bash
+sudo -E cargo test --test integration_tests
+```
 
-- Requires Linux kernel with namespace support
-- Must run with sudo/CAP_SYS_ADMIN for namespace creation
-- Alpine Linux rootfs expected in `./alpine-rootfs/`
-- Logging controlled via RUST_LOG environment variable
-- Uses unsafe blocks for direct libc calls (mount/umount)
+## Architecture
 
-**Note on Time Estimates:**
-- We avoid time estimates in documentation
-- They underestimate human effort and overestimate AI capabilities
-- Focus on task complexity and dependencies instead
+### Pre-exec Hook Order (Critical!)
+The spawn process has a carefully orchestrated setup:
 
-## TODOs / Future Work
+1. **Parent process** (before fork):
+   - Open namespace files (can't do in pre_exec)
+   - Compile seccomp BPF filter (requires allocation)
 
-- [ ] Investigate and fix sys unmounting issue
-- [ ] Debug cgroup mounting problems
-- [ ] Replace or update unshare dependency
-- [ ] Consider dropping root requirements where possible
-- [ ] Add tests
-- [ ] Document expected rootfs structure
+2. **Fork**: Create child process
+
+3. **Pre-exec hook** (in child, before exec):
+   1. Unshare namespaces
+   2. Make mounts private (if MOUNT namespace)
+   3. Set up UID/GID mappings (if USER namespace)
+   4. Set UID/GID
+   5. Change root (chroot or pivot_root)
+   6. Mount filesystems (/proc, /sys, /dev)
+   7. Drop capabilities
+   8. Set resource limits
+   9. Run user pre_exec callback
+   10. Join existing namespaces (setns)
+   11. **Apply seccomp filter (MUST BE LAST!)**
+
+4. **Exec**: Replace with target program
+
+**Why seccomp is last:** Many syscalls needed for setup (mount, setuid) would be blocked if applied earlier.
+
+## Development Workflow
+
+### Making Changes
+1. Write code
+2. Run unit tests: `cargo test --lib`
+3. Build: `cargo build`
+4. Tell user to run integration tests if relevant
+
+### Adding Features
+1. Ask user if uncertain about approach
+2. Implement in src/
+3. Add tests
+4. Update README.md
+5. Add example if appropriate
+
+### Documentation
+- Keep concise and practical
+- Focus on "how to use" over theory
+- Provide working examples
+- Update README when adding major features
+
+## Next Steps (from ROADMAP.md)
+
+**Phase 1 - Security Hardening:**
+- ✅ Seccomp filtering - COMPLETE
+- ⏳ Read-only rootfs (MS_RDONLY)
+- ⏳ Masked paths (/proc/kcore, /sys/firmware)
+- ⏳ No new privileges (PR_SET_NO_NEW_PRIVS)
+
+**Phase 2 - Interactive Containers:**
+- TTY/PTY support
+- Signal handling
+
+**Phase 3 - Networking:**
+- CNI integration (delegate to external tools)
+
+See ROADMAP.md for full plan (no time estimates!)
+
+## Common Issues
+
+### "alpine-rootfs not found"
+Run: `./fix-rootfs.sh` (requires Docker + sudo)
+
+### Integration tests fail
+User must run with: `sudo -E cargo test --test integration_tests`
+
+### Permission denied
+Many features require root or CAP_SYS_ADMIN
+
+## Comparison to Docker/runc
+
+| Feature | Remora | Docker |
+|---------|--------|--------|
+| Namespaces | ✅ 6/7 | ✅ All |
+| Seccomp | ✅ Docker profile | ✅ |
+| Capabilities | ✅ | ✅ |
+| Resource limits | ✅ rlimits | ✅ cgroups |
+| TTY/PTY | ❌ Planned | ✅ |
+| Networking | ⚠️ Join only | ✅ CNI |
+| OCI Compatible | ❌ | ✅ |
+
+**Current parity: ~35% of runc features**

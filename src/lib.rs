@@ -4,3 +4,4 @@
 //! using Linux namespaces.
 
 pub mod container;
+pub mod seccomp;
