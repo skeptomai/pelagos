@@ -383,6 +383,8 @@ pub struct Command {
     tmpfs_mounts: Vec<TmpfsMount>,
     // Resource limits
     rlimits: Vec<ResourceLimit>,
+    // Cgroup-based resource management
+    cgroup_config: Option<crate::cgroup::CgroupConfig>,
 }
 
 impl Command {
@@ -410,6 +412,7 @@ impl Command {
             bind_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
             rlimits: Vec::new(),
+            cgroup_config: None,
         }
     }
 
@@ -735,6 +738,44 @@ impl Command {
     /// ```
     pub fn with_cpu_time_limit(self, seconds: libc::rlim_t) -> Self {
         self.with_rlimit(libc::RLIMIT_CPU, seconds, seconds)
+    }
+
+    /// Set a cgroup memory hard limit in bytes (`memory.max`).
+    ///
+    /// The container will be OOM-killed if it exceeds this limit. This uses
+    /// cgroups v2 and applies to the entire container process group, unlike
+    /// `with_memory_limit()` which uses `RLIMIT_AS` (per-process address space).
+    ///
+    /// Requires root or `CAP_SYS_ADMIN`.
+    pub fn with_cgroup_memory(mut self, bytes: i64) -> Self {
+        self.cgroup_config.get_or_insert_with(Default::default).memory_limit = Some(bytes);
+        self
+    }
+
+    /// Set the CPU weight (shares) for the container's cgroup.
+    ///
+    /// Maps to `cpu.weight` in cgroups v2 (range 1–10000; default 100) and
+    /// `cpu.shares` in v1. Higher values receive proportionally more CPU time.
+    pub fn with_cgroup_cpu_shares(mut self, shares: u64) -> Self {
+        self.cgroup_config.get_or_insert_with(Default::default).cpu_shares = Some(shares);
+        self
+    }
+
+    /// Set a CPU quota for the container's cgroup.
+    ///
+    /// `quota_us` is the maximum CPU time (in microseconds) the container may
+    /// use per `period_us`. Example: `(50_000, 100_000)` = 50% of one CPU core.
+    pub fn with_cgroup_cpu_quota(mut self, quota_us: i64, period_us: u64) -> Self {
+        self.cgroup_config.get_or_insert_with(Default::default).cpu_quota = Some((quota_us, period_us));
+        self
+    }
+
+    /// Set the maximum number of processes/threads in the container's cgroup.
+    ///
+    /// Maps to `pids.max`. Forks beyond this limit will fail with `EAGAIN`.
+    pub fn with_cgroup_pids_limit(mut self, max: u64) -> Self {
+        self.cgroup_config.get_or_insert_with(Default::default).pids_limit = Some(max);
+        self
     }
 
     /// Apply Docker's default seccomp profile (recommended).
@@ -1373,12 +1414,19 @@ impl Command {
         }
 
         // Spawn the process
-        let child = self.inner.spawn().map_err(Error::Spawn)?;
+        let child_inner = self.inner.spawn().map_err(Error::Spawn)?;
 
         // Keep join_ns_files alive until here so file descriptors remain valid
         drop(join_ns_files);
 
-        Ok(Child { inner: child })
+        // Create cgroup and add child PID (parent-side, after fork)
+        let cgroup = if let Some(ref cfg) = self.cgroup_config {
+            Some(crate::cgroup::setup_cgroup(cfg, child_inner.id()).map_err(Error::Io)?)
+        } else {
+            None
+        };
+
+        Ok(Child { inner: child_inner, cgroup })
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -1742,7 +1790,7 @@ impl Command {
             });
         }
 
-        let child = self.inner.spawn().map_err(Error::Spawn)?;
+        let child_inner = self.inner.spawn().map_err(Error::Spawn)?;
 
         // Close the slave in the parent — only the child should have it.
         // If we keep it open, POLLHUP on the master will never fire when
@@ -1750,9 +1798,16 @@ impl Command {
         drop(slave);
         drop(join_ns_files);
 
+        // Create cgroup and add child PID (parent-side, after fork)
+        let cgroup = if let Some(ref cfg) = self.cgroup_config {
+            Some(crate::cgroup::setup_cgroup(cfg, child_inner.id()).map_err(Error::Io)?)
+        } else {
+            None
+        };
+
         Ok(crate::pty::InteractiveSession {
             master,
-            child: Child { inner: child },
+            child: Child { inner: child_inner, cgroup },
         })
     }
 }
@@ -1780,6 +1835,8 @@ impl Command {
 /// ```
 pub struct Child {
     inner: process::Child,
+    /// Optional cgroup for this container. Deleted after the child exits.
+    pub(crate) cgroup: Option<cgroups_rs::fs::Cgroup>,
 }
 
 impl Child {
@@ -1791,9 +1848,12 @@ impl Child {
     /// Wait for the child process to exit.
     ///
     /// This will block until the process terminates and return its exit status.
+    /// If a cgroup was configured, it is deleted after the child exits.
     pub fn wait(&mut self) -> Result<ExitStatus, Error> {
         let status = self.inner.wait().map_err(Error::Wait)?;
-
+        if let Some(cg) = self.cgroup.take() {
+            crate::cgroup::teardown_cgroup(cg);
+        }
         Ok(ExitStatus { inner: status })
     }
 
@@ -1801,13 +1861,39 @@ impl Child {
     ///
     /// Returns (exit_status, stdout_bytes, stderr_bytes).
     /// Only works if Stdio::Piped was set for stdout/stderr.
+    /// If a cgroup was configured, it is deleted after the child exits.
     pub fn wait_with_output(self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
         let output = self.inner.wait_with_output().map_err(Error::Wait)?;
+        if let Some(cg) = self.cgroup {
+            crate::cgroup::teardown_cgroup(cg);
+        }
         Ok((
             ExitStatus { inner: output.status },
             output.stdout,
             output.stderr,
         ))
+    }
+
+    /// Read current resource usage from the container's cgroup.
+    ///
+    /// Returns statistics on memory, CPU, and process count. Only available
+    /// if the container was spawned with cgroup limits configured (e.g.
+    /// [`Command::with_cgroup_memory`]). Returns zeros if no cgroup is active.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let stats = child.resource_stats()?;
+    /// println!("Memory: {} bytes", stats.memory_current_bytes);
+    /// println!("CPU: {} ns", stats.cpu_usage_ns);
+    /// println!("PIDs: {}", stats.pids_current);
+    /// ```
+    pub fn resource_stats(&self) -> Result<crate::cgroup::ResourceStats, Error> {
+        if let Some(ref cg) = self.cgroup {
+            crate::cgroup::read_stats(cg).map_err(Error::Io)
+        } else {
+            Ok(crate::cgroup::ResourceStats::default())
+        }
     }
 }
 

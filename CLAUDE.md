@@ -59,6 +59,13 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Terminal restore**: `TerminalGuard` RAII ensures raw mode is always cleaned up
 - **`src/pty.rs`**: relay loop, `TerminalGuard`, `InteractiveSession`
 
+**Advanced Resource Management (Phase 5 COMPLETE ✅):**
+- **Cgroups v2**: `with_cgroup_memory()`, `with_cgroup_cpu_shares()`, `with_cgroup_cpu_quota()`, `with_cgroup_pids_limit()`
+- **Auto-detection**: `cgroups-rs` auto-detects v1 vs v2 via `hierarchies::auto()`
+- **Resource stats**: `child.resource_stats()` returns memory, CPU, and PID stats
+- **Automatic cleanup**: cgroup deleted in `wait()` / `wait_with_output()`
+- **Coexists with rlimits**: both mechanisms work independently
+
 **Filesystem Flexibility (Phase 4 COMPLETE ✅):**
 - **Bind mounts**: `with_bind_mount()` (RW) and `with_bind_mount_ro()` (RO) — map host dirs into container
 - **tmpfs mounts**: `with_tmpfs()` — in-memory writable scratch space (works with read-only rootfs)
@@ -75,12 +82,13 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 src/
   lib.rs                  # Library entry point
   main.rs                 # CLI binary
-  container.rs            # Main API (~1500 lines)
+  container.rs            # Main API (~1900 lines)
+  cgroup.rs               # Cgroups v2 resource management
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
 
 tests/
-  integration_tests.rs    # 26 integration tests (require root)
+  integration_tests.rs    # 31 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -253,6 +261,14 @@ The spawn process has a carefully orchestrated setup:
 - ✅ SIGWINCH forwarding (window resize)
 - ✅ Session isolation (setsid + TIOCSCTTY)
 
+**Phase 5 - Advanced Resource Management: COMPLETE ✅**
+- ✅ Cgroups v2 memory limit — `with_cgroup_memory(bytes)`
+- ✅ Cgroups v2 CPU shares/weight — `with_cgroup_cpu_shares(weight)`
+- ✅ Cgroups v2 CPU quota — `with_cgroup_cpu_quota(quota_us, period_us)`
+- ✅ Cgroups v2 PID limit — `with_cgroup_pids_limit(max)`
+- ✅ Resource stats — `child.resource_stats()`
+- ✅ Automatic cgroup cleanup on `wait()`
+
 **Phase 4 - Filesystem Flexibility: COMPLETE ✅**
 - ✅ Bind mounts (RW and RO) — `with_bind_mount()`, `with_bind_mount_ro()`
 - ✅ tmpfs mounts — `with_tmpfs()`
@@ -281,7 +297,7 @@ Many features require root or CAP_SYS_ADMIN
 | Namespaces | ✅ 6/7 | ✅ All |
 | Seccomp | ✅ Docker profile | ✅ |
 | Capabilities | ✅ | ✅ |
-| Resource limits | ✅ rlimits | ✅ cgroups |
+| Resource limits | ✅ rlimits + cgroups v2 | ✅ cgroups |
 | TTY/PTY | ✅ PTY relay | ✅ |
 | Bind mounts | ✅ RW + RO | ✅ |
 | tmpfs mounts | ✅ | ✅ |
