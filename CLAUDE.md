@@ -115,10 +115,10 @@ Documentation:
   README.md                             # Project overview
   CLAUDE.md                             # This file
   docs/ROADMAP.md                       # Development plan (NO time estimates!)
-  docs/SECCOMP_DEEP_DIVE.md            # Seccomp implementation details
-  docs/SECCOMP_IMPLEMENTATION.md        # What was implemented
-  docs/CGROUPS.md                       # Cgroups v1 vs v2 analysis
+  docs/INTEGRATION_TESTS.md            # Every integration test documented
   docs/RUNTIME_COMPARISON.md            # vs Docker/runc/Podman
+  docs/SECCOMP_DEEP_DIVE.md            # Seccomp implementation details
+  docs/CGROUPS.md                       # Cgroups v1 vs v2 analysis
   docs/PTY_DEEP_DIVE.md                # PTY/interactive session design
   docs/BUILD_ROOTFS.md                  # How to build the Alpine rootfs
 ```
