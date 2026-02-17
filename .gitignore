@@ -1,3 +1,5 @@
 /target
 alpine-rootfs/**
 *.tar.gz
+test_syscalls
+*.o
