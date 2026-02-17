@@ -8,7 +8,7 @@ edition = "2018"
 [dependencies]
 log = "*"
 env_logger = "*"
-nix = { version = "0.31.1", features = ["process", "sched", "mount", "fs"] }
+nix = { version = "0.31.1", features = ["process", "sched", "mount", "fs", "term", "poll", "signal", "ioctl"] }
 libc = "*"
 clap = {version = "3.1.6", features = ["derive"] }
 thiserror = "2.0"

@@ -60,6 +60,7 @@ fn child(
             .stdin(Stdio::Inherit)
             .stdout(Stdio::Inherit)
             .stderr(Stdio::Inherit)
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .with_chroot(curdir)
             .with_proc_mount()  // Automatically mount /proc
             .with_namespaces(
@@ -87,12 +88,25 @@ fn child(
             .with_gid(0);
         */
 
-        let result = cmd.spawn();
+        let result = cmd.spawn_interactive();
 
         match result {
-            Ok(c) => {
-                info!("spawned child {}", c.pid());
-                Ok(c)
+            Ok(session) => {
+                info!("spawned child {}", session.child.pid());
+                // run() blocks here: relays I/O, restores terminal on exit
+                match session.run() {
+                    Ok(_status) => {
+                        // Return a placeholder Child — panic_spawn calls .wait() on it,
+                        // but the process has already exited. We need a real child handle.
+                        // Since spawn_interactive blocks until exit, we just need to not crash.
+                        // Use a direct exit here instead.
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        error!("relay loop failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
             Err(e) => {
                 error!("failed to spawn child: {}", e);

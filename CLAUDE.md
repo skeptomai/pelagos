@@ -51,6 +51,14 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Capability management**: Drop/keep specific capabilities
 - **Resource limits**: rlimits for memory, CPU, file descriptors
 
+**Interactive Containers (Phase 2 COMPLETE ✅):**
+- **PTY support**: `spawn_interactive()` allocates a PTY pair via `openpty()`
+- **Session isolation**: `setsid()` + `TIOCSCTTY` gives container its own session
+- **Raw-mode relay**: `InteractiveSession::run()` polls stdin↔master, 100ms timeout
+- **Window resize**: `SIGWINCH` handler syncs terminal size to PTY via `TIOCSWINSZ`
+- **Terminal restore**: `TerminalGuard` RAII ensures raw mode is always cleaned up
+- **`src/pty.rs`**: relay loop, `TerminalGuard`, `InteractiveSession`
+
 **Advanced:**
 - UID/GID mapping for user namespaces
 - Namespace joining (attach to existing namespaces)
@@ -62,11 +70,12 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 src/
   lib.rs                  # Library entry point
   main.rs                 # CLI binary
-  container.rs            # Main API (~1200 lines)
+  container.rs            # Main API (~1500 lines)
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
+  pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
 
 tests/
-  integration_tests.rs    # 17 integration tests (require root)
+  integration_tests.rs    # 22 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -88,7 +97,7 @@ Documentation:
 ```toml
 log = "*"
 env_logger = "*"
-nix = { version = "0.31.1", features = ["process", "sched", "mount", "fs"] }
+nix = { version = "0.31.1", features = ["process", "sched", "mount", "fs", "term", "poll", "signal", "ioctl"] }
 libc = "*"
 clap = { version = "3.1.6", features = ["derive"] }
 thiserror = "2.0"
@@ -138,10 +147,26 @@ let mut child = Command::new("/bin/sh")
 child.wait()?;
 ```
 
+### Interactive Container (PTY)
+```rust
+use remora::container::{Command, Namespace};
+
+let session = Command::new("/bin/sh")
+    .with_chroot("/path/to/rootfs")
+    .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+    .with_proc_mount()
+    .spawn_interactive()?;
+
+// Blocks: relays stdin/stdout, forwards SIGWINCH, restores terminal on exit
+let status = session.run()?;
+```
+
 ### Running Examples (User Must Run)
 ```bash
 # User runs:
 sudo -E cargo run --example seccomp_demo
+# Interactive shell:
+sudo -E cargo run -- --rootfs alpine-rootfs --exe /bin/sh --uid 0 --gid 0
 ```
 
 ## Testing
@@ -208,15 +233,18 @@ The spawn process has a carefully orchestrated setup:
 
 ## Next Steps (from ROADMAP.md)
 
-**Phase 1 - Security Hardening:**
-- ✅ Seccomp filtering - COMPLETE
-- ⏳ Read-only rootfs (MS_RDONLY)
-- ⏳ Masked paths (/proc/kcore, /sys/firmware)
-- ⏳ No new privileges (PR_SET_NO_NEW_PRIVS)
+**Phase 1 - Security Hardening: COMPLETE ✅**
+- ✅ Seccomp filtering
+- ✅ Read-only rootfs (MS_RDONLY via bind-mount + remount)
+- ✅ Masked paths (/proc/kcore, /sys/firmware, etc.)
+- ✅ No new privileges (PR_SET_NO_NEW_PRIVS)
+- ✅ Capability management
+- ✅ Resource limits (rlimits)
 
-**Phase 2 - Interactive Containers:**
-- TTY/PTY support
-- Signal handling
+**Phase 2 - Interactive Containers: COMPLETE ✅**
+- ✅ PTY support (`spawn_interactive()`, `InteractiveSession::run()`)
+- ✅ SIGWINCH forwarding (window resize)
+- ✅ Session isolation (setsid + TIOCSCTTY)
 
 **Phase 3 - Networking:**
 - CNI integration (delegate to external tools)
@@ -242,8 +270,8 @@ Many features require root or CAP_SYS_ADMIN
 | Seccomp | ✅ Docker profile | ✅ |
 | Capabilities | ✅ | ✅ |
 | Resource limits | ✅ rlimits | ✅ cgroups |
-| TTY/PTY | ❌ Planned | ✅ |
+| TTY/PTY | ✅ PTY relay | ✅ |
 | Networking | ⚠️ Join only | ✅ CNI |
 | OCI Compatible | ❌ | ✅ |
 
-**Current parity: ~35% of runc features**
+**Current parity: ~45% of runc features**

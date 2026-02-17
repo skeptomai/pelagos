@@ -1183,6 +1183,315 @@ impl Command {
 
         Ok(Child { inner: child })
     }
+
+    /// Spawn the container with a PTY for proper session isolation.
+    ///
+    /// Allocates a PTY master/slave pair. The slave becomes the container's
+    /// controlling terminal (stdin/stdout/stderr). The parent holds the master
+    /// and uses it to relay I/O to/from the user's terminal.
+    ///
+    /// Returns an [`crate::pty::InteractiveSession`] — call `.run()` on it to
+    /// start the relay loop, which blocks until the container exits.
+    ///
+    /// # Differences from `spawn()`
+    ///
+    /// - The container gets its own session (`setsid`) and controlling terminal
+    /// - Signals (Ctrl+C, Ctrl+Z) are scoped to the container's session only
+    /// - Terminal settings (colors, readline) are fully isolated
+    pub fn spawn_interactive(mut self) -> Result<crate::pty::InteractiveSession, Error> {
+        use std::os::fd::AsRawFd;
+
+        // Allocate PTY pair in the parent before fork.
+        // master: parent holds this and relays I/O through it.
+        // slave:  child's stdin/stdout/stderr will be wired to this.
+        let pty = nix::pty::openpty(None, None).map_err(|e| Error::Io(io::Error::from(e)))?;
+
+        let master = pty.master;
+        let slave = pty.slave;
+
+        let slave_raw_fd = slave.as_raw_fd();
+        let master_raw_fd = master.as_raw_fd();
+
+        // Mark master CLOEXEC so the child doesn't accidentally inherit it
+        unsafe {
+            libc::fcntl(master_raw_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+
+        // Ensure slave is NOT CLOEXEC — it must survive exec in the child
+        unsafe {
+            let flags = libc::fcntl(slave_raw_fd, libc::F_GETFD);
+            libc::fcntl(slave_raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
+
+        // --- From here, identical setup to spawn() except we capture slave_raw_fd ---
+
+        let seccomp_filter = if let Some(profile) = &self.seccomp_profile {
+            match profile {
+                SeccompProfile::Docker => Some(crate::seccomp::docker_default_filter()
+                    .map_err(|e| Error::Seccomp(e))?),
+                SeccompProfile::Minimal => Some(crate::seccomp::minimal_filter()
+                    .map_err(|e| Error::Seccomp(e))?),
+                SeccompProfile::None => None,
+            }
+        } else {
+            None
+        };
+
+        let join_ns_files: Vec<(File, Namespace)> = self.join_namespaces
+            .iter()
+            .map(|(path, ns)| {
+                File::open(path)
+                    .map(|f| (f, *ns))
+                    .map_err(Error::Io)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let join_ns_fds: Vec<(i32, Namespace)> = join_ns_files
+            .iter()
+            .map(|(f, ns)| (f.as_raw_fd(), *ns))
+            .collect();
+
+        let namespaces = self.namespaces;
+        let chroot_dir = self.chroot_dir.clone();
+        let user_pre_exec = self.pre_exec.take();
+        let uid_maps = self.uid_maps.clone();
+        let gid_maps = self.gid_maps.clone();
+        let uid = self.uid;
+        let gid = self.gid;
+        let mount_proc = self.mount_proc;
+        let mount_sys = self.mount_sys;
+        let mount_dev = self.mount_dev;
+        let pivot_root = self.pivot_root.clone();
+        let capabilities = self.capabilities;
+        let rlimits = self.rlimits.clone();
+        let no_new_privileges = self.no_new_privileges;
+        let readonly_rootfs = self.readonly_rootfs;
+        let masked_paths = self.masked_paths.clone();
+
+        unsafe {
+            self.inner.pre_exec(move || {
+                use std::ptr;
+                use std::ffi::CString;
+
+                // Step 0: PTY slave setup — runs before everything else.
+                // Create a new session so the container is isolated from the
+                // parent's session, then make the slave our controlling terminal.
+                let setsid_ret = libc::setsid();
+                if setsid_ret < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // TIOCSCTTY: make the slave the controlling terminal of this session
+                let ioctl_ret = libc::ioctl(slave_raw_fd, libc::TIOCSCTTY, 0 as libc::c_int);
+                if ioctl_ret < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Wire stdin/stdout/stderr to the slave
+                for dest_fd in [0i32, 1, 2] {
+                    if slave_raw_fd != dest_fd {
+                        let dup_ret = libc::dup2(slave_raw_fd, dest_fd);
+                        if dup_ret < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+                // Close the original slave fd — 0/1/2 are now the duplicates
+                libc::close(slave_raw_fd);
+
+                // Steps 1–7: identical to spawn() from here
+                if !namespaces.is_empty() {
+                    let flags = namespaces.to_clone_flags();
+                    unshare(flags).map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+
+                    if namespaces.contains(Namespace::MOUNT) {
+                        use std::ffi::CStr;
+                        let root = CStr::from_bytes_with_nul(b"/\0").unwrap();
+                        let result = libc::mount(
+                            ptr::null(),
+                            root.as_ptr(),
+                            ptr::null(),
+                            libc::MS_PRIVATE | libc::MS_REC,
+                            ptr::null(),
+                        );
+                        if result != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+
+                if !uid_maps.is_empty() || !gid_maps.is_empty() {
+                    if let Some(uid_val) = uid {
+                        let result = libc::setuid(uid_val);
+                        if result != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(gid_val) = gid {
+                        let result = libc::setgid(gid_val);
+                        if result != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+
+                if let Some((ref new_root, ref put_old)) = pivot_root {
+                    use std::os::unix::ffi::OsStrExt;
+                    std::fs::create_dir_all(put_old).ok();
+
+                    let new_root_c = CString::new(new_root.as_os_str().as_bytes()).unwrap();
+                    let put_old_c = CString::new(put_old.as_os_str().as_bytes()).unwrap();
+
+                    #[cfg(target_arch = "x86_64")]
+                    const SYS_PIVOT_ROOT: i64 = 155;
+                    #[cfg(target_arch = "aarch64")]
+                    const SYS_PIVOT_ROOT: i64 = 41;
+
+                    let result = libc::syscall(SYS_PIVOT_ROOT, new_root_c.as_ptr(), put_old_c.as_ptr());
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    std::env::set_current_dir("/")?;
+
+                    let put_old_rel = put_old.strip_prefix(new_root)
+                        .map_err(|_| io::Error::other("put_old must be inside new_root"))?;
+                    let put_old_rel_c = CString::new(put_old_rel.as_os_str().as_bytes()).unwrap();
+                    libc::umount2(put_old_rel_c.as_ptr(), libc::MNT_DETACH);
+                } else if let Some(ref dir) = chroot_dir {
+                    use std::os::unix::ffi::OsStrExt;
+
+                    if readonly_rootfs {
+                        let dir_c = CString::new(dir.as_os_str().as_bytes()).unwrap();
+                        let result = libc::mount(
+                            dir_c.as_ptr(),
+                            dir_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND | libc::MS_REC,
+                            ptr::null(),
+                        );
+                        if result != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+
+                    chroot(dir).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+                    std::env::set_current_dir("/")?;
+                }
+
+                if mount_proc {
+                    let proc = CString::new("proc").unwrap();
+                    let result = libc::mount(proc.as_ptr(), proc.as_ptr(), proc.as_ptr(), 0, ptr::null());
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if mount_sys {
+                    let sys = CString::new("/sys").unwrap();
+                    let sysfs = CString::new("sysfs").unwrap();
+                    let result = libc::mount(sys.as_ptr(), sys.as_ptr(), sysfs.as_ptr(), libc::MS_BIND, ptr::null());
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if mount_dev {
+                    let dev = CString::new("/dev").unwrap();
+                    let result = libc::mount(dev.as_ptr(), dev.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null());
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if let Some(keep_caps) = capabilities {
+                    const PR_CAPBSET_DROP: i32 = 24;
+                    for cap in 0..38 {
+                        let cap_bit = 1u64 << cap;
+                        if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
+                            let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+                            if result != 0 {
+                                let err = io::Error::last_os_error();
+                                if err.raw_os_error() != Some(libc::EINVAL) {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !masked_paths.is_empty() {
+                    let dev_null = CString::new("/dev/null").unwrap();
+                    for path in &masked_paths {
+                        let path_c = match CString::new(path.as_os_str().as_encoded_bytes()) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        libc::mount(dev_null.as_ptr(), path_c.as_ptr(), ptr::null(), libc::MS_BIND, ptr::null());
+                    }
+                }
+
+                if readonly_rootfs {
+                    let root = CString::new("/").unwrap();
+                    let result = libc::mount(
+                        ptr::null(),
+                        root.as_ptr(),
+                        ptr::null(),
+                        libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_BIND,
+                        ptr::null(),
+                    );
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                for limit in &rlimits {
+                    let rlimit = libc::rlimit { rlim_cur: limit.soft, rlim_max: limit.hard };
+                    let result = libc::setrlimit(limit.resource, &rlimit);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if let Some(cb) = &user_pre_exec {
+                    cb()?;
+                }
+
+                for (fd, _ns) in &join_ns_fds {
+                    let result = libc::setns(*fd, 0);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if no_new_privileges {
+                    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+                    let result = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                if let Some(ref filter) = seccomp_filter {
+                    crate::seccomp::apply_filter(filter)?;
+                }
+
+                Ok(())
+            });
+        }
+
+        let child = self.inner.spawn().map_err(Error::Spawn)?;
+
+        // Close the slave in the parent — only the child should have it.
+        // If we keep it open, POLLHUP on the master will never fire when
+        // the container exits (because we still hold a reference to the slave).
+        drop(slave);
+        drop(join_ns_files);
+
+        Ok(crate::pty::InteractiveSession {
+            master,
+            child: Child { inner: child },
+        })
+    }
 }
 
 /// A handle to a spawned child process.
