@@ -33,7 +33,7 @@
 
 Remora is a modern, lightweight Linux container runtime written in Rust. It provides a safe, ergonomic API for creating containerized processes using Linux namespaces, seccomp filtering, capabilities, and resource limits.
 
-## Current State (Updated Feb 16, 2026)
+## Current State (Updated Feb 17, 2026)
 
 ### ✅ Completed Features
 
@@ -71,6 +71,13 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **tmpfs mounts**: `with_tmpfs()` — in-memory writable scratch space (works with read-only rootfs)
 - **Named volumes**: `Volume::create/open/delete` backed by `/var/lib/remora/volumes/<name>/`; `with_volume()` builder method
 
+**Networking (Phase 6 IN PROGRESS 🔄):**
+- **N1 Loopback**: `with_network(NetworkMode::Loopback)` — isolated NET namespace, lo brought up via ioctl (127.0.0.1 active)
+- **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via `/run/remora/next_ip`
+- **Automatic cleanup**: veth pair deleted in `wait()` / `wait_with_output()`
+- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`
+- N3 (NAT), N4 (port mapping), N5 (DNS) — pending
+
 **Advanced:**
 - UID/GID mapping for user namespaces
 - Namespace joining (attach to existing namespaces)
@@ -82,13 +89,14 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 src/
   lib.rs                  # Library entry point
   main.rs                 # CLI binary
-  container.rs            # Main API (~1900 lines)
+  container.rs            # Main API (~1950 lines)
   cgroup.rs               # Cgroups v2 resource management
+  network.rs              # Native networking (N1 loopback, N2 bridge)
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
 
 tests/
-  integration_tests.rs    # 31 integration tests (require root)
+  integration_tests.rs    # 35 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -302,7 +310,7 @@ Many features require root or CAP_SYS_ADMIN
 | Bind mounts | ✅ RW + RO | ✅ |
 | tmpfs mounts | ✅ | ✅ |
 | Named volumes | ✅ | ✅ |
-| Networking | ⚠️ Join only | ✅ CNI |
+| Networking | 🔄 Loopback + Bridge (N1/N2) | ✅ Native libnetwork |
 | OCI Compatible | ❌ | ✅ |
 
 **Current parity: ~60% of runc features**

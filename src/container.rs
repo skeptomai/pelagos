@@ -385,6 +385,8 @@ pub struct Command {
     rlimits: Vec<ResourceLimit>,
     // Cgroup-based resource management
     cgroup_config: Option<crate::cgroup::CgroupConfig>,
+    // Network configuration
+    network_config: Option<crate::network::NetworkConfig>,
 }
 
 impl Command {
@@ -413,6 +415,7 @@ impl Command {
             tmpfs_mounts: Vec::new(),
             rlimits: Vec::new(),
             cgroup_config: None,
+            network_config: None,
         }
     }
 
@@ -778,6 +781,38 @@ impl Command {
         self
     }
 
+    /// Configure container networking.
+    ///
+    /// - [`NetworkMode::None`](crate::network::NetworkMode::None) — share the host
+    ///   network stack (default, no changes).
+    /// - [`NetworkMode::Loopback`](crate::network::NetworkMode::Loopback) — create an
+    ///   isolated network namespace with only the loopback interface (`lo`, 127.0.0.1).
+    /// - [`NetworkMode::Bridge`](crate::network::NetworkMode::Bridge) — create an isolated
+    ///   network namespace connected to the `remora0` bridge (172.19.0.x/24).
+    ///
+    /// `Loopback` and `Bridge` modes automatically add [`Namespace::NET`] to the
+    /// namespace set, so you don't need to call `.with_namespaces(Namespace::NET)` separately.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use remora::network::NetworkMode;
+    ///
+    /// // Isolated loopback only
+    /// Command::new("/bin/sh").with_network(NetworkMode::Loopback).spawn()?;
+    ///
+    /// // Full bridge networking
+    /// Command::new("/bin/sh").with_network(NetworkMode::Bridge).spawn()?;
+    /// ```
+    pub fn with_network(mut self, mode: crate::network::NetworkMode) -> Self {
+        // Loopback and Bridge require their own NET namespace.
+        if matches!(mode, crate::network::NetworkMode::Loopback | crate::network::NetworkMode::Bridge) {
+            self.namespaces |= Namespace::NET;
+        }
+        self.network_config = Some(crate::network::NetworkConfig { mode });
+        self
+    }
+
     /// Apply Docker's default seccomp profile (recommended).
     ///
     /// This blocks ~44 dangerous syscalls commonly used in container escapes
@@ -1032,6 +1067,11 @@ impl Command {
         let masked_paths = self.masked_paths.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
+        // True when the container's lo should be brought up inside pre_exec.
+        // (NetworkMode::None leaves lo alone; Loopback/Bridge bring it up.)
+        let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
+            matches!(c.mode, crate::network::NetworkMode::Loopback | crate::network::NetworkMode::Bridge)
+        });
 
         // Install our combined pre_exec hook
         unsafe {
@@ -1062,6 +1102,13 @@ impl Command {
                         if result != 0 {
                             return Err(io::Error::last_os_error());
                         }
+                    }
+
+                    // Step 1.6: Bring up loopback interface if network isolation requested.
+                    // Must happen after unshare(CLONE_NEWNET) so we target our own netns.
+                    if bring_up_loopback {
+                        crate::network::bring_up_loopback()
+                            .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
                     }
                 }
 
@@ -1426,7 +1473,15 @@ impl Command {
             None
         };
 
-        Ok(Child { inner: child_inner, cgroup })
+        // Set up bridge networking (parent-side, after fork)
+        let network = match &self.network_config {
+            Some(cfg) if cfg.mode == crate::network::NetworkMode::Bridge => {
+                Some(crate::network::setup_bridge_network(child_inner.id()).map_err(Error::Io)?)
+            }
+            _ => None,
+        };
+
+        Ok(Child { inner: child_inner, cgroup, network })
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -1514,6 +1569,9 @@ impl Command {
         let masked_paths = self.masked_paths.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
+        let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
+            matches!(c.mode, crate::network::NetworkMode::Loopback | crate::network::NetworkMode::Bridge)
+        });
 
         unsafe {
             self.inner.pre_exec(move || {
@@ -1564,6 +1622,11 @@ impl Command {
                         if result != 0 {
                             return Err(io::Error::last_os_error());
                         }
+                    }
+
+                    if bring_up_loopback {
+                        crate::network::bring_up_loopback()
+                            .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
                     }
                 }
 
@@ -1805,9 +1868,17 @@ impl Command {
             None
         };
 
+        // Set up bridge networking (parent-side, after fork)
+        let network = match &self.network_config {
+            Some(cfg) if cfg.mode == crate::network::NetworkMode::Bridge => {
+                Some(crate::network::setup_bridge_network(child_inner.id()).map_err(Error::Io)?)
+            }
+            _ => None,
+        };
+
         Ok(crate::pty::InteractiveSession {
             master,
-            child: Child { inner: child_inner, cgroup },
+            child: Child { inner: child_inner, cgroup, network },
         })
     }
 }
@@ -1837,6 +1908,8 @@ pub struct Child {
     inner: process::Child,
     /// Optional cgroup for this container. Deleted after the child exits.
     pub(crate) cgroup: Option<cgroups_rs::fs::Cgroup>,
+    /// Optional network state (veth pair). Torn down after the child exits.
+    network: Option<crate::network::NetworkSetup>,
 }
 
 impl Child {
@@ -1854,6 +1927,9 @@ impl Child {
         if let Some(cg) = self.cgroup.take() {
             crate::cgroup::teardown_cgroup(cg);
         }
+        if let Some(ref net) = self.network {
+            crate::network::teardown_network(net);
+        }
         Ok(ExitStatus { inner: status })
     }
 
@@ -1866,6 +1942,9 @@ impl Child {
         let output = self.inner.wait_with_output().map_err(Error::Wait)?;
         if let Some(cg) = self.cgroup {
             crate::cgroup::teardown_cgroup(cg);
+        }
+        if let Some(ref net) = self.network {
+            crate::network::teardown_network(net);
         }
         Ok((
             ExitStatus { inner: output.status },

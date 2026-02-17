@@ -15,6 +15,7 @@
 
 use remora::cgroup::ResourceStats;
 use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume};
+use remora::network::NetworkMode;
 use std::path::PathBuf;
 
 /// Helper to check if we're running as root
@@ -1058,5 +1059,160 @@ fn test_cgroup_cleanup() {
         !std::path::Path::new(&cgroup_path).exists(),
         "Cgroup {} should be deleted after container exits",
         cgroup_path
+    );
+}
+
+// ============================================================================
+// Phase 6: Native Networking Tests — N1 (Loopback) and N2 (Bridge)
+// ============================================================================
+
+/// N1: Loopback-only network mode — lo should come up with 127.0.0.1.
+#[test]
+fn test_loopback_network() {
+    if !is_root() {
+        eprintln!("Skipping test_loopback_network: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_loopback_network: alpine-rootfs not found");
+        return;
+    };
+
+    // with_network(Loopback) automatically adds Namespace::NET and brings up lo.
+    // After lo is up, the kernel assigns 127.0.0.1 automatically.
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LOOPBACK_OK"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Loopback)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_proc_mount()
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn loopback container");
+
+    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(
+        out.contains("LOOPBACK_OK"),
+        "lo should have 127.0.0.1 after bring-up, got: {}",
+        out
+    );
+    assert!(status.success(), "Container exited with failure");
+}
+
+/// N2: Bridge mode — container should receive a 172.19.0.x/24 address on eth0.
+#[test]
+fn test_bridge_network_ip() {
+    if !is_root() {
+        eprintln!("Skipping test_bridge_network_ip: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bridge_network_ip: alpine-rootfs not found");
+        return;
+    };
+
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_proc_mount()
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn bridge container");
+
+    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(
+        out.contains("BRIDGE_IP_OK"),
+        "eth0 should have a 172.19.0.x address in bridge mode, got: {}",
+        out
+    );
+    assert!(status.success(), "Container exited with failure");
+}
+
+/// N2: After spawn(), the host-side veth interface (veth-{pid}) should exist.
+#[test]
+fn test_bridge_network_veth_exists() {
+    if !is_root() {
+        eprintln!("Skipping test_bridge_network_veth_exists: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bridge_network_veth_exists: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "sleep 2"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn bridge container");
+
+    let veth_name = format!("veth-{}", child.pid());
+
+    // The host-side veth should exist while the container is running
+    let status = std::process::Command::new("ip")
+        .args(["link", "show", &veth_name])
+        .status()
+        .expect("Failed to run ip link show");
+    assert!(status.success(), "Host-side veth {} should exist after spawn", veth_name);
+
+    child.wait().expect("Failed to wait for container");
+}
+
+/// N2: After wait(), the veth pair should be deleted (teardown_network called).
+#[test]
+fn test_bridge_network_cleanup() {
+    if !is_root() {
+        eprintln!("Skipping test_bridge_network_cleanup: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bridge_network_cleanup: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "exit 0"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn bridge container");
+
+    let veth_name = format!("veth-{}", child.pid());
+    child.wait().expect("Failed to wait for container");
+
+    // After wait(), teardown_network() removes the veth pair
+    let status = std::process::Command::new("ip")
+        .args(["link", "show", &veth_name])
+        .status()
+        .expect("Failed to run ip link show");
+    assert!(
+        !status.success(),
+        "Host-side veth {} should be gone after container exits",
+        veth_name
     );
 }
