@@ -40,6 +40,9 @@ const REMORA_RUN_DIR: &str = "/run/remora";
 const IPAM_FILE: &str = "/run/remora/next_ip";
 /// Reference count for active NAT containers; protected by flock.
 const NAT_REFCOUNT_FILE: &str = "/run/remora/nat_refcount";
+/// Active port-forward entries; protected by flock. One line per entry:
+/// `{container_ip}:{host_port}:{container_port}`
+const PORT_FORWARDS_FILE: &str = "/run/remora/port_forwards";
 
 /// Monotonically increasing counter for generating unique netns/veth names.
 static NS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -74,6 +77,8 @@ pub struct NetworkSetup {
     pub container_ip: Ipv4Addr,
     /// Whether NAT (MASQUERADE) was enabled for this container.
     pub nat_enabled: bool,
+    /// Port forwards configured for this container: `(host_port, container_port)`.
+    pub port_forwards: Vec<(u16, u16)>,
 }
 
 // ── Name generation ───────────────────────────────────────────────────────────
@@ -234,13 +239,14 @@ fn veth_names_for(ns_name: &str) -> (String, String) {
 /// 7. Assigns the allocated IP and default route to `eth0`.
 /// 8. Attaches `vh-{hash}` to `remora0` and brings it up.
 /// 9. If `nat` is true, enables IP forwarding and installs an nftables MASQUERADE rule.
+/// 10. If `port_forwards` is non-empty, installs nftables DNAT rules.
 ///
 /// The child's `pre_exec` then calls `setns(open("/run/netns/{ns_name}"), CLONE_NEWNET)`
 /// to join the pre-configured namespace.
 ///
 /// Returns a [`NetworkSetup`] that must be passed to [`teardown_network`]
 /// after the container exits.
-pub fn setup_bridge_network(ns_name: &str, nat: bool) -> io::Result<NetworkSetup> {
+pub fn setup_bridge_network(ns_name: &str, nat: bool, port_forwards: Vec<(u16, u16)>) -> io::Result<NetworkSetup> {
     ensure_bridge()?;
 
     let container_ip = allocate_ip()?;
@@ -279,7 +285,18 @@ pub fn setup_bridge_network(ns_name: &str, nat: bool) -> io::Result<NetworkSetup
         enable_nat()?;
     }
 
-    Ok(NetworkSetup { veth_host, ns_name: ns_name.to_string(), container_ip, nat_enabled: nat })
+    // 8. Optionally install port-forward (DNAT) rules.
+    if !port_forwards.is_empty() {
+        enable_port_forwards(container_ip, &port_forwards)?;
+    }
+
+    Ok(NetworkSetup {
+        veth_host,
+        ns_name: ns_name.to_string(),
+        container_ip,
+        nat_enabled: nat,
+        port_forwards,
+    })
 }
 
 /// Remove the container's veth pair and named network namespace.
@@ -297,6 +314,9 @@ pub fn teardown_network(setup: &NetworkSetup) {
     }
     if let Err(e) = run("ip", &["netns", "del", &setup.ns_name]) {
         log::warn!("network teardown netns (non-fatal): {}", e);
+    }
+    if !setup.port_forwards.is_empty() {
+        disable_port_forwards(setup.container_ip, &setup.port_forwards);
     }
     if setup.nat_enabled {
         disable_nat();
@@ -371,7 +391,12 @@ fn enable_nat() -> io::Result<()> {
     Ok(())
 }
 
-/// Decrement the NAT refcount; remove the nftables table when reaching zero.
+/// Decrement the NAT refcount; remove or trim the nftables table when reaching zero.
+///
+/// If port-forward rules are still active when NAT reaches zero, the table is
+/// kept but the postrouting chain is flushed (MASQUERADE removed).
+/// The table is only fully deleted when both NAT refcount and port-forward list
+/// are empty.
 ///
 /// Errors are non-fatal (logged via `log::warn!`).
 fn disable_nat() {
@@ -396,15 +421,23 @@ fn disable_nat() {
     let count: u32 = content.trim().parse().unwrap_or(0);
 
     if count <= 1 {
-        // Last NAT container exiting — remove the entire remora nftables table.
-        if let Err(e) = run_nft("delete table ip remora\n") {
-            log::warn!("nft delete table ip remora (non-fatal): {}", e);
-        }
         if let Err(e) = file.seek(SeekFrom::Start(0))
             .and_then(|_| file.set_len(0))
             .and_then(|_| { write!(file, "0")?; Ok(()) })
         {
             log::warn!("NAT refcount write (non-fatal): {}", e);
+        }
+        // flock on refcount released; now decide what to do with the table.
+        drop(file);
+
+        if read_port_forwards_count() == 0 {
+            // No active port forwards either — remove the entire table.
+            if let Err(e) = run_nft("delete table ip remora\n") {
+                log::warn!("nft delete table ip remora (non-fatal): {}", e);
+            }
+        } else {
+            // Port forwards still active — remove MASQUERADE but keep the table.
+            let _ = run_nft("flush chain ip remora postrouting\n");
         }
     } else {
         if let Err(e) = file.seek(SeekFrom::Start(0))
@@ -413,8 +446,174 @@ fn disable_nat() {
         {
             log::warn!("NAT refcount write (non-fatal): {}", e);
         }
+        // flock released when `file` is dropped.
     }
+}
+
+// ── N4: Port mapping (DNAT) ───────────────────────────────────────────────────
+
+/// Parse one line from [`PORT_FORWARDS_FILE`]: `{ip}:{host_port}:{container_port}`.
+fn parse_port_forward_line(line: &str) -> Option<(Ipv4Addr, u16, u16)> {
+    let mut parts = line.splitn(3, ':');
+    let ip: Ipv4Addr = parts.next()?.parse().ok()?;
+    let host_port: u16 = parts.next()?.parse().ok()?;
+    let container_port: u16 = parts.next()?.parse().ok()?;
+    Some((ip, host_port, container_port))
+}
+
+/// Read all port-forward entries from an already-flocked file.
+fn read_port_forwards_locked(file: &mut std::fs::File) -> io::Result<Vec<(Ipv4Addr, u16, u16)>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let entries = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(parse_port_forward_line)
+        .collect();
+    Ok(entries)
+}
+
+/// Count active port-forward entries (reads without locking — for teardown checks only).
+fn read_port_forwards_count() -> usize {
+    let content = match std::fs::read_to_string(PORT_FORWARDS_FILE) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    content.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// Read the NAT refcount without locking (for teardown checks only).
+fn read_nat_refcount() -> u32 {
+    let content = match std::fs::read_to_string(NAT_REFCOUNT_FILE) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    content.trim().parse().unwrap_or(0)
+}
+
+/// Build the nftables script that (re)installs all current DNAT rules.
+///
+/// Uses `add table` / `add chain` (idempotent) so it is safe to call even
+/// when the table already exists (e.g. because NAT/MASQUERADE is active).
+/// `flush chain prerouting` wipes the old rules before rewriting — this is
+/// the flush-and-rebuild strategy that avoids needing to track rule handles.
+fn build_prerouting_script(entries: &[(Ipv4Addr, u16, u16)]) -> String {
+    let mut s = String::from(
+        "add table ip remora\n\
+         add chain ip remora prerouting { type nat hook prerouting priority -100; }\n\
+         flush chain ip remora prerouting\n",
+    );
+    for (ip, host_port, container_port) in entries {
+        s.push_str(&format!(
+            "add rule ip remora prerouting tcp dport {} dnat to {}:{}\n",
+            host_port, ip, container_port
+        ));
+    }
+    s
+}
+
+/// Add port-forward entries to the state file and install nftables DNAT rules.
+///
+/// Uses `flock(LOCK_EX)` on [`PORT_FORWARDS_FILE`] to serialise concurrent
+/// spawns. The `remora0` table / prerouting chain are created idempotently,
+/// so this is safe whether NAT is enabled or not.
+fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::Result<()> {
+    std::fs::create_dir_all(REMORA_RUN_DIR)?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(PORT_FORWARDS_FILE)?;
+
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+
+    let mut entries = read_port_forwards_locked(&mut file)?;
+
+    for &(host_port, container_port) in forwards {
+        entries.push((container_ip, host_port, container_port));
+    }
+
+    // Overwrite file with all entries.
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    for (ip, hp, cp) in &entries {
+        write!(file, "{}:{}:{}\n", ip, hp, cp)?;
+    }
+
+    // Install nftables DNAT rules.
+    let script = build_prerouting_script(&entries);
+    run_nft(&script)?;
+
     // flock released when `file` is dropped.
+    Ok(())
+}
+
+/// Remove a container's port-forward entries and update nftables accordingly.
+///
+/// - If no entries remain AND NAT is also inactive, deletes the entire table.
+/// - If no entries remain BUT NAT is still active, flushes only the prerouting chain.
+/// - If entries remain, rebuilds the prerouting chain from the survivors.
+///
+/// Errors are non-fatal (logged via `log::warn!`).
+fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(PORT_FORWARDS_FILE);
+
+    let mut file = match file {
+        Ok(f) => f,
+        Err(e) => { log::warn!("port forwards file open (non-fatal): {}", e); return; }
+    };
+
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+
+    let entries = match read_port_forwards_locked(&mut file) {
+        Ok(e) => e,
+        Err(e) => { log::warn!("port forwards read (non-fatal): {}", e); return; }
+    };
+
+    // Remove all entries belonging to this container.
+    let remaining: Vec<(Ipv4Addr, u16, u16)> = entries
+        .into_iter()
+        .filter(|(ip, hp, _cp)| {
+            !(*ip == container_ip && forwards.iter().any(|&(h, _)| h == *hp))
+        })
+        .collect();
+
+    // Write remaining entries back.
+    if let Err(e) = file.seek(SeekFrom::Start(0)).and_then(|_| file.set_len(0)) {
+        log::warn!("port forwards file truncate (non-fatal): {}", e);
+        return;
+    }
+    for (ip, hp, cp) in &remaining {
+        let _ = write!(file, "{}:{}:{}\n", ip, hp, cp);
+    }
+
+    // flock released; now update nftables.
+    drop(file);
+
+    if remaining.is_empty() {
+        // No more port forwards — check if NAT is also gone.
+        if read_nat_refcount() == 0 {
+            // Nothing using the table — remove it entirely.
+            if let Err(e) = run_nft("delete table ip remora\n") {
+                log::warn!("nft delete table (non-fatal): {}", e);
+            }
+        } else {
+            // NAT still active — flush prerouting chain only.
+            let _ = run_nft("flush chain ip remora prerouting\n");
+        }
+    } else {
+        // Rebuild prerouting chain from the surviving entries.
+        let script = build_prerouting_script(&remaining);
+        if let Err(e) = run_nft(&script) {
+            log::warn!("nft rebuild prerouting (non-fatal): {}", e);
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

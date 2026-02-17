@@ -389,6 +389,8 @@ pub struct Command {
     network_config: Option<crate::network::NetworkConfig>,
     // Whether to enable NAT (MASQUERADE) for bridge-mode containers.
     nat: bool,
+    // Port-forward rules: (host_port, container_port). Requires Bridge + NAT.
+    port_forwards: Vec<(u16, u16)>,
 }
 
 impl Command {
@@ -419,6 +421,7 @@ impl Command {
             cgroup_config: None,
             network_config: None,
             nat: false,
+            port_forwards: Vec::new(),
         }
     }
 
@@ -838,6 +841,28 @@ impl Command {
         self
     }
 
+    /// Forward a host port into the container (TCP only).
+    ///
+    /// Requires [`NetworkMode::Bridge`] and [`with_nat`](Self::with_nat) (for the
+    /// nftables table to already exist). Installs a DNAT rule via nftables so that
+    /// connections to `host_port` on any host interface are redirected to
+    /// `container_port` on the container's IP.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use remora::network::NetworkMode;
+    /// Command::new("/bin/sh")
+    ///     .with_network(NetworkMode::Bridge)
+    ///     .with_nat()
+    ///     .with_port_forward(8080, 80)   // host:8080 → container:80
+    ///     .spawn()?;
+    /// ```
+    pub fn with_port_forward(mut self, host_port: u16, container_port: u16) -> Self {
+        self.port_forwards.push((host_port, container_port));
+        self
+    }
+
     /// Apply Docker's default seccomp profile (recommended).
     ///
     /// This blocks ~44 dangerous syscalls commonly used in container escapes
@@ -1105,7 +1130,7 @@ impl Command {
         // The child's pre_exec will join it via setns — no race whatsoever.
         let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
             let ns_name = crate::network::generate_ns_name();
-            Some(crate::network::setup_bridge_network(&ns_name, self.nat).map_err(Error::Io)?)
+            Some(crate::network::setup_bridge_network(&ns_name, self.nat, self.port_forwards.clone()).map_err(Error::Io)?)
         } else {
             None
         };
@@ -1628,7 +1653,7 @@ impl Command {
         // Bridge mode: create and fully configure the named netns BEFORE fork.
         let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
             let ns_name = crate::network::generate_ns_name();
-            Some(crate::network::setup_bridge_network(&ns_name, self.nat).map_err(Error::Io)?)
+            Some(crate::network::setup_bridge_network(&ns_name, self.nat, self.port_forwards.clone()).map_err(Error::Io)?)
         } else {
             None
         };

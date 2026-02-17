@@ -1577,3 +1577,181 @@ fn test_nat_refcount() {
         "nft table should be removed after both NAT containers exit"
     );
 }
+
+/// N4: A DNAT rule must exist in the prerouting chain while a port-forward
+/// container is running.
+///
+/// Spawns a bridge+NAT container with `with_port_forward(18080, 80)` running
+/// `sleep 2`. While it sleeps, checks that `nft list chain ip remora prerouting`
+/// succeeds and contains "dport 18080". Waits for the container.
+#[test]
+#[serial(nat)]
+fn test_port_forward_rule_added() {
+    if !is_root() {
+        eprintln!("Skipping test_port_forward_rule_added: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_port_forward_rule_added: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "sleep 2"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_port_forward(18080, 80)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn port-forward container");
+
+    // While the container is sleeping, the prerouting chain must contain the DNAT rule.
+    let output = std::process::Command::new("nft")
+        .args(["list", "chain", "ip", "remora", "prerouting"])
+        .output()
+        .expect("Failed to run nft list chain");
+    assert!(
+        output.status.success(),
+        "nft prerouting chain should exist while port-forward container is running"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("dport 18080"),
+        "prerouting chain should contain DNAT rule for dport 18080; got:\n{}", stdout
+    );
+
+    child.wait().expect("Failed to wait for port-forward container");
+}
+
+/// N4: After a port-forward container exits, its DNAT rule must be cleaned up.
+///
+/// Spawns a bridge+NAT container with `with_port_forward(18081, 80)` that exits
+/// immediately. After `wait()`, asserts that the nftables table is gone entirely
+/// (both NAT and port-forward refcounts are zero).
+#[test]
+#[serial(nat)]
+fn test_port_forward_cleanup() {
+    if !is_root() {
+        eprintln!("Skipping test_port_forward_cleanup: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_port_forward_cleanup: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "exit 0"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_port_forward(18081, 80)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn port-forward container");
+
+    child.wait().expect("Failed to wait for port-forward container");
+
+    // After the container exits, the table must be gone entirely.
+    let status = std::process::Command::new("nft")
+        .args(["list", "table", "ip", "remora"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run nft list table");
+    assert!(
+        !status.success(),
+        "nft table ip remora should be removed after port-forward container exits"
+    );
+}
+
+/// N4: Two containers with different port forwards must be torn down independently.
+///
+/// Spawns A (`sleep 2`, port 18082→80) and B (`sleep 4`, port 18083→80), both
+/// with NAT. Waits for A — the prerouting chain must still contain B's rule
+/// (`dport 18083`) but not A's (`dport 18082`). Waits for B — table must be gone.
+#[test]
+#[serial(nat)]
+fn test_port_forward_independent_teardown() {
+    if !is_root() {
+        eprintln!("Skipping test_port_forward_independent_teardown: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_port_forward_independent_teardown: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child_a = Command::new("/bin/ash")
+        .args(&["-c", "sleep 2"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_port_forward(18082, 80)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn port-forward container A");
+
+    let mut child_b = Command::new("/bin/ash")
+        .args(&["-c", "sleep 4"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_port_forward(18083, 80)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn port-forward container B");
+
+    // Wait for A. B is still running — prerouting must still exist with B's rule.
+    child_a.wait().expect("Failed to wait for container A");
+
+    let output = std::process::Command::new("nft")
+        .args(["list", "chain", "ip", "remora", "prerouting"])
+        .output()
+        .expect("Failed to run nft list chain after A exits");
+    assert!(
+        output.status.success(),
+        "prerouting chain should still exist after A exits (B is still running)"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("dport 18082"),
+        "A's DNAT rule (dport 18082) should be gone after A exits"
+    );
+    assert!(
+        stdout.contains("dport 18083"),
+        "B's DNAT rule (dport 18083) should still be present; got:\n{}", stdout
+    );
+
+    // Wait for B. Both containers gone — table must be removed entirely.
+    child_b.wait().expect("Failed to wait for container B");
+
+    let status = std::process::Command::new("nft")
+        .args(["list", "table", "ip", "remora"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run nft list table after B exits");
+    assert!(
+        !status.success(),
+        "nft table should be removed after both port-forward containers exit"
+    );
+}

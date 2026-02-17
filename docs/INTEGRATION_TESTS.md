@@ -379,3 +379,39 @@ Waits for B, then asserts it exits non-zero (refcount hits 0, table removed).
 Failure would indicate the reference-counting logic in `enable_nat` /
 `disable_nat` is incorrect — either decrementing too eagerly (table gone while B
 runs) or not decrementing at all (table present after both exit).
+
+---
+
+## Phase 6 N4 — Port Mapping Tests
+
+These three tests share the `#[serial(nat)]` key with the N3 tests (port-forward
+rules live in the same `table ip remora`). All three use dedicated port numbers
+(18080–18083) to avoid collision with real services on the host.
+
+### `test_port_forward_rule_added` — N4
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container with `with_port_forward(18080, 80)` running `sleep 2`.
+While it sleeps, runs `nft list chain ip remora prerouting` and asserts exit 0 and
+that the output contains `dport 18080`. Failure would indicate that
+`enable_port_forwards()` did not install the DNAT rule, or that the prerouting chain
+was not created.
+
+### `test_port_forward_cleanup` — N4
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container with `with_port_forward(18081, 80)` that exits
+immediately (`ash -c "exit 0"`). After `wait()`, runs `nft list table ip remora`
+and asserts non-zero exit (table gone). Failure would indicate that
+`disable_port_forwards()` did not clean up nftables state, or that the port-forwards
+state file was not cleared.
+
+### `test_port_forward_independent_teardown` — N4
+**Requires:** root, rootfs
+
+Spawns A (`sleep 2`, port 18082→80) and B (`sleep 4`, port 18083→80), both with NAT.
+Waits for A, then checks: prerouting chain still exists, A's rule (`dport 18082`)
+is gone, B's rule (`dport 18083`) is still present. Waits for B, then asserts the
+table is fully removed. Failure would indicate that `disable_port_forwards()` either
+removed the wrong entries, failed to rebuild the prerouting chain from survivors, or
+deleted the table prematurely while B was still running.
