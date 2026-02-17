@@ -105,6 +105,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Counter for unique overlay merged-dir names.
 static OVERLAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Counter for unique per-container DNS temp-dir names.
+static DNS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 // Re-export SeccompProfile for public API
 pub use crate::seccomp::SeccompProfile;
 
@@ -409,23 +412,6 @@ pub struct Command {
     dns_servers: Vec<String>,
     // Overlay filesystem (upper + work dirs; lower = chroot_dir).
     overlay: Option<OverlayConfig>,
-}
-
-/// Write `nameserver` lines to `{rootfs}/etc/resolv.conf`.
-///
-/// Called from the parent process before fork, using the host-side rootfs path.
-/// Creates `/etc/` if it does not yet exist.
-fn write_dns_config(rootfs: &std::path::Path, servers: &[String]) -> io::Result<()> {
-    let etc = rootfs.join("etc");
-    std::fs::create_dir_all(&etc)?;
-    let resolv = etc.join("resolv.conf");
-    let mut content = String::new();
-    for s in servers {
-        content.push_str("nameserver ");
-        content.push_str(s);
-        content.push('\n');
-    }
-    std::fs::write(resolv, content)
 }
 
 impl Command {
@@ -902,11 +888,13 @@ impl Command {
 
     /// Write DNS nameservers into the container's `/etc/resolv.conf`.
     ///
-    /// Called in the parent before fork — writes `{rootfs}/etc/resolv.conf`
-    /// using the host-side path to the chroot or pivot_root directory.
-    /// No-op if no rootfs is configured. Requires [`NetworkMode::Bridge`] or
-    /// [`NetworkMode::Loopback`] to be useful (containers sharing the host
-    /// network stack can use the host's own `/etc/resolv.conf`).
+    /// Writes nameserver lines to a per-container temp file under
+    /// `/run/remora/dns-{pid}-{n}/resolv.conf` (never touches the shared rootfs)
+    /// and bind-mounts it over `/etc/resolv.conf` inside the container.
+    /// The temp file is removed in `wait()` / `wait_with_output()`.
+    ///
+    /// Requires [`Namespace::MOUNT`] (so the bind mount stays inside the
+    /// container's private mount namespace) and [`with_chroot`](Self::with_chroot).
     ///
     /// # Examples
     ///
@@ -1265,15 +1253,37 @@ impl Command {
                 _ => None,
             };
 
-        // Write DNS config into the rootfs before fork (host-side path).
+        // DNS: write nameservers to a per-container temp file; bind-mount into container.
+        // Requires Namespace::MOUNT so the bind mount stays in the container's private namespace.
         if !self.dns_servers.is_empty() {
-            let rootfs = self.chroot_dir.as_deref()
-                .or_else(|| self.pivot_root.as_ref().map(|(r, _)| r.as_path()));
-            match rootfs {
-                Some(r) => write_dns_config(r, &self.dns_servers).map_err(Error::Io)?,
-                None => log::warn!("with_dns() has no effect without a rootfs (with_chroot or with_pivot_root)"),
+            if !self.namespaces.contains(Namespace::MOUNT) {
+                return Err(Error::Io(io::Error::other("with_dns requires Namespace::MOUNT")));
+            }
+            if self.chroot_dir.is_none() {
+                return Err(Error::Io(io::Error::other("with_dns requires with_chroot")));
             }
         }
+        let dns_temp_dir: Option<PathBuf> = if !self.dns_servers.is_empty() {
+            let pid = unsafe { libc::getpid() };
+            let n = DNS_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from(format!("/run/remora/dns-{}-{}", pid, n));
+            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+            let mut content = String::new();
+            for s in &self.dns_servers {
+                content.push_str("nameserver ");
+                content.push_str(s);
+                content.push('\n');
+            }
+            std::fs::write(dir.join("resolv.conf"), content).map_err(Error::Io)?;
+            Some(dir)
+        } else {
+            None
+        };
+        // Pre-allocate the CString for the temp resolv.conf path (used in pre_exec).
+        let dns_temp_file_cstring: Option<std::ffi::CString> = dns_temp_dir.as_ref().map(|dir| {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
+        });
 
         // Install our combined pre_exec hook
         unsafe {
@@ -1446,6 +1456,30 @@ impl Command {
                     let effective_root: &std::path::Path = overlay_merged.as_ref()
                         .map(|m| std::path::Path::new(m.to_str().unwrap()))
                         .unwrap_or(dir.as_path());
+
+                    // DNS: bind-mount the per-container resolv.conf over /etc/resolv.conf.
+                    // Done here (before chroot) using the host-side effective_root path.
+                    // Because Namespace::MOUNT is required, the bind mount is scoped to this
+                    // container's private mount namespace — the host's rootfs is never touched.
+                    if let Some(ref dns_src) = dns_temp_file_cstring {
+                        let etc_host = effective_root.join("etc");
+                        std::fs::create_dir_all(&etc_host)
+                            .map_err(|e| io::Error::other(format!("dns mkdir /etc: {}", e)))?;
+                        let resolv_host = etc_host.join("resolv.conf");
+                        let tgt_c = std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
+                        // Ensure target file exists — bind mount requires the target to exist.
+                        let fd = libc::open(tgt_c.as_ptr(),
+                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                            0o644u32);
+                        if fd >= 0 { libc::close(fd); }
+                        let r = libc::mount(dns_src.as_ptr(), tgt_c.as_ptr(),
+                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "dns bind mount: {}", io::Error::last_os_error()
+                            )));
+                        }
+                    }
 
                     // If readonly rootfs is requested, bind-mount the effective root to itself
                     // BEFORE chroot — this makes it a proper mount point so we can remount it
@@ -1716,7 +1750,7 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
-        Ok(Child { inner: child_inner, cgroup, network, overlay_merged_dir })
+        Ok(Child { inner: child_inner, cgroup, network, overlay_merged_dir, dns_temp_dir })
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -1855,15 +1889,35 @@ impl Command {
                 _ => None,
             };
 
-        // Write DNS config into the rootfs before fork (host-side path).
+        // DNS: write nameservers to a per-container temp file; bind-mount into container.
         if !self.dns_servers.is_empty() {
-            let rootfs = self.chroot_dir.as_deref()
-                .or_else(|| self.pivot_root.as_ref().map(|(r, _)| r.as_path()));
-            match rootfs {
-                Some(r) => write_dns_config(r, &self.dns_servers).map_err(Error::Io)?,
-                None => log::warn!("with_dns() has no effect without a rootfs (with_chroot or with_pivot_root)"),
+            if !self.namespaces.contains(Namespace::MOUNT) {
+                return Err(Error::Io(io::Error::other("with_dns requires Namespace::MOUNT")));
+            }
+            if self.chroot_dir.is_none() {
+                return Err(Error::Io(io::Error::other("with_dns requires with_chroot")));
             }
         }
+        let dns_temp_dir: Option<PathBuf> = if !self.dns_servers.is_empty() {
+            let pid = unsafe { libc::getpid() };
+            let n = DNS_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from(format!("/run/remora/dns-{}-{}", pid, n));
+            std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+            let mut content = String::new();
+            for s in &self.dns_servers {
+                content.push_str("nameserver ");
+                content.push_str(s);
+                content.push('\n');
+            }
+            std::fs::write(dir.join("resolv.conf"), content).map_err(Error::Io)?;
+            Some(dir)
+        } else {
+            None
+        };
+        let dns_temp_file_cstring: Option<std::ffi::CString> = dns_temp_dir.as_ref().map(|dir| {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
+        });
 
         unsafe {
             self.inner.pre_exec(move || {
@@ -1995,6 +2049,26 @@ impl Command {
                     let effective_root: &std::path::Path = overlay_merged.as_ref()
                         .map(|m| std::path::Path::new(m.to_str().unwrap()))
                         .unwrap_or(dir.as_path());
+
+                    // DNS: bind-mount the per-container resolv.conf over /etc/resolv.conf.
+                    if let Some(ref dns_src) = dns_temp_file_cstring {
+                        let etc_host = effective_root.join("etc");
+                        std::fs::create_dir_all(&etc_host)
+                            .map_err(|e| io::Error::other(format!("dns mkdir /etc: {}", e)))?;
+                        let resolv_host = etc_host.join("resolv.conf");
+                        let tgt_c = std::ffi::CString::new(resolv_host.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(tgt_c.as_ptr(),
+                                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                            0o644u32);
+                        if fd >= 0 { libc::close(fd); }
+                        let r = libc::mount(dns_src.as_ptr(), tgt_c.as_ptr(),
+                                            ptr::null(), libc::MS_BIND, ptr::null());
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "dns bind mount: {}", io::Error::last_os_error()
+                            )));
+                        }
+                    }
 
                     // Skip readonly self-bind when overlay active — overlayfs IS a proper mount point.
                     if readonly_rootfs && overlay_merged.is_none() {
@@ -2200,7 +2274,7 @@ impl Command {
 
         Ok(crate::pty::InteractiveSession {
             master,
-            child: Child { inner: child_inner, cgroup, network, overlay_merged_dir },
+            child: Child { inner: child_inner, cgroup, network, overlay_merged_dir, dns_temp_dir },
         })
     }
 }
@@ -2234,6 +2308,8 @@ pub struct Child {
     network: Option<crate::network::NetworkSetup>,
     /// Overlay merged-dir created before fork; removed after the child exits.
     overlay_merged_dir: Option<PathBuf>,
+    /// Per-container DNS temp dir (`/run/remora/dns-{pid}-{n}/`); removed after child exits.
+    dns_temp_dir: Option<PathBuf>,
 }
 
 impl Child {
@@ -2279,6 +2355,9 @@ impl Child {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+        if let Some(ref dir) = self.dns_temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         Ok(ExitStatus { inner: status })
     }
 
@@ -2300,6 +2379,9 @@ impl Child {
             if let Some(parent) = merged.parent() {
                 let _ = std::fs::remove_dir(parent);
             }
+        }
+        if let Some(ref dir) = self.dns_temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
         }
         Ok((
             ExitStatus { inner: output.status },

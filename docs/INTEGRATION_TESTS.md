@@ -425,10 +425,11 @@ deleted the table prematurely while B was still running.
 
 Spawns a bridge+NAT container with `with_dns(&["1.1.1.1", "8.8.8.8"])` that runs
 `cat /etc/resolv.conf` and captures stdout. Asserts the output contains both
-`nameserver 1.1.1.1` and `nameserver 8.8.8.8`. Failure would indicate that
-`write_dns_config()` did not write the file, wrote to the wrong path, or produced
-incorrect content. This test does not perform a live DNS lookup — it only verifies
-the file was written correctly.
+`nameserver 1.1.1.1` and `nameserver 8.8.8.8`. Failure would indicate that the
+per-container temp resolv.conf was not created, the bind mount over
+`effective_root/etc/resolv.conf` failed, or the content was incorrect.
+This test does not perform a live DNS lookup — it only verifies the file is visible
+and correct inside the container. The shared Alpine rootfs is never modified.
 
 ---
 

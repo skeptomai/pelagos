@@ -71,9 +71,10 @@
   before deleting the table
 
 **N5 — DNS**
-- `with_dns(&["1.1.1.1", "8.8.8.8"])`: writes `{rootfs}/etc/resolv.conf` in parent
-  before fork using the host-side rootfs path
-- No-op if no rootfs is configured
+- `with_dns(&["1.1.1.1", "8.8.8.8"])`: writes to a per-container temp file at
+  `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it over `/etc/resolv.conf`
+  inside the container — the shared rootfs is never modified
+- Requires `Namespace::MOUNT` and `with_chroot`; temp file removed in `wait()`
 
 ---
 

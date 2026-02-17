@@ -26,6 +26,18 @@ When ready to implement, expand this section with the full plan before proceedin
 
 ## Completed Tasks
 
+### DNS Fix ✅
+
+Replaced the incorrect `write_dns_config()` approach (which permanently mutated the
+shared rootfs) with a per-container temp file + bind mount:
+
+- Parent writes nameservers to `/run/remora/dns-{pid}-{n}/resolv.conf` before fork
+- `pre_exec` bind-mounts that file over `effective_root/etc/resolv.conf` inside the
+  container's private mount namespace — the shared rootfs is never touched
+- Temp dir removed in `wait()` / `wait_with_output()` via `remove_dir_all`
+- Requires `Namespace::MOUNT` (so the bind mount stays in the container's namespace)
+  and `with_chroot`; returns an error if either is missing
+
 ### Overlay Filesystem ✅
 
 Implemented `with_overlay(upper_dir, work_dir)` — copy-on-write layered rootfs.

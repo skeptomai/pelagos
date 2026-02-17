@@ -39,7 +39,7 @@ a daemon, without CNI plugins, and without image management.
   `/run/remora/next_ip` (flock-protected)
 - **NAT:** `with_nat()` — nftables MASQUERADE, reference-counted across containers
 - **Port mapping:** `with_port_forward(host, container)` — TCP DNAT via nftables
-- **DNS:** `with_dns(&["1.1.1.1", "8.8.8.8"])` — writes `/etc/resolv.conf` into rootfs
+- **DNS:** `with_dns(&["1.1.1.1", "8.8.8.8"])` — bind-mounts a per-container resolv.conf; shared rootfs is never modified
 
 ### Interactive Containers
 - **PTY:** `spawn_interactive()` allocates a PTY pair via `openpty()`

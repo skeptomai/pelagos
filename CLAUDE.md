@@ -96,7 +96,7 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via `/run/remora/next_ip`
 - **N3 NAT**: `with_nat()` — nftables MASQUERADE, reference-counted via `/run/remora/nat_refcount`
 - **N4 Port mapping**: `with_port_forward(host_port, container_port)` — TCP DNAT via nftables prerouting
-- **N5 DNS**: `with_dns(&[...])` — writes `{rootfs}/etc/resolv.conf` in parent before fork
+- **N5 DNS**: `with_dns(&[...])` — writes to `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it into the container; shared rootfs is never modified; requires `Namespace::MOUNT` + `with_chroot`
 - **Automatic cleanup**: veth pair, netns, nftables rules cleaned up in `wait()` / `wait_with_output()`
 - **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
 
