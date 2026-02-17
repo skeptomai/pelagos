@@ -1,7 +1,7 @@
 # Remora: Active Development Tasks
 
 **Last Updated:** 2026-02-17
-**Current Status:** Phase 6 (Networking) — N1+N2 in progress
+**Current Status:** Phase 6 (Networking) — N1+N2 implementing named-netns approach
 
 ---
 
@@ -21,16 +21,43 @@ Full plan: `docs/PHASE6_NETWORKING_PLAN.md`
 
 ### Architecture Decision
 - **Native networking** (not CNI) — full control, no external plugins required
-- **Sync implementation** — `ip`/`nsenter` via `std::process::Command` for host-side setup
-- **ioctl** for loopback bring-up inside container (pre_exec, no allocation issues)
+- **Named netns for N2** — `ip netns add/exec/del` configures bridge BEFORE fork; child joins
+  via `setns()` in pre_exec. Eliminates all races (container sees configured network from exec).
+- **ioctl** for loopback bring-up inside container (pre_exec for Loopback mode)
 - Shell out to `nft` for NAT/port-mapping rules (N3/N4)
+
+#### Why named netns (not fd-passing, not sync-pipe)?
+
+| Approach | Problem |
+|----------|---------|
+| Sync pipe in pre_exec | Deadlock: Rust's spawn() blocks until child exec()s via fail-pipe; pre_exec blocking prevents exec |
+| Open /proc/{pid}/ns/net after spawn | ENOENT if container exits before parent opens the file (`exit 0` containers) |
+| SCM_RIGHTS fd passing | Complex + still doesn't fix container-visible race (polling still needed) |
+| **Named netns (chosen)** | No race at all — setup is 100% complete before fork |
+
+#### Named netns implementation:
+
+```
+ip netns add rem-{pid}-{n}                   # creates /run/netns/rem-{pid}-{n}
+ip -n rem-{pid}-{n} link set lo up           # bring up lo inside the netns
+ip link add vh-{hash} type veth peer vp-{hash}
+ip link set vp-{hash} netns rem-{pid}-{n}    # move peer into named netns
+ip -n rem-{pid}-{n} link set vp-{hash} name eth0
+ip -n rem-{pid}-{n} addr add {ip}/24 dev eth0
+ip -n rem-{pid}-{n} link set eth0 up
+ip -n rem-{pid}-{n} route add default via 172.19.0.1
+ip link set vh-{hash} master remora0
+ip link set vh-{hash} up
+# In pre_exec: open("/run/netns/rem-{pid}-{n}") + setns(fd, CLONE_NEWNET)
+# In teardown: ip link del vh-{hash} && ip netns del rem-{pid}-{n}
+```
 
 ### Sub-phases
 
 | Phase | Feature | Tests | Status |
 |-------|---------|-------|--------|
 | N1 | Loopback bring-up in NET namespace | +1 → 32 | 🔄 In progress |
-| N2 | veth + remora0 bridge + IPAM | +3 → 35 | 🔄 In progress |
+| N2 | veth + remora0 bridge + IPAM (named netns) | +3 → 35 | 🔄 In progress |
 | N3 | NAT / internet access (nftables MASQUERADE) | +2 → 37 | ⏳ Pending |
 | N4 | Port mapping (DNAT rules) | +2 → 39 | ⏳ Pending |
 | N5 | DNS (write /etc/resolv.conf) | +2 → 41 | ⏳ Pending |

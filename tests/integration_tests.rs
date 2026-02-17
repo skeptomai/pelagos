@@ -1117,6 +1117,7 @@ fn test_bridge_network_ip() {
         return;
     };
 
+    // Named netns is fully configured before fork; eth0 is ready from the first instruction.
     let child = Command::new("/bin/ash")
         .args(&["-c", "ip addr show eth0 | grep -q '172.19.0' && echo BRIDGE_IP_OK"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -1140,7 +1141,7 @@ fn test_bridge_network_ip() {
     assert!(status.success(), "Container exited with failure");
 }
 
-/// N2: After spawn(), the host-side veth interface (veth-{pid}) should exist.
+/// N2: After spawn(), the host-side veth interface (vh-{hash}) should exist.
 #[test]
 fn test_bridge_network_veth_exists() {
     if !is_root() {
@@ -1165,7 +1166,7 @@ fn test_bridge_network_veth_exists() {
         .spawn()
         .expect("Failed to spawn bridge container");
 
-    let veth_name = format!("veth-{}", child.pid());
+    let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
 
     // The host-side veth should exist while the container is running
     let status = std::process::Command::new("ip")
@@ -1190,6 +1191,7 @@ fn test_bridge_network_cleanup() {
         return;
     };
 
+    // Named netns is set up before fork — exit 0 is safe (no race with setup).
     let mut child = Command::new("/bin/ash")
         .args(&["-c", "exit 0"])
         .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -1202,10 +1204,10 @@ fn test_bridge_network_cleanup() {
         .spawn()
         .expect("Failed to spawn bridge container");
 
-    let veth_name = format!("veth-{}", child.pid());
+    let veth_name = child.veth_name().expect("Bridge mode must have a veth name").to_string();
     child.wait().expect("Failed to wait for container");
 
-    // After wait(), teardown_network() removes the veth pair
+    // After wait(), teardown_network() removes the veth pair and the named netns.
     let status = std::process::Command::new("ip")
         .args(["link", "show", &veth_name])
         .status()
@@ -1215,4 +1217,195 @@ fn test_bridge_network_cleanup() {
         "Host-side veth {} should be gone after container exits",
         veth_name
     );
+}
+
+/// N2: After wait(), the named netns (/run/netns/rem-*) should also be deleted.
+#[test]
+fn test_bridge_netns_cleanup() {
+    if !is_root() {
+        eprintln!("Skipping test_bridge_netns_cleanup: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bridge_netns_cleanup: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "exit 0"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn bridge container");
+
+    let ns_name = child.netns_name().expect("Bridge mode must have netns name").to_string();
+    let ns_path = format!("/run/netns/{}", ns_name);
+
+    // The named netns should exist before wait()
+    assert!(
+        std::path::Path::new(&ns_path).exists(),
+        "Named netns {} should exist before wait()",
+        ns_path
+    );
+
+    child.wait().expect("Failed to wait for container");
+
+    // After wait(), teardown_network() should have deleted the named netns
+    assert!(
+        !std::path::Path::new(&ns_path).exists(),
+        "Named netns {} should be deleted after wait()",
+        ns_path
+    );
+}
+
+/// N2: Loopback (127.0.0.1) should be up inside a bridge-mode container.
+///
+/// setup_bridge_network() runs `ip -n {ns_name} link set lo up` before fork;
+/// this test verifies that the container sees lo correctly.
+#[test]
+fn test_bridge_loopback_up() {
+    if !is_root() {
+        eprintln!("Skipping test_bridge_loopback_up: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bridge_loopback_up: alpine-rootfs not found");
+        return;
+    };
+
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "ip addr show lo | grep -q '127.0.0.1' && echo LO_OK"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_proc_mount()
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn bridge container");
+
+    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(
+        out.contains("LO_OK"),
+        "lo should be up with 127.0.0.1 in bridge mode, got: {:?}",
+        out
+    );
+    assert!(status.success(), "Container exited with failure");
+}
+
+/// N2: The bridge gateway (172.19.0.1 on remora0) should be reachable via ICMP.
+///
+/// Verifies actual layer-3 connectivity through the veth pair: the container
+/// sends a ping, the packet traverses eth0→veth→bridge, and the host replies.
+#[test]
+fn test_bridge_gateway_reachable() {
+    if !is_root() {
+        eprintln!("Skipping test_bridge_gateway_reachable: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bridge_gateway_reachable: alpine-rootfs not found");
+        return;
+    };
+
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "ping -c 1 -W 2 172.19.0.1 >/dev/null 2>&1 && echo PING_OK"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .with_proc_mount()
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn bridge container");
+
+    let (status, stdout, _) = child.wait_with_output().expect("Failed to collect output");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(
+        out.contains("PING_OK"),
+        "Gateway 172.19.0.1 should be reachable from bridge container, got: {:?}",
+        out
+    );
+    assert!(status.success(), "Container exited with failure");
+}
+
+/// N2: Two bridge containers spawned concurrently must receive different IPs.
+///
+/// Exercises the flock-protected IPAM and the atomic ns-name counter under
+/// real concurrency. Each thread builds, spawns, and collects its container
+/// entirely within that thread — no non-Send types cross thread boundaries.
+#[test]
+fn test_bridge_concurrent_spawn() {
+    if !is_root() {
+        eprintln!("Skipping test_bridge_concurrent_spawn: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_bridge_concurrent_spawn: alpine-rootfs not found");
+        return;
+    };
+
+    // Build and run each container entirely inside its thread.
+    // The closures capture only PathBuf (Send); Command and Child stay local.
+    let r1 = rootfs.clone();
+    let t1 = std::thread::spawn(move || {
+        Command::new("/bin/ash")
+            .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&r1)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container 1")
+            .wait_with_output()
+            .expect("Failed to collect output from container 1")
+    });
+
+    let r2 = rootfs.clone();
+    let t2 = std::thread::spawn(move || {
+        Command::new("/bin/ash")
+            .args(&["-c", "ip addr show eth0 | grep -m1 'inet ' | awk '{print $2}'"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&r2)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container 2")
+            .wait_with_output()
+            .expect("Failed to collect output from container 2")
+    });
+
+    let (_s1, out1, _) = t1.join().expect("Container 1 thread panicked");
+    let (_s2, out2, _) = t2.join().expect("Container 2 thread panicked");
+
+    let ip1 = String::from_utf8_lossy(&out1).trim().to_string();
+    let ip2 = String::from_utf8_lossy(&out2).trim().to_string();
+
+    assert!(!ip1.is_empty(), "Container 1 should output its IP address");
+    assert!(!ip2.is_empty(), "Container 2 should output its IP address");
+    assert!(ip1.starts_with("172.19.0."), "Container 1 IP should be in bridge subnet: {}", ip1);
+    assert!(ip2.starts_with("172.19.0."), "Container 2 IP should be in bridge subnet: {}", ip2);
+    assert_ne!(ip1, ip2, "Containers must receive different IPs: got {} and {}", ip1, ip2);
 }

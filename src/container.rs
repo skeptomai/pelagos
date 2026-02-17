@@ -805,8 +805,10 @@ impl Command {
     /// Command::new("/bin/sh").with_network(NetworkMode::Bridge).spawn()?;
     /// ```
     pub fn with_network(mut self, mode: crate::network::NetworkMode) -> Self {
-        // Loopback and Bridge require their own NET namespace.
-        if matches!(mode, crate::network::NetworkMode::Loopback | crate::network::NetworkMode::Bridge) {
+        // Loopback requires a new NET namespace (unshare in pre_exec).
+        // Bridge does NOT unshare NET — the child joins a pre-configured named
+        // netns via setns() in pre_exec instead.
+        if mode == crate::network::NetworkMode::Loopback {
             self.namespaces |= Namespace::NET;
         }
         self.network_config = Some(crate::network::NetworkConfig { mode });
@@ -1067,11 +1069,26 @@ impl Command {
         let masked_paths = self.masked_paths.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
-        // True when the container's lo should be brought up inside pre_exec.
-        // (NetworkMode::None leaves lo alone; Loopback/Bridge bring it up.)
+        // Loopback mode: bring up lo inside pre_exec (after unshare(NEWNET)).
+        // Bridge mode uses setns instead — lo is configured by setup_bridge_network.
         let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
-            matches!(c.mode, crate::network::NetworkMode::Loopback | crate::network::NetworkMode::Bridge)
+            c.mode == crate::network::NetworkMode::Loopback
         });
+        let is_bridge = self.network_config.as_ref().map_or(false, |c| {
+            c.mode == crate::network::NetworkMode::Bridge
+        });
+
+        // Bridge mode: create and fully configure the named netns BEFORE fork.
+        // The child's pre_exec will join it via setns — no race whatsoever.
+        let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
+            let ns_name = crate::network::generate_ns_name();
+            Some(crate::network::setup_bridge_network(&ns_name).map_err(Error::Io)?)
+        } else {
+            None
+        };
+        // Pre-allocate the netns path CString so pre_exec can open it without allocating.
+        let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
+            .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
         // Install our combined pre_exec hook
         unsafe {
@@ -1104,11 +1121,25 @@ impl Command {
                         }
                     }
 
-                    // Step 1.6: Bring up loopback interface if network isolation requested.
-                    // Must happen after unshare(CLONE_NEWNET) so we target our own netns.
+                    // Step 1.6: Loopback mode — bring up lo after unshare(CLONE_NEWNET).
                     if bring_up_loopback {
                         crate::network::bring_up_loopback()
                             .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
+                    }
+
+                }
+
+                // Step 1.7: Bridge mode — join the pre-configured named netns via setns.
+                // The named netns was fully set up before fork; no race is possible.
+                if let Some(ref ns_path) = bridge_ns_path {
+                    let fd = libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let ret = libc::setns(fd, libc::CLONE_NEWNET);
+                    libc::close(fd);
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
                     }
                 }
 
@@ -1473,13 +1504,8 @@ impl Command {
             None
         };
 
-        // Set up bridge networking (parent-side, after fork)
-        let network = match &self.network_config {
-            Some(cfg) if cfg.mode == crate::network::NetworkMode::Bridge => {
-                Some(crate::network::setup_bridge_network(child_inner.id()).map_err(Error::Io)?)
-            }
-            _ => None,
-        };
+        // Bridge networking was fully set up before fork; nothing to do here.
+        let network = bridge_network;
 
         Ok(Child { inner: child_inner, cgroup, network })
     }
@@ -1570,8 +1596,21 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
-            matches!(c.mode, crate::network::NetworkMode::Loopback | crate::network::NetworkMode::Bridge)
+            c.mode == crate::network::NetworkMode::Loopback
         });
+        let is_bridge = self.network_config.as_ref().map_or(false, |c| {
+            c.mode == crate::network::NetworkMode::Bridge
+        });
+
+        // Bridge mode: create and fully configure the named netns BEFORE fork.
+        let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
+            let ns_name = crate::network::generate_ns_name();
+            Some(crate::network::setup_bridge_network(&ns_name).map_err(Error::Io)?)
+        } else {
+            None
+        };
+        let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
+            .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
         unsafe {
             self.inner.pre_exec(move || {
@@ -1627,6 +1666,20 @@ impl Command {
                     if bring_up_loopback {
                         crate::network::bring_up_loopback()
                             .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
+                    }
+
+                }
+
+                // Bridge mode — join the pre-configured named netns via setns.
+                if let Some(ref ns_path) = bridge_ns_path {
+                    let fd = libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let ret = libc::setns(fd, libc::CLONE_NEWNET);
+                    libc::close(fd);
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
                     }
                 }
 
@@ -1868,13 +1921,8 @@ impl Command {
             None
         };
 
-        // Set up bridge networking (parent-side, after fork)
-        let network = match &self.network_config {
-            Some(cfg) if cfg.mode == crate::network::NetworkMode::Bridge => {
-                Some(crate::network::setup_bridge_network(child_inner.id()).map_err(Error::Io)?)
-            }
-            _ => None,
-        };
+        // Bridge networking was fully set up before fork; nothing to do here.
+        let network = bridge_network;
 
         Ok(crate::pty::InteractiveSession {
             master,
@@ -1916,6 +1964,17 @@ impl Child {
     /// Returns the process ID of the child.
     pub fn pid(&self) -> i32 {
         self.inner.id() as i32
+    }
+
+    /// Returns the host-side veth interface name if bridge networking is active.
+    pub fn veth_name(&self) -> Option<&str> {
+        self.network.as_ref().map(|n| n.veth_host.as_str())
+    }
+
+    /// Returns the named network namespace name (e.g. `rem-12345-0`) if bridge
+    /// networking is active. Useful for verifying teardown in tests.
+    pub fn netns_name(&self) -> Option<&str> {
+        self.network.as_ref().map(|n| n.ns_name.as_str())
     }
 
     /// Wait for the child process to exit.

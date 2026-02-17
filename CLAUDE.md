@@ -16,6 +16,16 @@
 - ✅ Explain what the command will do
 - ✅ Wait for user to run it and report results
 
+### Document Every Integration Test
+**When writing a new integration test, you MUST also add its entry to `docs/INTEGRATION_TESTS.md` in the same change.**
+
+The entry must include:
+- The function name as a heading
+- Whether it requires root and/or rootfs
+- What it actually asserts and why — not just what the code does, but what failure would indicate
+
+This is a hard requirement, not optional cleanup.
+
 ### Ask Before Major Decisions
 - API design choices
 - Adding new features not explicitly requested
