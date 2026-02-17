@@ -1498,6 +1498,7 @@ fn test_nat_cleanup() {
     // After the container exits, the nftables table should be gone.
     let status = std::process::Command::new("nft")
         .args(["list", "table", "ip", "remora"])
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .expect("Failed to run nft list table");
@@ -1569,6 +1570,7 @@ fn test_nat_refcount() {
 
     let status = std::process::Command::new("nft")
         .args(["list", "table", "ip", "remora"])
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .expect("Failed to run nft list table after B exits");
@@ -1666,6 +1668,7 @@ fn test_port_forward_cleanup() {
     // After the container exits, the table must be gone entirely.
     let status = std::process::Command::new("nft")
         .args(["list", "table", "ip", "remora"])
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .expect("Failed to run nft list table");
@@ -1747,11 +1750,57 @@ fn test_port_forward_independent_teardown() {
 
     let status = std::process::Command::new("nft")
         .args(["list", "table", "ip", "remora"])
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .expect("Failed to run nft list table after B exits");
     assert!(
         !status.success(),
         "nft table should be removed after both port-forward containers exit"
+    );
+}
+
+/// N5: `with_dns()` must write the specified nameservers into the container's
+/// `/etc/resolv.conf` so that DNS resolution works inside the container.
+///
+/// Spawns a bridge+NAT+DNS container that runs `cat /etc/resolv.conf` and
+/// captures stdout. Asserts the output contains both configured nameservers.
+#[test]
+#[serial(nat)]
+fn test_dns_resolv_conf() {
+    if !is_root() {
+        eprintln!("Skipping test_dns_resolv_conf: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_dns_resolv_conf: alpine-rootfs not found");
+        return;
+    };
+
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "cat /etc/resolv.conf"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_dns(&["1.1.1.1", "8.8.8.8"])
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn DNS container");
+
+    let (_status, stdout_bytes, _stderr) = child.wait_with_output().expect("Failed to wait for DNS container");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+    assert!(
+        stdout.contains("nameserver 1.1.1.1"),
+        "/etc/resolv.conf should contain 'nameserver 1.1.1.1'; got:\n{}", stdout
+    );
+    assert!(
+        stdout.contains("nameserver 8.8.8.8"),
+        "/etc/resolv.conf should contain 'nameserver 8.8.8.8'; got:\n{}", stdout
     );
 }

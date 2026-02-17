@@ -81,12 +81,14 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **tmpfs mounts**: `with_tmpfs()` — in-memory writable scratch space (works with read-only rootfs)
 - **Named volumes**: `Volume::create/open/delete` backed by `/var/lib/remora/volumes/<name>/`; `with_volume()` builder method
 
-**Networking (Phase 6 IN PROGRESS 🔄):**
+**Networking (Phase 6 COMPLETE ✅):**
 - **N1 Loopback**: `with_network(NetworkMode::Loopback)` — isolated NET namespace, lo brought up via ioctl (127.0.0.1 active)
 - **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via `/run/remora/next_ip`
-- **Automatic cleanup**: veth pair deleted in `wait()` / `wait_with_output()`
-- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`
-- N3 (NAT), N4 (port mapping), N5 (DNS) — pending
+- **N3 NAT**: `with_nat()` — nftables MASQUERADE, reference-counted via `/run/remora/nat_refcount`
+- **N4 Port mapping**: `with_port_forward(host_port, container_port)` — TCP DNAT via nftables prerouting
+- **N5 DNS**: `with_dns(&[...])` — writes `{rootfs}/etc/resolv.conf` in parent before fork
+- **Automatic cleanup**: veth pair, netns, nftables rules cleaned up in `wait()` / `wait_with_output()`
+- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
 
 **Advanced:**
 - UID/GID mapping for user namespaces
@@ -292,8 +294,12 @@ The spawn process has a carefully orchestrated setup:
 - ✅ tmpfs mounts — `with_tmpfs()`
 - ✅ Named volumes — `Volume::create/open/delete`, `with_volume()`
 
-**Phase 3 - Networking:**
-- CNI integration (delegate to external tools)
+**Phase 6 - Networking: COMPLETE ✅**
+- ✅ N1 Loopback — `with_network(NetworkMode::Loopback)`
+- ✅ N2 Bridge — `with_network(NetworkMode::Bridge)`
+- ✅ N3 NAT — `with_nat()`
+- ✅ N4 Port mapping — `with_port_forward(host_port, container_port)`
+- ✅ N5 DNS — `with_dns(&[...])`
 
 See docs/ROADMAP.md for full plan (no time estimates!)
 

@@ -415,3 +415,17 @@ is gone, B's rule (`dport 18083`) is still present. Waits for B, then asserts th
 table is fully removed. Failure would indicate that `disable_port_forwards()` either
 removed the wrong entries, failed to rebuild the prerouting chain from survivors, or
 deleted the table prematurely while B was still running.
+
+---
+
+## Phase 6 N5 — DNS Tests
+
+### `test_dns_resolv_conf` — N5
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container with `with_dns(&["1.1.1.1", "8.8.8.8"])` that runs
+`cat /etc/resolv.conf` and captures stdout. Asserts the output contains both
+`nameserver 1.1.1.1` and `nameserver 8.8.8.8`. Failure would indicate that
+`write_dns_config()` did not write the file, wrote to the wrong path, or produced
+incorrect content. This test does not perform a live DNS lookup — it only verifies
+the file was written correctly.

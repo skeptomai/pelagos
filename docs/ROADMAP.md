@@ -47,7 +47,7 @@
 - Resource stats (`child.resource_stats()`)
 - Automatic cgroup cleanup in `wait()` / `wait_with_output()`
 
-### Phase 6 Networking — N1/N2/N3 ✅
+### Phase 6 Networking — N1–N5 ✅
 
 **N1 — Loopback**
 - `with_network(NetworkMode::Loopback)`: isolated NET namespace, `lo` brought up
@@ -64,39 +64,22 @@
 - Reference-counted — shared across concurrent NAT containers
 - Removed atomically (`nft delete table ip remora`) when last NAT container exits
 
+**N4 — Port Mapping**
+- `with_port_forward(host_port, container_port)`: TCP DNAT via nftables prerouting
+- Flush-and-rebuild strategy on teardown — no handle tracking required
+- Shared `table ip remora` with N3; `disable_port_forwards` checks NAT refcount
+  before deleting the table
+
+**N5 — DNS**
+- `with_dns(&["1.1.1.1", "8.8.8.8"])`: writes `{rootfs}/etc/resolv.conf` in parent
+  before fork using the host-side rootfs path
+- No-op if no rootfs is configured
+
 ---
 
 ## In Progress
 
-### Phase 6 Networking — N4/N5
-
-#### N4 — Port Mapping
-Allow host ports to forward into bridge-mode containers.
-
-```rust
-Command::new("/bin/sh")
-    .with_network(NetworkMode::Bridge)
-    .with_nat()
-    .with_port_forward(8080, 80)   // host:8080 → container:80
-    .spawn()?;
-```
-
-**Implementation:** nftables DNAT rule — same `nft -f -` pipe pattern as N3.
-Reference-counted per port binding; torn down in `teardown_network`.
-
-#### N5 — DNS
-Write `/etc/resolv.conf` into the container's rootfs so hostnames resolve.
-
-```rust
-Command::new("/bin/sh")
-    .with_network(NetworkMode::Bridge)
-    .with_nat()
-    .with_dns(&["1.1.1.1", "8.8.8.8"])   // default if omitted
-    .spawn()?;
-```
-
-**Implementation:** write to `{rootfs}/etc/resolv.conf` in parent before fork.
-Requires rootfs to be set. No-op for loopback-only containers.
+Nothing — Phase 6 networking is complete.
 
 ---
 
@@ -145,7 +128,6 @@ Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.
 
 | Milestone | Estimated runc parity |
 |-----------|----------------------|
-| Current (N1/N2/N3 complete) | ~65% |
-| After N4/N5 | ~70% |
+| Current (N1–N5 complete) | ~70% |
 | After OCI compliance | ~85% |
 | After rootless | ~90% |

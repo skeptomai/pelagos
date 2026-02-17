@@ -391,6 +391,25 @@ pub struct Command {
     nat: bool,
     // Port-forward rules: (host_port, container_port). Requires Bridge + NAT.
     port_forwards: Vec<(u16, u16)>,
+    // DNS servers to write into the container's /etc/resolv.conf.
+    dns_servers: Vec<String>,
+}
+
+/// Write `nameserver` lines to `{rootfs}/etc/resolv.conf`.
+///
+/// Called from the parent process before fork, using the host-side rootfs path.
+/// Creates `/etc/` if it does not yet exist.
+fn write_dns_config(rootfs: &std::path::Path, servers: &[String]) -> io::Result<()> {
+    let etc = rootfs.join("etc");
+    std::fs::create_dir_all(&etc)?;
+    let resolv = etc.join("resolv.conf");
+    let mut content = String::new();
+    for s in servers {
+        content.push_str("nameserver ");
+        content.push_str(s);
+        content.push('\n');
+    }
+    std::fs::write(resolv, content)
 }
 
 impl Command {
@@ -422,6 +441,7 @@ impl Command {
             network_config: None,
             nat: false,
             port_forwards: Vec::new(),
+            dns_servers: Vec::new(),
         }
     }
 
@@ -863,6 +883,29 @@ impl Command {
         self
     }
 
+    /// Write DNS nameservers into the container's `/etc/resolv.conf`.
+    ///
+    /// Called in the parent before fork — writes `{rootfs}/etc/resolv.conf`
+    /// using the host-side path to the chroot or pivot_root directory.
+    /// No-op if no rootfs is configured. Requires [`NetworkMode::Bridge`] or
+    /// [`NetworkMode::Loopback`] to be useful (containers sharing the host
+    /// network stack can use the host's own `/etc/resolv.conf`).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use remora::network::NetworkMode;
+    /// Command::new("/bin/sh")
+    ///     .with_network(NetworkMode::Bridge)
+    ///     .with_nat()
+    ///     .with_dns(&["1.1.1.1", "8.8.8.8"])
+    ///     .spawn()?;
+    /// ```
+    pub fn with_dns<S: AsRef<str>>(mut self, servers: &[S]) -> Self {
+        self.dns_servers = servers.iter().map(|s| s.as_ref().to_owned()).collect();
+        self
+    }
+
     /// Apply Docker's default seccomp profile (recommended).
     ///
     /// This blocks ~44 dangerous syscalls commonly used in container escapes
@@ -1137,6 +1180,16 @@ impl Command {
         // Pre-allocate the netns path CString so pre_exec can open it without allocating.
         let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
+
+        // Write DNS config into the rootfs before fork (host-side path).
+        if !self.dns_servers.is_empty() {
+            let rootfs = self.chroot_dir.as_deref()
+                .or_else(|| self.pivot_root.as_ref().map(|(r, _)| r.as_path()));
+            match rootfs {
+                Some(r) => write_dns_config(r, &self.dns_servers).map_err(Error::Io)?,
+                None => log::warn!("with_dns() has no effect without a rootfs (with_chroot or with_pivot_root)"),
+            }
+        }
 
         // Install our combined pre_exec hook
         unsafe {
@@ -1659,6 +1712,16 @@ impl Command {
         };
         let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
+
+        // Write DNS config into the rootfs before fork (host-side path).
+        if !self.dns_servers.is_empty() {
+            let rootfs = self.chroot_dir.as_deref()
+                .or_else(|| self.pivot_root.as_ref().map(|(r, _)| r.as_path()));
+            match rootfs {
+                Some(r) => write_dns_config(r, &self.dns_servers).map_err(Error::Io)?,
+                None => log::warn!("with_dns() has no effect without a rootfs (with_chroot or with_pivot_root)"),
+            }
+        }
 
         unsafe {
             self.inner.pre_exec(move || {

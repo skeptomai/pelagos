@@ -59,8 +59,8 @@
 | Loopback isolation | ✅ | ✅ | ✅ | ioctl in pre_exec |
 | Bridge (veth + IPAM) | ✅ | ✅ | ✅ | `remora0`, 172.19.0.x/24 |
 | NAT / MASQUERADE | ✅ | ✅ | ✅ | nftables, reference-counted |
-| Port mapping (DNAT) | ❌ | 🚫 | ✅ | N4 — next |
-| DNS configuration | ❌ | ✅ | ✅ | N5 — next |
+| Port mapping (DNAT) | ✅ | 🚫 | ✅ | TCP; `with_port_forward()` |
+| DNS configuration | ✅ | ✅ | ✅ | `with_dns()` writes resolv.conf |
 | CNI plugins | ❌ | ✅ | ✅ | Not planned (native approach) |
 | **Process Management** |
 | Spawn + wait | ✅ | ✅ | ✅ | |
@@ -76,7 +76,7 @@
 | Unprivileged mode | ❌ | ✅ | ✅ | Planned |
 | Subuid/subgid | ❌ | ✅ | ✅ | Planned |
 | **Testing** |
-| Integration tests | ✅ | ✅ | ✅ | 42 tests, all passing |
+| Integration tests | ✅ | ✅ | ✅ | 46 tests, all passing |
 | Unit tests | ✅ | ✅ | ✅ | |
 
 ---
@@ -85,7 +85,7 @@
 
 | vs | Estimate |
 |----|----------|
-| runc | ~65% |
+| runc | ~70% |
 | Docker Engine | ~35% (Docker is a full platform, not a fair comparison) |
 
 ---

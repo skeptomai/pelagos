@@ -36,7 +36,8 @@ a daemon, without CNI plugins, and without image management.
 - **Bridge:** `NetworkMode::Bridge` — veth pair + `remora0` bridge, IPAM via
   `/run/remora/next_ip` (flock-protected)
 - **NAT:** `with_nat()` — nftables MASQUERADE, reference-counted across containers
-- **Port mapping / DNS:** N4/N5, coming next
+- **Port mapping:** `with_port_forward(host, container)` — TCP DNAT via nftables
+- **DNS:** `with_dns(&["1.1.1.1", "8.8.8.8"])` — writes `/etc/resolv.conf` into rootfs
 
 ### Interactive Containers
 - **PTY:** `spawn_interactive()` allocates a PTY pair via `openpty()`
@@ -122,7 +123,7 @@ sudo -E cargo run --example seccomp_demo
 # Unit tests (no root required):
 cargo test --lib
 
-# Integration tests (42 tests, requires root + alpine-rootfs):
+# Integration tests (46 tests, requires root + alpine-rootfs):
 sudo -E cargo test --test integration_tests
 ```
 
@@ -153,14 +154,14 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | Interactive PTY | ✅ | ✅ | ✅ |
 | Loopback + bridge | ✅ | ✅ | ✅ |
 | NAT (MASQUERADE) | ✅ | ✅ | ✅ |
-| Port mapping | ❌ N4 next | — | ✅ |
-| DNS | ❌ N5 next | ✅ | ✅ |
+| Port mapping | ✅ TCP | — | ✅ |
+| DNS | ✅ resolv.conf | ✅ | ✅ |
 | OCI compliant | ❌ planned | ✅ | ✅ |
 | Rootless | ❌ planned | ✅ | ✅ |
 | Library API | ✅ | ❌ | ❌ |
 | Daemon required | ❌ | ❌ | ✅ |
 
-**Estimated runc parity: ~65%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
+**Estimated runc parity: ~70%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
 and `docs/ROADMAP.md` for what's next.
 
 ## Documentation
