@@ -2,6 +2,15 @@
 
 ## ⚠️ CRITICAL RULES FOR CLAUDE ⚠️
 
+### Write Plans to ONGOING_TASKS.md
+**Before presenting any implementation plan to the user, write the full plan to
+`ONGOING_TASKS.md` in the project root.** This ensures plans survive context resets.
+
+- `ONGOING_TASKS.md` always reflects the current task and its full implementation detail
+- After completing a task, update it with the next planned task
+- The file includes: context, API design, pre_exec sequence changes, exact file changes,
+  test descriptions, verification steps, and notes/risks
+
 ### ❌ NEVER RUN SUDO COMMANDS
 **YOU CANNOT RUN SUDO** - The user MUST run sudo commands themselves.
 
@@ -80,6 +89,7 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Bind mounts**: `with_bind_mount()` (RW) and `with_bind_mount_ro()` (RO) — map host dirs into container
 - **tmpfs mounts**: `with_tmpfs()` — in-memory writable scratch space (works with read-only rootfs)
 - **Named volumes**: `Volume::create/open/delete` backed by `/var/lib/remora/volumes/<name>/`; `with_volume()` builder method
+- **Overlay filesystem**: `with_overlay(upper_dir, work_dir)` — copy-on-write layered rootfs; requires `Namespace::MOUNT` + `with_chroot`; merged dir auto-managed at `/run/remora/overlay-{pid}-{n}/merged/`
 
 **Networking (Phase 6 COMPLETE ✅):**
 - **N1 Loopback**: `with_network(NetworkMode::Loopback)` — isolated NET namespace, lo brought up via ioctl (127.0.0.1 active)
@@ -101,14 +111,14 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 src/
   lib.rs                  # Library entry point
   main.rs                 # CLI binary
-  container.rs            # Main API (~1950 lines)
+  container.rs            # Main API (~2200 lines)
   cgroup.rs               # Cgroups v2 resource management
   network.rs              # Native networking (N1 loopback, N2 bridge)
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
 
 tests/
-  integration_tests.rs    # 35 integration tests (require root)
+  integration_tests.rs    # 49 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration

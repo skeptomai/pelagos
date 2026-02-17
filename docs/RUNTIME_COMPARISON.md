@@ -41,7 +41,7 @@
 | Bind mounts (RW + RO) | ✅ | ✅ | ✅ | |
 | tmpfs mounts | ✅ | ✅ | ✅ | |
 | Named volumes | ✅ | ✅ | ✅ | Backed by `/var/lib/remora/volumes/` |
-| Overlay filesystem | ❌ | ✅ | ✅ | Planned |
+| Overlay filesystem | ✅ | ✅ | ✅ | `with_overlay(upper, work)` |
 | **Security** |
 | Seccomp (Docker profile) | ✅ | ✅ | ✅ | Pure-Rust via `seccompiler` |
 | No-new-privileges | ✅ | ✅ | ✅ | `PR_SET_NO_NEW_PRIVS` |
@@ -76,7 +76,7 @@
 | Unprivileged mode | ❌ | ✅ | ✅ | Planned |
 | Subuid/subgid | ❌ | ✅ | ✅ | Planned |
 | **Testing** |
-| Integration tests | ✅ | ✅ | ✅ | 46 tests, all passing |
+| Integration tests | ✅ | ✅ | ✅ | 49 tests, all passing |
 | Unit tests | ✅ | ✅ | ✅ | |
 
 ---
@@ -85,7 +85,7 @@
 
 | vs | Estimate |
 |----|----------|
-| runc | ~70% |
+| runc | ~73% |
 | Docker Engine | ~35% (Docker is a full platform, not a fair comparison) |
 
 ---

@@ -1,7 +1,7 @@
 # Remora Development Roadmap
 
 **Last Updated:** 2026-02-17
-**Current Status:** Phase 6 networking — N1/N2/N3 complete, N4/N5 next
+**Current Status:** Overlay filesystem complete; next: OCI compliance
 
 ---
 
@@ -77,9 +77,21 @@
 
 ---
 
+### Overlay Filesystem ✅
+
+Layered rootfs using `overlayfs` — lower (read-only base) + upper (writable per-container) layers.
+
+- `with_overlay(upper_dir, work_dir)`: requires `Namespace::MOUNT` + `with_chroot` (lower layer)
+- Lower layer (shared Alpine rootfs) is never modified — writes land in `upper_dir`
+- Merged mount point auto-created at `/run/remora/overlay-{pid}-{n}/merged/`; removed in `wait()`
+- Compatible with `with_readonly_rootfs(true)`, bind mounts, and tmpfs
+- Foundation for image-layer-style workflows without full image management
+
+---
+
 ## In Progress
 
-Nothing — Phase 6 networking is complete.
+Nothing — overlay filesystem is complete.
 
 ---
 
@@ -107,11 +119,6 @@ remora delete <id>
 Enables interoperability with Kubernetes, containerd, and other OCI tooling.
 Requires `serde_json`; state persistence in `/run/remora/containers/<id>/`.
 
-### Overlay Filesystem (Moderate Effort)
-
-Layered rootfs using `overlayfs` — lower (read-only) + upper (writable) layers.
-Foundation for image-layer-style workflows without full image management.
-
 ### Rootless Mode (Significant Work)
 
 Run containers without root using unprivileged user namespaces.
@@ -128,6 +135,6 @@ Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.
 
 | Milestone | Estimated runc parity |
 |-----------|----------------------|
-| Current (N1–N5 complete) | ~70% |
+| Current (N1–N5 + overlay complete) | ~73% |
 | After OCI compliance | ~85% |
 | After rootless | ~90% |

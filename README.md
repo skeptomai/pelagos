@@ -30,6 +30,8 @@ a daemon, without CNI plugins, and without image management.
 - **tmpfs:** `with_tmpfs()` — writable scratch space inside a read-only rootfs
 - **Named volumes:** `Volume::create/open/delete`, `with_volume()` — persisted at
   `/var/lib/remora/volumes/<name>/`
+- **Overlay filesystem:** `with_overlay(upper, work)` — copy-on-write view of a
+  shared lower rootfs; writes land in `upper_dir`, lower layer is never modified
 
 ### Networking
 - **Loopback:** `NetworkMode::Loopback` — isolated NET namespace, `lo` only
@@ -123,7 +125,7 @@ sudo -E cargo run --example seccomp_demo
 # Unit tests (no root required):
 cargo test --lib
 
-# Integration tests (46 tests, requires root + alpine-rootfs):
+# Integration tests (49 tests, requires root + alpine-rootfs):
 sudo -E cargo test --test integration_tests
 ```
 
@@ -151,6 +153,7 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | Capabilities | ✅ | ✅ | ✅ |
 | Cgroups v2 | ✅ | ✅ | ✅ |
 | Bind / tmpfs / volumes | ✅ | ✅ | ✅ |
+| Overlay filesystem | ✅ | ✅ | ✅ |
 | Interactive PTY | ✅ | ✅ | ✅ |
 | Loopback + bridge | ✅ | ✅ | ✅ |
 | NAT (MASQUERADE) | ✅ | ✅ | ✅ |
@@ -161,7 +164,7 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | Library API | ✅ | ❌ | ❌ |
 | Daemon required | ❌ | ❌ | ✅ |
 
-**Estimated runc parity: ~70%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
+**Estimated runc parity: ~73%.** See `docs/RUNTIME_COMPARISON.md` for the full matrix
 and `docs/ROADMAP.md` for what's next.
 
 ## Documentation

@@ -429,3 +429,39 @@ Spawns a bridge+NAT container with `with_dns(&["1.1.1.1", "8.8.8.8"])` that runs
 `write_dns_config()` did not write the file, wrote to the wrong path, or produced
 incorrect content. This test does not perform a live DNS lookup — it only verifies
 the file was written correctly.
+
+---
+
+## Overlay Filesystem Tests
+
+### `test_overlay_writes_to_upper`
+**Requires:** root, rootfs
+
+Creates temporary `upper` and `work` directories. Spawns a container with
+`with_overlay(upper, work)` that writes `echo hello > /newfile`. After `wait()`:
+asserts that `lower_dir/newfile` does **not** exist (lower layer is untouched),
+and that `upper_dir/newfile` contains `"hello\n"`. Failure would indicate that
+writes inside an overlay container are reaching the lower layer instead of the
+upper layer — overlayfs copy-on-write is broken or the overlay was not mounted.
+
+### `test_overlay_lower_unchanged`
+**Requires:** root, rootfs
+
+Creates temporary `upper` and `work` directories. Records the original content of
+`lower_dir/etc/hostname`, then spawns a container that runs
+`echo modified > /etc/hostname`. After `wait()`: asserts that `lower_dir/etc/hostname`
+is unchanged (same content as before), and that `upper_dir/etc/hostname` contains
+`"modified\n"`. Failure would indicate that modifying an existing lower-layer file
+writes through to the lower directory instead of producing a copy-on-write in the
+upper layer.
+
+### `test_overlay_merged_cleanup`
+**Requires:** root, rootfs
+
+Spawns a container with `with_overlay(upper, work)` that runs `true` (exits
+immediately). Records the specific merged dir path via `child.overlay_merged_dir()`
+before calling `wait()`. After `wait()`: asserts that neither the merged dir nor its
+parent (`/run/remora/overlay-{pid}-{n}/`) exist. Failure would indicate that `wait()`
+failed to call `remove_dir` on the merged directory and its parent, leaving stale
+directories on the host. The test checks the specific path rather than scanning the
+whole directory to avoid false failures from other overlay tests running in parallel.

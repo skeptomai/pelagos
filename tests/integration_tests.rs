@@ -1804,3 +1804,177 @@ fn test_dns_resolv_conf() {
         "/etc/resolv.conf should contain 'nameserver 8.8.8.8'; got:\n{}", stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// Overlay filesystem tests
+// ---------------------------------------------------------------------------
+
+/// Container writes to a file inside overlayfs; the write appears in upper_dir,
+/// not in lower_dir (the shared Alpine rootfs is untouched).
+#[test]
+fn test_overlay_writes_to_upper() {
+    if !is_root() {
+        eprintln!("Skipping test_overlay_writes_to_upper: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_overlay_writes_to_upper: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let scratch = tempfile::tempdir().expect("failed to create tempdir");
+    let upper = scratch.path().join("upper");
+    let work = scratch.path().join("work");
+    std::fs::create_dir_all(&upper).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+
+    let mut child = Command::new("/bin/sh")
+        .args(&["-c", "echo hello > /newfile"])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_overlay(&upper, &work)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("failed to spawn overlay container");
+
+    child.wait().expect("failed to wait");
+
+    // The lower layer must NOT have been modified.
+    assert!(
+        !rootfs.join("newfile").exists(),
+        "lower dir (alpine-rootfs) should not contain newfile — overlay leaked write to lower"
+    );
+
+    // The write must appear in upper_dir.
+    let upper_file = upper.join("newfile");
+    assert!(
+        upper_file.exists(),
+        "upper_dir/newfile should exist after container wrote /newfile"
+    );
+    let content = std::fs::read_to_string(&upper_file).expect("failed to read upper/newfile");
+    assert_eq!(content, "hello\n", "upper_dir/newfile should contain 'hello\\n'");
+}
+
+/// Modifying an existing lower-layer file writes a copy to upper_dir;
+/// the original file in lower_dir is untouched.
+#[test]
+fn test_overlay_lower_unchanged() {
+    if !is_root() {
+        eprintln!("Skipping test_overlay_lower_unchanged: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_overlay_lower_unchanged: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let scratch = tempfile::tempdir().expect("failed to create tempdir");
+    let upper = scratch.path().join("upper");
+    let work = scratch.path().join("work");
+    std::fs::create_dir_all(&upper).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+
+    // Record the original content of /etc/hostname in the lower layer.
+    let lower_hostname = rootfs.join("etc/hostname");
+    let original_content = std::fs::read_to_string(&lower_hostname)
+        .unwrap_or_else(|_| String::new());
+
+    let mut child = Command::new("/bin/sh")
+        .args(&["-c", "echo modified > /etc/hostname"])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_overlay(&upper, &work)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("failed to spawn overlay container");
+
+    child.wait().expect("failed to wait");
+
+    // Lower layer /etc/hostname must be unchanged.
+    let after_content = std::fs::read_to_string(&lower_hostname)
+        .unwrap_or_else(|_| String::new());
+    assert_eq!(
+        original_content, after_content,
+        "lower_dir/etc/hostname should be unchanged; overlay leaked write to lower"
+    );
+
+    // upper_dir must hold the modified copy.
+    let upper_hostname = upper.join("etc/hostname");
+    assert!(
+        upper_hostname.exists(),
+        "upper_dir/etc/hostname should exist (copy-on-write)"
+    );
+    let upper_content = std::fs::read_to_string(&upper_hostname)
+        .expect("failed to read upper/etc/hostname");
+    assert_eq!(upper_content, "modified\n", "upper_dir/etc/hostname should contain 'modified\\n'");
+}
+
+/// After wait(), the auto-created /run/remora/overlay-{pid}-{n}/merged directory
+/// and its parent are removed — no stale dirs left on the host.
+#[test]
+fn test_overlay_merged_cleanup() {
+    if !is_root() {
+        eprintln!("Skipping test_overlay_merged_cleanup: requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test_overlay_merged_cleanup: alpine-rootfs not found");
+            return;
+        }
+    };
+
+    let scratch = tempfile::tempdir().expect("failed to create tempdir");
+    let upper = scratch.path().join("upper");
+    let work = scratch.path().join("work");
+    std::fs::create_dir_all(&upper).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+
+    let mut child = Command::new("/bin/sh")
+        .args(&["-c", "true"])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_overlay(&upper, &work)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("failed to spawn overlay container");
+
+    // Record this container's specific merged dir before calling wait().
+    let merged_dir = child.overlay_merged_dir().map(|p| p.to_path_buf());
+    assert!(merged_dir.is_some(), "with_overlay should set overlay_merged_dir on Child");
+    let merged = merged_dir.unwrap();
+    let parent = merged.parent().unwrap().to_path_buf();
+
+    // The dirs must exist while the container is running.
+    assert!(merged.exists(), "merged dir should exist before wait()");
+
+    child.wait().expect("failed to wait");
+
+    // After wait(), both the merged dir and its parent must be gone.
+    assert!(
+        !merged.exists(),
+        "overlay merged dir should be removed after wait(); still present: {}",
+        merged.display()
+    );
+    assert!(
+        !parent.exists(),
+        "overlay parent dir should be removed after wait(); still present: {}",
+        parent.display()
+    );
+}

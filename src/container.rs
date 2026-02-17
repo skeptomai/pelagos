@@ -100,6 +100,10 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{self, ExitStatus as StdExitStatus};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Counter for unique overlay merged-dir names.
+static OVERLAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 // Re-export SeccompProfile for public API
 pub use crate::seccomp::SeccompProfile;
@@ -269,6 +273,16 @@ pub struct TmpfsMount {
     pub options: String,
 }
 
+/// Overlay filesystem configuration — lower layer is `chroot_dir`; upper and work
+/// are user-supplied. The merged mount point is managed by Remora.
+#[derive(Debug, Clone)]
+pub struct OverlayConfig {
+    /// Writable layer — container writes land here; persists after container exit.
+    pub upper_dir: PathBuf,
+    /// Required by overlayfs; must be on the same filesystem as `upper_dir`.
+    pub work_dir: PathBuf,
+}
+
 /// A named volume backed by a host directory under `/var/lib/remora/volumes/<name>/`.
 ///
 /// Volumes provide persistent storage that survives container restarts.
@@ -393,6 +407,8 @@ pub struct Command {
     port_forwards: Vec<(u16, u16)>,
     // DNS servers to write into the container's /etc/resolv.conf.
     dns_servers: Vec<String>,
+    // Overlay filesystem (upper + work dirs; lower = chroot_dir).
+    overlay: Option<OverlayConfig>,
 }
 
 /// Write `nameserver` lines to `{rootfs}/etc/resolv.conf`.
@@ -442,6 +458,7 @@ impl Command {
             nat: false,
             port_forwards: Vec::new(),
             dns_servers: Vec::new(),
+            overlay: None,
         }
     }
 
@@ -906,6 +923,37 @@ impl Command {
         self
     }
 
+    /// Mount an overlay filesystem on top of the chroot rootfs.
+    ///
+    /// Requires [`Namespace::MOUNT`] and [`with_chroot`](Self::with_chroot).
+    /// Container writes land in `upper_dir` (visible on the host after exit);
+    /// the lower layer (`chroot_dir`) is never modified.
+    ///
+    /// `upper_dir` and `work_dir` must be on the same filesystem and must not
+    /// themselves reside on an overlayfs mount.
+    ///
+    /// The merged mount point is created by Remora at
+    /// `/run/remora/overlay-{pid}-{n}/merged/` and removed after `wait()`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// Command::new("/bin/sh")
+    ///     .with_chroot("/shared/alpine-rootfs")
+    ///     .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+    ///     .with_overlay("/scratch/upper", "/scratch/work")
+    ///     .spawn()?;
+    /// ```
+    pub fn with_overlay<P1: Into<PathBuf>, P2: Into<PathBuf>>(
+        mut self, upper_dir: P1, work_dir: P2,
+    ) -> Self {
+        self.overlay = Some(OverlayConfig {
+            upper_dir: upper_dir.into(),
+            work_dir: work_dir.into(),
+        });
+        self
+    }
+
     /// Apply Docker's default seccomp profile (recommended).
     ///
     /// This blocks ~44 dangerous syscalls commonly used in container escapes
@@ -1181,6 +1229,42 @@ impl Command {
         let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
+        // Validate overlay prerequisites before fork.
+        if self.overlay.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
+            return Err(Error::Io(io::Error::other("with_overlay requires Namespace::MOUNT")));
+        }
+        if self.overlay.is_some() && self.chroot_dir.is_none() {
+            return Err(Error::Io(io::Error::other("with_overlay requires with_chroot")));
+        }
+
+        // Create the overlay merged dir before fork. The actual mount happens in
+        // pre_exec (after unshare(NEWNS)), but the directory must exist first.
+        let overlay_merged_dir: Option<PathBuf> = if self.overlay.is_some() {
+            let pid = unsafe { libc::getpid() };
+            let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let merged = PathBuf::from(format!("/run/remora/overlay-{}-{}/merged", pid, n));
+            std::fs::create_dir_all(&merged).map_err(Error::Io)?;
+            Some(merged)
+        } else {
+            None
+        };
+
+        // Pre-allocate CStrings for the overlay mount (lower, upper, work, merged).
+        // Must be done in the parent — no allocation allowed in pre_exec.
+        let overlay_cstrings: Option<(std::ffi::CString, std::ffi::CString, std::ffi::CString, std::ffi::CString)> =
+            match (&self.overlay, &overlay_merged_dir) {
+                (Some(ov), Some(merged)) => {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    Some((
+                        std::ffi::CString::new(self.chroot_dir.as_ref().unwrap().as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
+                    ))
+                }
+                _ => None,
+            };
+
         // Write DNS config into the rootfs before fork (host-side path).
         if !self.dns_servers.is_empty() {
             let rootfs = self.chroot_dir.as_deref()
@@ -1300,6 +1384,22 @@ impl Command {
                     }
                 }
 
+                // Step 3.5: Mount overlayfs (if configured).
+                // The merged dir becomes the effective root for chroot and bind mounts.
+                let overlay_merged: Option<&std::ffi::CString> = if let Some((lower, upper, work, merged)) = &overlay_cstrings {
+                    let opts = std::ffi::CString::new(format!(
+                        "lowerdir={},upperdir={},workdir={}",
+                        lower.to_string_lossy(), upper.to_string_lossy(), work.to_string_lossy()
+                    )).unwrap();
+                    let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
+                    let ret = libc::mount(ov_type, merged.as_ptr(), ov_type, 0,
+                                         opts.as_ptr() as *const libc::c_void);
+                    if ret != 0 { return Err(io::Error::last_os_error()); }
+                    Some(merged)
+                } else {
+                    None
+                };
+
                 // Step 4: Change root if specified
                 if let Some((ref new_root, ref put_old)) = pivot_root {
                     // Use pivot_root for better security
@@ -1341,9 +1441,17 @@ impl Command {
                     // Fallback to chroot if pivot_root not specified
                     use std::os::unix::ffi::OsStrExt;
 
-                    // If readonly rootfs is requested, bind-mount the chroot dir to itself BEFORE chroot
-                    // This makes it a proper mount point so we can remount it readonly later
-                    if readonly_rootfs {
+                    // When overlay is active, the merged dir is the effective root.
+                    // Otherwise the chroot dir itself is the effective root.
+                    let effective_root: &std::path::Path = overlay_merged.as_ref()
+                        .map(|m| std::path::Path::new(m.to_str().unwrap()))
+                        .unwrap_or(dir.as_path());
+
+                    // If readonly rootfs is requested, bind-mount the effective root to itself
+                    // BEFORE chroot — this makes it a proper mount point so we can remount it
+                    // readonly later. When overlay is active, the overlay IS already a proper
+                    // mount point — skip the self-bind in that case.
+                    if readonly_rootfs && overlay_merged.is_none() {
                         let dir_c = CString::new(dir.as_os_str().as_bytes()).unwrap();
                         let result = libc::mount(
                             dir_c.as_ptr(),          // source: chroot dir
@@ -1361,9 +1469,9 @@ impl Command {
                     // unreachable once we chroot.
                     for bm in &bind_mounts {
                         use std::os::unix::ffi::OsStrExt as _;
-                        // Target inside the chroot on the host side
+                        // Target inside the effective root on the host side
                         let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
-                        let host_target = dir.join(rel);
+                        let host_target = effective_root.join(rel);
                         std::fs::create_dir_all(&host_target)
                             .map_err(|e| io::Error::other(format!("bind mount mkdir: {}", e)))?;
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
@@ -1401,7 +1509,7 @@ impl Command {
                         }
                     }
 
-                    chroot(dir).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+                    chroot(effective_root).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
 
                     // Change working directory to / after chroot
                     std::env::set_current_dir("/")?;
@@ -1608,7 +1716,7 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
-        Ok(Child { inner: child_inner, cgroup, network })
+        Ok(Child { inner: child_inner, cgroup, network, overlay_merged_dir })
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -1713,6 +1821,40 @@ impl Command {
         let bridge_ns_path: Option<std::ffi::CString> = bridge_network.as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());
 
+        // Validate overlay prerequisites before fork.
+        if self.overlay.is_some() && !self.namespaces.contains(Namespace::MOUNT) {
+            return Err(Error::Io(io::Error::other("with_overlay requires Namespace::MOUNT")));
+        }
+        if self.overlay.is_some() && self.chroot_dir.is_none() {
+            return Err(Error::Io(io::Error::other("with_overlay requires with_chroot")));
+        }
+
+        // Create the overlay merged dir before fork.
+        let overlay_merged_dir: Option<PathBuf> = if self.overlay.is_some() {
+            let pid = unsafe { libc::getpid() };
+            let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let merged = PathBuf::from(format!("/run/remora/overlay-{}-{}/merged", pid, n));
+            std::fs::create_dir_all(&merged).map_err(Error::Io)?;
+            Some(merged)
+        } else {
+            None
+        };
+
+        // Pre-allocate CStrings for the overlay mount (lower, upper, work, merged).
+        let overlay_cstrings: Option<(std::ffi::CString, std::ffi::CString, std::ffi::CString, std::ffi::CString)> =
+            match (&self.overlay, &overlay_merged_dir) {
+                (Some(ov), Some(merged)) => {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    Some((
+                        std::ffi::CString::new(self.chroot_dir.as_ref().unwrap().as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
+                    ))
+                }
+                _ => None,
+            };
+
         // Write DNS config into the rootfs before fork (host-side path).
         if !self.dns_servers.is_empty() {
             let rootfs = self.chroot_dir.as_deref()
@@ -1809,6 +1951,21 @@ impl Command {
                     }
                 }
 
+                // Step 3.5: Mount overlayfs (if configured).
+                let overlay_merged: Option<&std::ffi::CString> = if let Some((lower, upper, work, merged)) = &overlay_cstrings {
+                    let opts = std::ffi::CString::new(format!(
+                        "lowerdir={},upperdir={},workdir={}",
+                        lower.to_string_lossy(), upper.to_string_lossy(), work.to_string_lossy()
+                    )).unwrap();
+                    let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
+                    let ret = libc::mount(ov_type, merged.as_ptr(), ov_type, 0,
+                                         opts.as_ptr() as *const libc::c_void);
+                    if ret != 0 { return Err(io::Error::last_os_error()); }
+                    Some(merged)
+                } else {
+                    None
+                };
+
                 if let Some((ref new_root, ref put_old)) = pivot_root {
                     use std::os::unix::ffi::OsStrExt;
                     std::fs::create_dir_all(put_old).ok();
@@ -1834,7 +1991,13 @@ impl Command {
                 } else if let Some(ref dir) = chroot_dir {
                     use std::os::unix::ffi::OsStrExt;
 
-                    if readonly_rootfs {
+                    // When overlay is active, use the merged dir as the effective root.
+                    let effective_root: &std::path::Path = overlay_merged.as_ref()
+                        .map(|m| std::path::Path::new(m.to_str().unwrap()))
+                        .unwrap_or(dir.as_path());
+
+                    // Skip readonly self-bind when overlay active — overlayfs IS a proper mount point.
+                    if readonly_rootfs && overlay_merged.is_none() {
                         let dir_c = CString::new(dir.as_os_str().as_bytes()).unwrap();
                         let result = libc::mount(
                             dir_c.as_ptr(),
@@ -1853,7 +2016,7 @@ impl Command {
                     for bm in &bind_mounts {
                         use std::os::unix::ffi::OsStrExt as _;
                         let rel = bm.target.strip_prefix("/").unwrap_or(&bm.target);
-                        let host_target = dir.join(rel);
+                        let host_target = effective_root.join(rel);
                         std::fs::create_dir_all(&host_target)
                             .map_err(|e| io::Error::other(format!("bind mount mkdir: {}", e)))?;
                         let src_c = CString::new(bm.source.as_os_str().as_bytes()).unwrap();
@@ -1889,7 +2052,7 @@ impl Command {
                         }
                     }
 
-                    chroot(dir).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
+                    chroot(effective_root).map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
                     std::env::set_current_dir("/")?;
                 }
 
@@ -2037,7 +2200,7 @@ impl Command {
 
         Ok(crate::pty::InteractiveSession {
             master,
-            child: Child { inner: child_inner, cgroup, network },
+            child: Child { inner: child_inner, cgroup, network, overlay_merged_dir },
         })
     }
 }
@@ -2069,6 +2232,8 @@ pub struct Child {
     pub(crate) cgroup: Option<cgroups_rs::fs::Cgroup>,
     /// Optional network state (veth pair). Torn down after the child exits.
     network: Option<crate::network::NetworkSetup>,
+    /// Overlay merged-dir created before fork; removed after the child exits.
+    overlay_merged_dir: Option<PathBuf>,
 }
 
 impl Child {
@@ -2088,6 +2253,14 @@ impl Child {
         self.network.as_ref().map(|n| n.ns_name.as_str())
     }
 
+    /// Returns the overlay merged-dir path if an overlay filesystem was configured.
+    ///
+    /// The path is removed by `wait()` / `wait_with_output()`. Useful in tests to
+    /// verify cleanup without relying on global directory state.
+    pub fn overlay_merged_dir(&self) -> Option<&std::path::Path> {
+        self.overlay_merged_dir.as_deref()
+    }
+
     /// Wait for the child process to exit.
     ///
     /// This will block until the process terminates and return its exit status.
@@ -2099,6 +2272,12 @@ impl Child {
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);
+        }
+        if let Some(ref merged) = self.overlay_merged_dir {
+            let _ = std::fs::remove_dir(merged);
+            if let Some(parent) = merged.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
         }
         Ok(ExitStatus { inner: status })
     }
@@ -2115,6 +2294,12 @@ impl Child {
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);
+        }
+        if let Some(ref merged) = self.overlay_merged_dir {
+            let _ = std::fs::remove_dir(merged);
+            if let Some(parent) = merged.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
         }
         Ok((
             ExitStatus { inner: output.status },
