@@ -387,6 +387,8 @@ pub struct Command {
     cgroup_config: Option<crate::cgroup::CgroupConfig>,
     // Network configuration
     network_config: Option<crate::network::NetworkConfig>,
+    // Whether to enable NAT (MASQUERADE) for bridge-mode containers.
+    nat: bool,
 }
 
 impl Command {
@@ -416,6 +418,7 @@ impl Command {
             rlimits: Vec::new(),
             cgroup_config: None,
             network_config: None,
+            nat: false,
         }
     }
 
@@ -815,6 +818,26 @@ impl Command {
         self
     }
 
+    /// Enable NAT (MASQUERADE) for a bridge-mode container.
+    ///
+    /// Requires `.with_network(NetworkMode::Bridge)` — silently ignored for
+    /// other network modes.  Installs an nftables MASQUERADE rule on the first
+    /// NAT container and removes it when the last one exits (reference-counted).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use remora::network::NetworkMode;
+    /// Command::new("/bin/sh")
+    ///     .with_network(NetworkMode::Bridge)
+    ///     .with_nat()
+    ///     .spawn()?;
+    /// ```
+    pub fn with_nat(mut self) -> Self {
+        self.nat = true;
+        self
+    }
+
     /// Apply Docker's default seccomp profile (recommended).
     ///
     /// This blocks ~44 dangerous syscalls commonly used in container escapes
@@ -1082,7 +1105,7 @@ impl Command {
         // The child's pre_exec will join it via setns — no race whatsoever.
         let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
             let ns_name = crate::network::generate_ns_name();
-            Some(crate::network::setup_bridge_network(&ns_name).map_err(Error::Io)?)
+            Some(crate::network::setup_bridge_network(&ns_name, self.nat).map_err(Error::Io)?)
         } else {
             None
         };
@@ -1605,7 +1628,7 @@ impl Command {
         // Bridge mode: create and fully configure the named netns BEFORE fork.
         let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
             let ns_name = crate::network::generate_ns_name();
-            Some(crate::network::setup_bridge_network(&ns_name).map_err(Error::Io)?)
+            Some(crate::network::setup_bridge_network(&ns_name, self.nat).map_err(Error::Io)?)
         } else {
             None
         };

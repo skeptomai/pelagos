@@ -343,3 +343,39 @@ Asserts:
 
 Exercises the `flock(LOCK_EX)` IPAM lock (concurrent writes to `/run/remora/next_ip`)
 and the `AtomicU32` namespace-name counter under real concurrency.
+
+---
+
+## Phase 6 N3 — NAT / MASQUERADE Tests
+
+These three tests share a global `NAT_TEST_LOCK` mutex so they run serially.
+All three check the nftables refcount state via `nft list table ip remora`,
+which is global per-host state. Running them concurrently would cause spurious
+failures when one test's container exits and sees a non-zero refcount left by a
+sibling's still-running container.
+
+### `test_nat_rule_added` — N3
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container running `sleep 2`. While it sleeps, runs
+`nft list table ip remora` on the host and asserts exit 0. Failure would
+indicate that `enable_nat()` did not install the MASQUERADE rule set, or that
+`nft` is not available on the host.
+
+### `test_nat_cleanup` — N3
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container with `ash -c "exit 0"` (exits immediately). After
+`wait()`, runs `nft list table ip remora` and asserts non-zero exit. Failure
+would indicate that `disable_nat()` did not remove the nftables table (refcount
+not decremented to zero, or `nft delete table` failed silently).
+
+### `test_nat_refcount` — N3
+**Requires:** root, rootfs
+
+Spawns two bridge+NAT containers: A (`sleep 2`) and B (`sleep 4`). Waits for A,
+then asserts `nft list table ip remora` exits 0 (B still running — refcount ≥ 1).
+Waits for B, then asserts it exits non-zero (refcount hits 0, table removed).
+Failure would indicate the reference-counting logic in `enable_nat` /
+`disable_nat` is incorrect — either decrementing too eagerly (table gone while B
+runs) or not decrementing at all (table present after both exit).

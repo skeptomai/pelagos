@@ -16,6 +16,7 @@
 use remora::cgroup::ResourceStats;
 use remora::container::{Capability, Command, GidMap, Namespace, SeccompProfile, Stdio, UidMap, Volume};
 use remora::network::NetworkMode;
+use serial_test::serial;
 use std::path::PathBuf;
 
 /// Helper to check if we're running as root
@@ -1171,6 +1172,7 @@ fn test_bridge_network_veth_exists() {
     // The host-side veth should exist while the container is running
     let status = std::process::Command::new("ip")
         .args(["link", "show", &veth_name])
+        .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run ip link show");
     assert!(status.success(), "Host-side veth {} should exist after spawn", veth_name);
@@ -1210,6 +1212,7 @@ fn test_bridge_network_cleanup() {
     // After wait(), teardown_network() removes the veth pair and the named netns.
     let status = std::process::Command::new("ip")
         .args(["link", "show", &veth_name])
+        .stderr(std::process::Stdio::null())
         .status()
         .expect("Failed to run ip link show");
     assert!(
@@ -1408,4 +1411,169 @@ fn test_bridge_concurrent_spawn() {
     assert!(ip1.starts_with("172.19.0."), "Container 1 IP should be in bridge subnet: {}", ip1);
     assert!(ip2.starts_with("172.19.0."), "Container 2 IP should be in bridge subnet: {}", ip2);
     assert_ne!(ip1, ip2, "Containers must receive different IPs: got {} and {}", ip1, ip2);
+}
+
+// ============================================================================
+// Phase 6 N3 Networking Tests — NAT / MASQUERADE
+// ============================================================================
+
+/// N3: While a NAT container is running, `nft list table ip remora` must succeed.
+///
+/// Spawns a bridge+NAT container running `sleep 2`. While it sleeps, queries
+/// `nft list table ip remora` on the host. Asserts exit 0, confirming that
+/// `enable_nat()` installed the MASQUERADE table.
+#[test]
+#[serial(nat)]
+fn test_nat_rule_added() {
+    if !is_root() {
+        eprintln!("Skipping test_nat_rule_added: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_nat_rule_added: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "sleep 2"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn NAT container");
+
+    // While the container sleeps, the nftables table should exist.
+    let status = std::process::Command::new("nft")
+        .args(["list", "table", "ip", "remora"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run nft list table");
+    assert!(
+        status.success(),
+        "nft table ip remora should exist while a NAT container is running"
+    );
+
+    child.wait().expect("Failed to wait for NAT container");
+}
+
+/// N3: After the last NAT container exits, `nft list table ip remora` must fail.
+///
+/// Spawns a bridge+NAT container with `ash -c "exit 0"`. After `wait()`,
+/// asserts that `nft list table ip remora` exits non-zero, confirming that
+/// `disable_nat()` removed the nftables table.
+#[test]
+#[serial(nat)]
+fn test_nat_cleanup() {
+    if !is_root() {
+        eprintln!("Skipping test_nat_cleanup: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_nat_cleanup: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child = Command::new("/bin/ash")
+        .args(&["-c", "exit 0"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn NAT container");
+
+    child.wait().expect("Failed to wait for NAT container");
+
+    // After the container exits, the nftables table should be gone.
+    let status = std::process::Command::new("nft")
+        .args(["list", "table", "ip", "remora"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run nft list table");
+    assert!(
+        !status.success(),
+        "nft table ip remora should be removed after all NAT containers exit"
+    );
+}
+
+/// N3: The nftables table must survive until the *last* NAT container exits.
+///
+/// Spawns container A (`sleep 2`, NAT) and B (`sleep 4`, NAT).
+/// Waits for A — table must still exist (B is still running).
+/// Waits for B — table must be gone (refcount hits 0).
+#[test]
+#[serial(nat)]
+fn test_nat_refcount() {
+    if !is_root() {
+        eprintln!("Skipping test_nat_refcount: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_nat_refcount: alpine-rootfs not found");
+        return;
+    };
+
+    let mut child_a = Command::new("/bin/ash")
+        .args(&["-c", "sleep 2"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn NAT container A");
+
+    let mut child_b = Command::new("/bin/ash")
+        .args(&["-c", "sleep 4"])
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Bridge)
+        .with_nat()
+        .with_chroot(&rootfs)
+        .env("PATH", ALPINE_PATH)
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null)
+        .spawn()
+        .expect("Failed to spawn NAT container B");
+
+    // Wait for A (shorter sleep). B is still running — table must still exist.
+    child_a.wait().expect("Failed to wait for container A");
+
+    let status = std::process::Command::new("nft")
+        .args(["list", "table", "ip", "remora"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run nft list table after A exits");
+    assert!(
+        status.success(),
+        "nft table should still exist after A exits (B is still running)"
+    );
+
+    // Now wait for B. Both containers have exited — table must be gone.
+    child_b.wait().expect("Failed to wait for container B");
+
+    let status = std::process::Command::new("nft")
+        .args(["list", "table", "ip", "remora"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run nft list table after B exits");
+    assert!(
+        !status.success(),
+        "nft table should be removed after both NAT containers exit"
+    );
 }
