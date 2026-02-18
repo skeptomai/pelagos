@@ -46,7 +46,15 @@ a daemon, without CNI plugins, and without image management.
 - **Lifecycle:** `remora create <id> <bundle>` / `start` / `state` / `kill` / `delete`
 - **State machine:** creating → created → running → stopped
 - **Sync:** Unix socket at `/run/remora/<id>/exec.sock` suspends exec until `start`
-- **Phase 2 (planned):** hooks, `linux.resources`, seccomp, devices, capabilities
+- **Phase 2 (complete):** `process.capabilities`, `linux.maskedPaths`, `linux.readonlyPaths`,
+  `linux.resources`, `process.rlimits`, `linux.sysctl`, `linux.devices`, hooks, `linux.seccomp`
+
+### Rootless Containers (Phase 1)
+- **Auto-detection:** `getuid() != 0` triggers rootless mode automatically — no flag needed
+- **User namespace:** auto-adds `Namespace::USER` and a default uid/gid map (`container 0 → host UID`)
+- **Loopback works:** `NetworkMode::Loopback` functions in rootless (USER + NET namespace)
+- **Cgroups:** skipped gracefully in rootless (no `CAP_SYS_ADMIN` needed)
+- **Bridge rejected:** clear error if `NetworkMode::Bridge` is attempted without root
 
 ### Interactive Containers
 - **PTY:** `spawn_interactive()` allocates a PTY pair via `openpty()`
@@ -132,8 +140,10 @@ sudo -E cargo run --example seccomp_demo
 # Unit tests (no root required):
 cargo test --lib
 
-# Integration tests (61 tests, requires root + alpine-rootfs):
+# Integration tests (65 tests; root tests require sudo + alpine-rootfs):
 sudo -E cargo test --test integration_tests
+# Rootless tests (run WITHOUT sudo, as a regular user):
+cargo test --test integration_tests test_rootless
 ```
 
 ## Architecture
@@ -167,7 +177,7 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | Port mapping | ✅ TCP | — | ✅ |
 | DNS | ✅ resolv.conf | ✅ | ✅ |
 | OCI compliant | ✅ Phase 1 | ✅ | ✅ |
-| Rootless | ❌ planned | ✅ | ✅ |
+| Rootless | ⚠️ Phase 1 (loopback) | ✅ | ✅ |
 | Library API | ✅ | ❌ | ❌ |
 | Daemon required | ❌ | ❌ | ✅ |
 

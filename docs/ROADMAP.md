@@ -124,17 +124,30 @@ conditions (`args` field), `hooks.createRuntime` / `startContainer`, `annotation
 
 ## In Progress
 
-Nothing — OCI Phase 2 is complete.
+### Rootless Mode — Phase 1 (User Namespace + Loopback) 🔄
+
+Auto-detection when running as non-root: adds `Namespace::USER`, configures
+a default `{inside: 0, outside: host_uid, count: 1}` uid/gid map so the
+process appears as UID 0 inside the container, skips cgroups gracefully, and
+rejects `NetworkMode::Bridge` with a clear error.
+
+- ✅ Rootless auto-detection (`getuid() != 0`)
+- ✅ Auto-add `Namespace::USER` + uid/gid map
+- ✅ `NetworkMode::Loopback` works rootless (USER+NET namespace)
+- ✅ Graceful cgroup skip (EPERM in rootless)
+- ✅ Bridge networking rejected with clear error
+- ✅ Fix: uid_map writing was missing from `spawn_interactive()` pre_exec
+
+**Phase 2** (deferred): pasta networking integration for full internet access.
 
 ---
 
 ## Planned
 
-### Rootless Mode (Significant Work)
+### Rootless Mode — Phase 2 (pasta Networking)
 
-Run containers without root using unprivileged user namespaces.
-Requires subuid/subgid mapping (`/etc/subuid`, `/etc/subgid`) and rootless
-cgroup delegation.
+Full internet access in rootless containers via [pasta](https://passt.top/passt/about/)
+(chosen over slirp4netns: lower overhead, no per-container daemon, Podman ≥4.4 default).
 
 ### AppArmor / SELinux (Moderate Effort)
 

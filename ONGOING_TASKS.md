@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Current Task: None — see Planned section
+## Current Task: Rootless Phase 1 — COMPLETE ✅
 
 ### OCI Phase 2 — COMPLETE ✅
 
@@ -18,7 +18,19 @@ All fields implemented and tested (61 integration tests passing):
 
 ---
 
-## Planned (after OCI Phase 2)
+### Rootless Mode Phase 1 — COMPLETE ✅
 
-- **Rootless Mode** — unprivileged user namespaces; slirp4netns vs pasta decision needed
+- Auto-detect non-root (`getuid() != 0`)
+- Auto-add `Namespace::USER` + default uid/gid map (`{0 → host_uid}`)
+- `NetworkMode::Loopback` works rootless (USER+NET namespace)
+- Cgroups skipped gracefully (EPERM in rootless)
+- `NetworkMode::Bridge` rejected with clear error
+- Bug fix: uid_map writing was missing from `spawn_interactive()` pre_exec
+- 4 new integration tests (3 skip-if-root, 1 requires root)
+
+---
+
+## Planned
+
+- **Rootless Phase 2** — pasta networking integration (full internet access without root)
 - **AppArmor / SELinux** — MAC profile support; defence-in-depth on top of seccomp

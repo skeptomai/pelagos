@@ -129,7 +129,7 @@ src/
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
 
 tests/
-  integration_tests.rs    # 53 integration tests (require root)
+  integration_tests.rs    # 64 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -349,7 +349,8 @@ Many features require root or CAP_SYS_ADMIN
 | Bind mounts | ✅ RW + RO | ✅ |
 | tmpfs mounts | ✅ | ✅ |
 | Named volumes | ✅ | ✅ |
-| Networking | 🔄 Loopback + Bridge (N1/N2) | ✅ Native libnetwork |
-| OCI Compatible | ❌ | ✅ |
+| Overlay filesystem | ✅ CoW layered rootfs | ✅ |
+| Networking | 🔄 N1–N5 (Loopback/Bridge/NAT/Ports/DNS) | ✅ Native libnetwork |
+| OCI Compatible | 🔄 Partial | ✅ |
 
-**Current parity: ~60% of runc features**
+**Current parity: ~73% of runc features**

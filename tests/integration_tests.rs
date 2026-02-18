@@ -2728,3 +2728,131 @@ fn test_oci_seccomp() {
     let id = format!("test-oci-sec-{}", std::process::id());
     oci_run_to_completion(&id, bundle_dir.path(), 5);
 }
+
+// ---------------------------------------------------------------------------
+// Rootless mode tests
+// ---------------------------------------------------------------------------
+// These tests skip when running as root (rootless mode is only relevant as a
+// non-root user). To run these, execute:
+//   cargo test --test integration_tests test_rootless -- --nocapture
+// as a non-root user (without sudo).
+
+#[test]
+fn test_rootless_basic() {
+    if is_root() {
+        eprintln!("Skipping test_rootless_basic: must run as non-root (no sudo)");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_rootless_basic: alpine-rootfs not found"); return; }
+    };
+    // When running rootless, spawn() auto-adds Namespace::USER and a uid/gid map
+    // that makes the process appear as UID 0 inside the container.
+    // Use /bin/ash to invoke id — Alpine's id lives at /usr/bin/id (busybox symlink),
+    // not at /bin/id.
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "id"])
+        .env("PATH", ALPINE_PATH)
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("rootless spawn failed");
+
+    let (status, stdout, _stderr) = child.wait_with_output().expect("wait failed");
+    assert!(status.success(), "rootless container exited non-zero");
+    let out = String::from_utf8_lossy(&stdout);
+    // Inside the container the process maps to UID 0 via the user namespace.
+    assert!(out.contains("uid=0"), "expected uid=0 inside rootless container, got: {}", out);
+}
+
+#[test]
+fn test_rootless_loopback() {
+    if is_root() {
+        eprintln!("Skipping test_rootless_loopback: must run as non-root (no sudo)");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_rootless_loopback: alpine-rootfs not found"); return; }
+    };
+    // Loopback networking works in rootless mode: the container gets a private
+    // NET namespace (and USER namespace from auto-config) and lo is brought up.
+    // lo shows 'state UNKNOWN' even when admin-UP; match the flags field instead.
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "ip addr show lo | grep -q 'LOOPBACK,UP' && echo ok"])
+        .env("PATH", ALPINE_PATH)
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_network(NetworkMode::Loopback)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("rootless loopback spawn failed");
+
+    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+    assert!(status.success(), "rootless loopback container failed");
+    assert!(String::from_utf8_lossy(&stdout).contains("ok"));
+}
+
+#[test]
+fn test_rootless_bridge_rejected() {
+    if is_root() {
+        eprintln!("Skipping test_rootless_bridge_rejected: must run as non-root (no sudo)");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_rootless_bridge_rejected: alpine-rootfs not found"); return; }
+    };
+    // Bridge mode should be rejected with a clear error in rootless mode.
+    let result = Command::new("/bin/echo")
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT)
+        .with_network(NetworkMode::Bridge)
+        .spawn();
+
+    match result {
+        Ok(_) => panic!("expected bridge networking to fail in rootless mode"),
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            assert!(err_msg.contains("rootless") || err_msg.contains("root"),
+                "error message should mention rootless/root: {}", err_msg);
+        }
+    }
+}
+
+#[test]
+fn test_user_namespace_explicit() {
+    // Verify that root can create a USER namespace with explicit uid/gid maps and
+    // that the container process sees itself as uid=0 inside.
+    //
+    // No chroot: the rootfs lives under /home/cb/ which is not traversable from
+    // inside a USER namespace with a single-uid map (0→0). In a user namespace,
+    // capable_wrt_inode_uidgid() only grants DAC_OVERRIDE for inodes whose uid is
+    // present in the namespace's uid_map. /home/cb is owned by uid 1000 (not mapped),
+    // so the kernel falls through to normal permission bits and returns EACCES.
+    // Chroot is not needed to verify uid mapping — just run /usr/bin/id on the host fs.
+    //
+    // No MOUNT namespace: without chroot there is nothing to isolate mount-wise,
+    // and omitting it avoids the MS_PRIVATE limitation on inherited locked mounts.
+    if !is_root() {
+        eprintln!("Skipping test_user_namespace_explicit: requires root");
+        return;
+    }
+    let child = Command::new("/usr/bin/id")
+        .with_namespaces(Namespace::USER)
+        .with_uid_maps(&[UidMap { inside: 0, outside: 0, count: 1 }])
+        .with_gid_maps(&[GidMap { inside: 0, outside: 0, count: 1 }])
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("user namespace spawn failed");
+
+    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+    assert!(status.success(), "user namespace container exited non-zero");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(out.contains("uid=0"), "expected uid=0 inside user namespace, got: {}", out);
+}

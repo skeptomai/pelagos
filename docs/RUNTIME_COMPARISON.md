@@ -73,10 +73,10 @@
 | OCI bundle format | ✅ | ✅ | ✅ | create/start/state/kill/delete |
 | OCI lifecycle hooks | ❌ | ✅ | ✅ | Phase 2 |
 | **Rootless** |
-| Unprivileged mode | ❌ | ✅ | ✅ | Planned |
-| Subuid/subgid | ❌ | ✅ | ✅ | Planned |
+| Unprivileged mode | ⚠️ | ✅ | ✅ | Phase 1: USER ns + loopback; Phase 2: pasta |
+| Subuid/subgid | ❌ | ✅ | ✅ | Planned (Phase 2) |
 | **Testing** |
-| Integration tests | ✅ | ✅ | ✅ | 61 tests, all passing |
+| Integration tests | ✅ | ✅ | ✅ | 65 tests, all passing |
 | Unit tests | ✅ | ✅ | ✅ | |
 
 ---

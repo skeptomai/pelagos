@@ -1265,6 +1265,37 @@ impl Command {
             .map(|(f, ns)| (f.as_raw_fd(), *ns))
             .collect();
 
+        // Detect rootless mode (running as non-root) and auto-configure.
+        let is_rootless = unsafe { libc::getuid() } != 0;
+        if is_rootless {
+            // Unprivileged containers require a user namespace.
+            self.namespaces |= Namespace::USER;
+            // Map the calling user to UID 0 inside the container by default.
+            if self.uid_maps.is_empty() {
+                self.uid_maps.push(UidMap {
+                    inside: 0,
+                    outside: unsafe { libc::getuid() },
+                    count: 1,
+                });
+            }
+            if self.gid_maps.is_empty() {
+                self.gid_maps.push(GidMap {
+                    inside: 0,
+                    outside: unsafe { libc::getgid() },
+                    count: 1,
+                });
+            }
+            // Bridge networking requires root-level capabilities on the host network.
+            if self.network_config.as_ref()
+                .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
+            {
+                return Err(Error::Io(io::Error::other(
+                    "NetworkMode::Bridge requires root; use NetworkMode::Loopback for rootless containers",
+                )));
+            }
+        }
+
+
         // Collect configuration to move into pre_exec closure
         let namespaces = self.namespaces;
         let chroot_dir = self.chroot_dir.clone();
@@ -1386,13 +1417,67 @@ impl Command {
                 use std::ptr;
                 use std::ffi::CString;
 
-                // Step 1: Unshare namespaces (create new ones)
+                // Step 1: Unshare namespaces.
                 if !namespaces.is_empty() {
-                    let flags = namespaces.to_clone_flags();
-                    unshare(flags).map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                    if is_rootless && namespaces.contains(Namespace::USER) {
+                        // Rootless two-phase unshare:
+                        // 1a. Unshare user namespace alone first.
+                        unshare(CloneFlags::CLONE_NEWUSER)
+                            .map_err(|e| io::Error::other(format!("unshare USER: {}", e)))?;
+                        // 1b. Write uid/gid maps while only in the user namespace.
+                        //     Must happen before unsharing other namespaces that
+                        //     require capabilities granted by the uid/gid mapping.
+                        {
+                            use std::io::Write;
+                            // uid_map and gid_map MUST be written in a single write() syscall.
+                            // The kernel processes each write() call atomically; multiple writes
+                            // fail with EINVAL because the map is committed on the first write.
+                            // Pre-format the entire content as a single String, then write_all().
+                            if !gid_maps.is_empty() {
+                                let mut sg = std::fs::OpenOptions::new().write(true)
+                                    .open("/proc/self/setgroups")
+                                    .map_err(|e| io::Error::other(format!("setgroups: {}", e)))?;
+                                sg.write_all(b"deny\n")
+                                    .map_err(|e| io::Error::other(format!("setgroups write: {}", e)))?;
+                            }
+                            if !uid_maps.is_empty() {
+                                let mut content = String::new();
+                                for map in &uid_maps {
+                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                }
+                                let mut f = std::fs::OpenOptions::new().write(true)
+                                    .open("/proc/self/uid_map")
+                                    .map_err(|e| io::Error::other(format!("uid_map: {}", e)))?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| io::Error::other(format!("uid_map write: {}", e)))?;
+                            }
+                            if !gid_maps.is_empty() {
+                                let mut content = String::new();
+                                for map in &gid_maps {
+                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                }
+                                let mut f = std::fs::OpenOptions::new().write(true)
+                                    .open("/proc/self/gid_map")
+                                    .map_err(|e| io::Error::other(format!("gid_map: {}", e)))?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| io::Error::other(format!("gid_map write: {}", e)))?;
+                            }
+                        }
+                        // 1c. Unshare remaining namespaces — now with proper uid/gid mapping
+                        //     and full capabilities in the user namespace.
+                        let remaining = namespaces & !Namespace::USER;
+                        if !remaining.is_empty() {
+                            unshare(remaining.to_clone_flags())
+                                .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                        }
+                    } else {
+                        // Privileged (root) mode: unshare all namespaces at once.
+                        unshare(namespaces.to_clone_flags())
+                            .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                    }
 
                     // Step 1.5: If we created a mount namespace, make all mounts private
-                    // to prevent mount propagation leaking to the parent namespace
+                    // to prevent mount propagation leaking to the parent namespace.
                     if namespaces.contains(Namespace::MOUNT) {
                         use std::ffi::CStr;
                         use std::ptr;
@@ -1407,7 +1492,15 @@ impl Command {
                         );
 
                         if result != 0 {
-                            return Err(io::Error::last_os_error());
+                            let err = io::Error::last_os_error();
+                            // Any USER namespace (rootless or root-created) causes inherited mounts
+                            // to be marked MNT_LOCKED by the kernel — their propagation cannot be
+                            // changed, returning EINVAL. Safe to skip: the new mount namespace
+                            // already provides isolation even without re-labelling propagation.
+                            let has_user_ns = is_rootless || namespaces.contains(Namespace::USER);
+                            if !has_user_ns || err.raw_os_error() != Some(libc::EINVAL) {
+                                return Err(io::Error::other(format!("MS_PRIVATE: {}", err)));
+                            }
                         }
                     }
 
@@ -1433,8 +1526,10 @@ impl Command {
                     }
                 }
 
-                // Step 2: Set up UID/GID mapping if user namespace is active
-                if namespaces.contains(Namespace::USER) {
+                // Step 2: Set up UID/GID mapping if user namespace is active.
+                // Skip for rootless — maps were written early in Step 1 so that
+                // subsequent namespace unshares could use the resulting capabilities.
+                if namespaces.contains(Namespace::USER) && !is_rootless {
                     use std::fs;
                     use std::io::Write;
 
@@ -1448,30 +1543,34 @@ impl Command {
                             .map_err(|e| io::Error::other(format!("write setgroups: {}", e)))?;
                     }
 
-                    // Write UID mappings
+                    // Write UID mappings — must be a single write() call (kernel requirement).
                     if !uid_maps.is_empty() {
+                        use std::io::Write as _;
+                        let mut content = String::new();
+                        for map in &uid_maps {
+                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                        }
                         let mut uid_map_file = fs::OpenOptions::new()
                             .write(true)
                             .open("/proc/self/uid_map")
                             .map_err(|e| io::Error::other(format!("open uid_map: {}", e)))?;
-
-                        for map in &uid_maps {
-                            writeln!(uid_map_file, "{} {} {}", map.inside, map.outside, map.count)
-                                .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
-                        }
+                        uid_map_file.write_all(content.as_bytes())
+                            .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
                     }
 
-                    // Write GID mappings
+                    // Write GID mappings — must be a single write() call (kernel requirement).
                     if !gid_maps.is_empty() {
+                        use std::io::Write as _;
+                        let mut content = String::new();
+                        for map in &gid_maps {
+                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                        }
                         let mut gid_map_file = fs::OpenOptions::new()
                             .write(true)
                             .open("/proc/self/gid_map")
                             .map_err(|e| io::Error::other(format!("open gid_map: {}", e)))?;
-
-                        for map in &gid_maps {
-                            writeln!(gid_map_file, "{} {} {}", map.inside, map.outside, map.count)
-                                .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
-                        }
+                        gid_map_file.write_all(content.as_bytes())
+                            .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
                     }
                 }
 
@@ -1479,13 +1578,13 @@ impl Command {
                 if let Some(gid_val) = gid {
                     let result = libc::setgid(gid_val);
                     if result != 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!("setgid: {}", io::Error::last_os_error())));
                     }
                 }
                 if let Some(uid_val) = uid {
                     let result = libc::setuid(uid_val);
                     if result != 0 {
-                        return Err(io::Error::last_os_error());
+                        return Err(io::Error::other(format!("setuid: {}", io::Error::last_os_error())));
                     }
                 }
 
@@ -1642,7 +1741,7 @@ impl Command {
 
                     // Change working directory after chroot (defaults to /).
                     let cwd = container_cwd.as_deref().unwrap_or(std::path::Path::new("/"));
-                    std::env::set_current_dir(cwd)?;
+                    std::env::set_current_dir(cwd).map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
                 }
 
                 // Step 4.5: Perform automatic mounts if requested
@@ -1656,7 +1755,12 @@ impl Command {
                         0,                  // flags
                         ptr::null(),        // data
                     );
-                    if result != 0 {
+                    // In rootless mode OR with a USER namespace, proc mount fails (EPERM or
+                    // EINVAL) because the PID namespace is not owned by our user namespace.
+                    // In rootless mode, proc mount fails because the PID namespace is not
+                    // owned by our user namespace. With USER+PID (auto-added by spawn()),
+                    // proc succeeds. Only skip errors in rootless mode.
+                    if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -1672,7 +1776,8 @@ impl Command {
                         libc::MS_BIND,      // flags
                         ptr::null(),        // data
                     );
-                    if result != 0 {
+                    // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
+                    if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -1687,7 +1792,8 @@ impl Command {
                         libc::MS_BIND | libc::MS_REC, // recursive bind
                         ptr::null(),        // data
                     );
-                    if result != 0 {
+                    // Rootless: /dev bind may fail on locked mounts; inherited /dev is still usable.
+                    if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -1926,7 +2032,15 @@ impl Command {
 
         // Create cgroup and add child PID (parent-side, after fork)
         let cgroup = if let Some(ref cfg) = self.cgroup_config {
-            Some(crate::cgroup::setup_cgroup(cfg, child_inner.id()).map_err(Error::Io)?)
+            match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
+                Ok(cg) => Some(cg),
+                Err(e) if is_rootless => {
+                    // Cgroups require root or cgroup delegation; skip gracefully in rootless mode.
+                    let _ = e;
+                    None
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
         } else {
             None
         };
@@ -2006,6 +2120,33 @@ impl Command {
             .iter()
             .map(|(f, ns)| (f.as_raw_fd(), *ns))
             .collect();
+
+        // Detect rootless mode and auto-configure (same logic as spawn()).
+        let is_rootless = unsafe { libc::getuid() } != 0;
+        if is_rootless {
+            self.namespaces |= Namespace::USER;
+            if self.uid_maps.is_empty() {
+                self.uid_maps.push(UidMap {
+                    inside: 0,
+                    outside: unsafe { libc::getuid() },
+                    count: 1,
+                });
+            }
+            if self.gid_maps.is_empty() {
+                self.gid_maps.push(GidMap {
+                    inside: 0,
+                    outside: unsafe { libc::getgid() },
+                    count: 1,
+                });
+            }
+            if self.network_config.as_ref()
+                .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
+            {
+                return Err(Error::Io(io::Error::other(
+                    "NetworkMode::Bridge requires root; use NetworkMode::Loopback for rootless containers",
+                )));
+            }
+        }
 
         let namespaces = self.namespaces;
         let chroot_dir = self.chroot_dir.clone();
@@ -2146,8 +2287,52 @@ impl Command {
 
                 // Steps 1–7: identical to spawn() from here
                 if !namespaces.is_empty() {
-                    let flags = namespaces.to_clone_flags();
-                    unshare(flags).map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                    if is_rootless && namespaces.contains(Namespace::USER) {
+                        // Rootless two-phase unshare (same logic as spawn()).
+                        unshare(CloneFlags::CLONE_NEWUSER)
+                            .map_err(|e| io::Error::other(format!("unshare USER: {}", e)))?;
+                        {
+                            use std::io::Write;
+                            // uid_map and gid_map MUST be written in a single write() syscall.
+                            if !gid_maps.is_empty() {
+                                let mut sg = std::fs::OpenOptions::new().write(true)
+                                    .open("/proc/self/setgroups")
+                                    .map_err(|e| io::Error::other(format!("setgroups: {}", e)))?;
+                                sg.write_all(b"deny\n")
+                                    .map_err(|e| io::Error::other(format!("setgroups write: {}", e)))?;
+                            }
+                            if !uid_maps.is_empty() {
+                                let mut content = String::new();
+                                for map in &uid_maps {
+                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                }
+                                let mut f = std::fs::OpenOptions::new().write(true)
+                                    .open("/proc/self/uid_map")
+                                    .map_err(|e| io::Error::other(format!("uid_map: {}", e)))?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| io::Error::other(format!("uid_map write: {}", e)))?;
+                            }
+                            if !gid_maps.is_empty() {
+                                let mut content = String::new();
+                                for map in &gid_maps {
+                                    content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                                }
+                                let mut f = std::fs::OpenOptions::new().write(true)
+                                    .open("/proc/self/gid_map")
+                                    .map_err(|e| io::Error::other(format!("gid_map: {}", e)))?;
+                                f.write_all(content.as_bytes())
+                                    .map_err(|e| io::Error::other(format!("gid_map write: {}", e)))?;
+                            }
+                        }
+                        let remaining = namespaces & !Namespace::USER;
+                        if !remaining.is_empty() {
+                            unshare(remaining.to_clone_flags())
+                                .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                        }
+                    } else {
+                        unshare(namespaces.to_clone_flags())
+                            .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
+                    }
 
                     if namespaces.contains(Namespace::MOUNT) {
                         use std::ffi::CStr;
@@ -2160,7 +2345,12 @@ impl Command {
                             ptr::null(),
                         );
                         if result != 0 {
-                            return Err(io::Error::last_os_error());
+                            let err = io::Error::last_os_error();
+                            // Any USER namespace causes MNT_LOCKED on inherited mounts (EINVAL).
+                            let has_user_ns = is_rootless || namespaces.contains(Namespace::USER);
+                            if !has_user_ns || err.raw_os_error() != Some(libc::EINVAL) {
+                                return Err(err);
+                            }
                         }
                     }
 
@@ -2184,19 +2374,54 @@ impl Command {
                     }
                 }
 
-                if !uid_maps.is_empty() || !gid_maps.is_empty() {
-                    if let Some(uid_val) = uid {
-                        let result = libc::setuid(uid_val);
-                        if result != 0 {
-                            return Err(io::Error::last_os_error());
-                        }
+                // Step 2: Set up UID/GID mapping if user namespace is active.
+                // Skip for rootless — maps were written early in Step 1.
+                if namespaces.contains(Namespace::USER) && !is_rootless {
+                    use std::io::Write;
+
+                    if !gid_maps.is_empty() {
+                        let mut setgroups = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open("/proc/self/setgroups")
+                            .map_err(|e| io::Error::other(format!("open setgroups: {}", e)))?;
+                        setgroups.write_all(b"deny\n")
+                            .map_err(|e| io::Error::other(format!("write setgroups: {}", e)))?;
                     }
-                    if let Some(gid_val) = gid {
-                        let result = libc::setgid(gid_val);
-                        if result != 0 {
-                            return Err(io::Error::last_os_error());
+                    // uid_map and gid_map MUST be written in a single write() call.
+                    if !uid_maps.is_empty() {
+                        let mut content = String::new();
+                        for map in &uid_maps {
+                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
                         }
+                        let mut uid_map_file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open("/proc/self/uid_map")
+                            .map_err(|e| io::Error::other(format!("open uid_map: {}", e)))?;
+                        uid_map_file.write_all(content.as_bytes())
+                            .map_err(|e| io::Error::other(format!("write uid_map: {}", e)))?;
                     }
+                    if !gid_maps.is_empty() {
+                        let mut content = String::new();
+                        for map in &gid_maps {
+                            content.push_str(&format!("{} {} {}\n", map.inside, map.outside, map.count));
+                        }
+                        let mut gid_map_file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open("/proc/self/gid_map")
+                            .map_err(|e| io::Error::other(format!("open gid_map: {}", e)))?;
+                        gid_map_file.write_all(content.as_bytes())
+                            .map_err(|e| io::Error::other(format!("write gid_map: {}", e)))?;
+                    }
+                }
+
+                // Step 3: Set UID/GID if specified.
+                if let Some(gid_val) = gid {
+                    let result = libc::setgid(gid_val);
+                    if result != 0 { return Err(io::Error::last_os_error()); }
+                }
+                if let Some(uid_val) = uid {
+                    let result = libc::setuid(uid_val);
+                    if result != 0 { return Err(io::Error::last_os_error()); }
                 }
 
                 // Step 3.5: Mount overlayfs (if configured).
@@ -2328,7 +2553,9 @@ impl Command {
                 if mount_proc {
                     let proc = CString::new("proc").unwrap();
                     let result = libc::mount(proc.as_ptr(), proc.as_ptr(), proc.as_ptr(), 0, ptr::null());
-                    if result != 0 {
+                    // In rootless mode, proc mount fails without an owned PID namespace.
+                    // With USER+PID (auto-added by spawn()), proc succeeds. Only skip in rootless.
+                    if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -2337,7 +2564,8 @@ impl Command {
                     let sys = CString::new("/sys").unwrap();
                     let sysfs = CString::new("sysfs").unwrap();
                     let result = libc::mount(sys.as_ptr(), sys.as_ptr(), sysfs.as_ptr(), libc::MS_BIND, ptr::null());
-                    if result != 0 {
+                    // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
+                    if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -2345,7 +2573,8 @@ impl Command {
                 if mount_dev {
                     let dev = CString::new("/dev").unwrap();
                     let result = libc::mount(dev.as_ptr(), dev.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null());
-                    if result != 0 {
+                    // Rootless: /dev bind may fail on locked mounts; inherited /dev is still usable.
+                    if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -2531,7 +2760,14 @@ impl Command {
 
         // Create cgroup and add child PID (parent-side, after fork)
         let cgroup = if let Some(ref cfg) = self.cgroup_config {
-            Some(crate::cgroup::setup_cgroup(cfg, child_inner.id()).map_err(Error::Io)?)
+            match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
+                Ok(cg) => Some(cg),
+                Err(e) if is_rootless => {
+                    let _ = e;
+                    None
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
         } else {
             None
         };

@@ -569,3 +569,50 @@ Creates a `config.json` with `linux.seccomp` using a default-allow policy that d
 `ptrace`, `personality`, and `bpf`. The container runs `/bin/echo hello` which must succeed.
 Failure indicates that `linux.seccomp` parsing from OCI config, the `filter_from_oci()`
 function in `src/seccomp.rs`, or the `with_seccomp_program()` wiring is broken.
+
+---
+
+## Rootless Mode Tests
+
+The following tests only execute when the test binary is run **without root** (no `sudo`).
+When run as root (as in the standard CI invocation), they print a skip message and exit.
+To run these tests:
+
+```bash
+cargo test --test integration_tests test_rootless
+cargo test --test integration_tests test_user_namespace_explicit
+```
+
+### `test_rootless_basic`
+**Requires:** non-root user, rootfs
+
+Spawns a container that runs `/bin/id` without any explicit namespace configuration beyond
+`MOUNT | UTS`. The rootless auto-configuration adds `Namespace::USER` and a uid_map that
+maps `{container 0 → host UID}`. Asserts that the output contains `uid=0`, confirming
+that the process appears as root inside the container's user namespace. Failure indicates
+that rootless auto-configuration (auto-add USER namespace + uid_map) is not working.
+
+### `test_rootless_loopback`
+**Requires:** non-root user, rootfs
+
+Spawns a container with `NetworkMode::Loopback` without root. Verifies that `ping 127.0.0.1`
+succeeds inside the container. Rootless auto-config adds USER namespace; combined with
+the private NET namespace the process gains the capability to bring up `lo`. Failure
+indicates that rootless + loopback networking is broken.
+
+### `test_rootless_bridge_rejected`
+**Requires:** non-root user, rootfs
+
+Calls `spawn()` with `NetworkMode::Bridge` as a non-root user. Asserts that `spawn()`
+returns an `Err` whose message mentions `root` or `rootless`. Failure indicates that the
+rootless bridge-mode guard is not in place.
+
+### `test_user_namespace_explicit`
+**Requires:** root
+
+Runs `/usr/bin/id` as root with an explicit `Namespace::USER` and an identity uid/gid map
+(`{inside: 0, outside: 0, count: 1}`). No chroot or MOUNT namespace is used — the rootfs
+lives under `/home/cb/` which is not traversable from inside a USER namespace with a
+single-uid map (DAC_OVERRIDE only applies for inodes whose uid is in the map). Asserts the
+container process outputs `uid=0`. Failure indicates a regression in the uid_map writing
+path or the MS_PRIVATE MNT_LOCKED skip logic.
