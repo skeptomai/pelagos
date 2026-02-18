@@ -2106,6 +2106,278 @@ mod networking {
             "/etc/resolv.conf should contain 'nameserver 8.8.8.8'; got:\n{}", stdout
         );
     }
+
+    /// N4: Port forwarding must actually route TCP traffic to the container.
+    ///
+    /// DNAT prerouting rules only apply to traffic arriving from external
+    /// interfaces, not locally-originated packets (those go through OUTPUT,
+    /// not PREROUTING). Bridge-internal traffic has hairpin routing issues.
+    ///
+    /// So we create a temporary external network namespace with its own veth
+    /// pair to the host (10.99.0.0/24), simulating a real external client.
+    /// Traffic from this namespace to the host goes through PREROUTING where
+    /// the DNAT rule rewrites it to the container's bridge IP.
+    ///
+    /// Unlike `test_port_forward_rule_added` (which only checks the nftables
+    /// rule string), this proves the full DNAT path works end-to-end.
+    #[test]
+    #[serial(nat)]
+    fn test_port_forward_end_to_end() {
+        if !is_root() {
+            eprintln!("Skipping test_port_forward_end_to_end: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_port_forward_end_to_end: alpine-rootfs not found");
+            return;
+        };
+
+        // Check that nc is available on the host (needed for the external client).
+        let nc_ok = std::process::Command::new("which")
+            .arg("nc")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !nc_ok {
+            eprintln!("Skipping test_port_forward_end_to_end: nc not found on host");
+            return;
+        }
+
+        // Container A: one-shot TCP server on port 80, forwarded from host 19090.
+        let mut child_a = Command::new("/bin/sh")
+            .args(&["-c", "echo HELLO_FROM_CONTAINER | nc -l -p 80"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(19090, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container A");
+
+        // Give nc a moment to start listening.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Create a temporary external network namespace to simulate a real
+        // external client. Traffic from 10.99.0.2 → 10.99.0.1:19090 arrives
+        // on the pf-test-h veth, goes through PREROUTING (DNAT → container
+        // IP:80), then FORWARD to the container via the bridge.
+        let setup_ok = std::process::Command::new("sh")
+            .args(["-c", "\
+                ip netns add pf-test-client && \
+                ip link add pf-test-h type veth peer name pf-test-c && \
+                ip link set pf-test-c netns pf-test-client && \
+                ip addr add 10.99.0.1/24 dev pf-test-h && \
+                ip link set pf-test-h up && \
+                ip netns exec pf-test-client ip addr add 10.99.0.2/24 dev pf-test-c && \
+                ip netns exec pf-test-client ip link set pf-test-c up && \
+                ip netns exec pf-test-client ip route add default via 10.99.0.1\
+            "])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("setup test netns")
+            .success();
+
+        if !setup_ok {
+            // Clean up container and skip.
+            unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+            let _ = child_a.wait();
+            eprintln!("Skipping test_port_forward_end_to_end: failed to set up test netns");
+            return;
+        }
+
+        // Connect from the external namespace to the host on the forwarded port.
+        let output = std::process::Command::new("ip")
+            .args(["netns", "exec", "pf-test-client", "nc", "-w", "2", "10.99.0.1", "19090"])
+            .output()
+            .expect("nc from test netns");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+
+        // Clean up: test namespace, veth, container.
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", "pf-test-client"])
+            .status();
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", "pf-test-h"])
+            .status();
+        unsafe { libc::kill(child_a.pid(), libc::SIGKILL); }
+        let _ = child_a.wait();
+
+        assert!(
+            out.contains("HELLO_FROM_CONTAINER"),
+            "External client should receive 'HELLO_FROM_CONTAINER' via port forward 19090→80.\nstdout: {}\nstderr: {}",
+            out, err
+        );
+    }
+
+    /// N2+N3: Bridge + NAT cleanup must work even after SIGKILL.
+    ///
+    /// Spawns a bridge+NAT container (`sleep 60`), records veth name, netns name,
+    /// and verifies iptables FORWARD rules exist. Then SIGKILLs the container
+    /// and calls `wait()`. Asserts all resources are cleaned up:
+    /// - veth pair removed
+    /// - named netns removed
+    /// - nftables table removed
+    /// - iptables FORWARD rules removed
+    ///
+    /// All existing cleanup tests use normal exit. This catches teardown bugs
+    /// that only manifest when the container process dies unexpectedly.
+    #[test]
+    #[serial(nat)]
+    fn test_bridge_cleanup_after_sigkill() {
+        if !is_root() {
+            eprintln!("Skipping test_bridge_cleanup_after_sigkill: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_bridge_cleanup_after_sigkill: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sleep")
+            .args(&["60"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let veth = child.veth_name().expect("should have veth").to_string();
+        let netns = child.netns_name().expect("should have netns").to_string();
+
+        // Verify resources exist before kill.
+        let veth_exists = std::process::Command::new("ip")
+            .args(["link", "show", &veth])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("ip link show")
+            .success();
+        assert!(veth_exists, "veth {} should exist before kill", veth);
+
+        let iptables_exists = std::process::Command::new("iptables")
+            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("iptables -C")
+            .success();
+        assert!(iptables_exists, "iptables FORWARD rule should exist before kill");
+
+        // SIGKILL the container.
+        unsafe { libc::kill(child.pid(), libc::SIGKILL); }
+
+        // wait() should still run teardown.
+        let _ = child.wait();
+
+        // Verify all resources are cleaned up.
+        let veth_after = std::process::Command::new("ip")
+            .args(["link", "show", &veth])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("ip link show after kill")
+            .success();
+        assert!(!veth_after, "veth {} should be gone after SIGKILL + wait()", veth);
+
+        let netns_path = format!("/run/netns/{}", netns);
+        assert!(
+            !std::path::Path::new(&netns_path).exists(),
+            "netns {} should be gone after SIGKILL + wait()", netns
+        );
+
+        let nft_after = std::process::Command::new("nft")
+            .args(["list", "table", "ip", "remora"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("nft list table after kill")
+            .success();
+        assert!(!nft_after, "nftables table should be gone after SIGKILL + wait()");
+
+        let iptables_after = std::process::Command::new("iptables")
+            .args(["-C", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("iptables -C after kill")
+            .success();
+        assert!(!iptables_after, "iptables FORWARD rule should be gone after SIGKILL + wait()");
+    }
+
+    /// N3: NAT must actually allow outbound TCP traffic, not just have rules.
+    ///
+    /// Spawns a bridge+NAT+DNS container that runs `wget --spider http://1.1.1.1/`.
+    /// Asserts exit code 0. Skips if outbound internet is unavailable.
+    ///
+    /// This is the end-to-end NAT test — it proves packets actually flow through
+    /// MASQUERADE to the internet. Existing NAT tests only verify rule existence.
+    /// Follows the same skip-if-no-internet pattern as `test_pasta_connectivity`.
+    #[test]
+    #[serial(nat)]
+    fn test_nat_end_to_end_tcp() {
+        if !is_root() {
+            eprintln!("Skipping test_nat_end_to_end_tcp: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_nat_end_to_end_tcp: alpine-rootfs not found");
+            return;
+        };
+
+        // Skip if no outbound internet.
+        let internet = std::process::Command::new("ping")
+            .args(["-c", "1", "-W", "2", "1.1.1.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match internet {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!("Skipping test_nat_end_to_end_tcp: no outbound internet");
+                return;
+            }
+        }
+
+        let child = Command::new("/bin/sh")
+            .args(&["-c", "wget -q -T 5 --spider http://1.1.1.1/"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_dns(&["1.1.1.1"])
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn NAT container");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(
+            status.success(),
+            "wget through NAT should succeed (TCP to 1.1.1.1).\nstdout: {}\nstderr: {}",
+            out, err
+        );
+    }
 }
 
 mod oci_lifecycle {

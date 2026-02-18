@@ -449,6 +449,59 @@ and correct inside the container. The shared Alpine rootfs is never modified.
 
 ---
 
+## End-to-End Traffic Tests
+
+These tests go beyond rule/config existence checks and verify that real packets
+flow through the networking stack. They were added after discovering that nftables
+rules can exist while iptables FORWARD policy DROP silently blocks TCP/UDP.
+
+### `test_port_forward_end_to_end` — N4
+**Requires:** root, rootfs, `nc` on host
+
+Container A runs `echo HELLO_FROM_CONTAINER | nc -l -p 80` with
+`with_port_forward(19090, 80)`. A temporary external network namespace
+(`pf-test-client`) is created with its own veth pair to the host on
+10.99.0.0/24, simulating a real external client. From that namespace,
+`nc -w 2 10.99.0.1 19090` connects to the host on the forwarded port.
+The traffic arrives on the `pf-test-h` veth, goes through nftables PREROUTING
+(DNAT → container IP:80), then gets forwarded through the bridge to A.
+
+Note: DNAT prerouting rules only apply to traffic arriving from external
+interfaces, not locally-originated host packets (which go through OUTPUT) and
+not bridge-internal traffic (hairpin routing issues). So this test creates a
+separate network namespace as the client rather than connecting from the host
+or from another bridge container.
+
+Unlike `test_port_forward_rule_added` (which only checks the nftables rule string),
+this proves the full DNAT path works: external traffic → nftables prerouting → DNAT →
+FORWARD → bridge → container netns → container process → response back via conntrack.
+
+### `test_bridge_cleanup_after_sigkill` — N2+N3
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container (`sleep 60`), records veth name, netns name, and
+verifies iptables FORWARD rules exist. Then SIGKILLs the container and calls
+`wait()`. Asserts all four resource types are cleaned up: veth pair, named netns,
+nftables table, and iptables FORWARD rules.
+
+All other cleanup tests use normal container exit. This catches teardown bugs that
+only manifest when the container process dies unexpectedly — e.g. if `wait()` skips
+`teardown_network()` or `disable_nat()` when the child was killed.
+
+### `test_nat_end_to_end_tcp` — N3
+**Requires:** root, rootfs, outbound internet
+
+Spawns a bridge+NAT+DNS container that runs `wget --spider http://1.1.1.1/` and
+asserts exit 0. Skips gracefully if the host has no outbound internet (checked via
+host-side `ping -c1 -W2 1.1.1.1`).
+
+This is the true end-to-end NAT test — TCP packets flow from the container through
+MASQUERADE to the public internet and back. Existing NAT tests only verify that
+nftables/iptables rules exist. Follows the same skip-if-no-internet pattern as
+`test_pasta_connectivity`.
+
+---
+
 ## Overlay Filesystem Tests
 
 ### `test_overlay_writes_to_upper`
