@@ -25,7 +25,7 @@ struct Cli {
 enum CliCommand {
     // ── Container lifecycle ────────────────────────────────────────────────
     /// Create and start a container
-    Run(cli::run::RunArgs),
+    Run(Box<cli::run::RunArgs>),
 
     /// Run a command in a running container
     Exec(cli::exec::ExecArgs),
@@ -163,7 +163,7 @@ fn main() {
 
     let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
         // Container lifecycle
-        CliCommand::Run(args) => cli::run::cmd_run(args),
+        CliCommand::Run(args) => cli::run::cmd_run(*args),
         CliCommand::Exec(args) => cli::exec::cmd_exec(args),
         CliCommand::Ps { all } => cli::ps::cmd_ps(all),
         CliCommand::Stop { name } => cli::stop::cmd_stop(&name),

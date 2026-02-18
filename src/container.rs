@@ -1456,7 +1456,7 @@ impl Command {
             if self
                 .network_config
                 .as_ref()
-                .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
+                .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge)
             {
                 return Err(Error::Io(io::Error::other(
                     "NetworkMode::Bridge requires root; use NetworkMode::Pasta for rootless internet access",
@@ -1468,7 +1468,7 @@ impl Command {
         let is_pasta = self
             .network_config
             .as_ref()
-            .map_or(false, |c| c.mode == crate::network::NetworkMode::Pasta);
+            .is_some_and(|c| c.mode == crate::network::NetworkMode::Pasta);
         if is_pasta {
             if !crate::network::is_pasta_available() {
                 return Err(Error::Io(io::Error::other(
@@ -1503,14 +1503,14 @@ impl Command {
         let hostname = self.hostname.clone();
         // Loopback/Pasta mode: bring up lo inside pre_exec (after unshare(NEWNET)).
         // Bridge mode uses setns instead — lo is configured by setup_bridge_network.
-        let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
+        let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
         });
         let is_bridge = self
             .network_config
             .as_ref()
-            .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge);
+            .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge);
 
         // Bridge mode: create and fully configure the named netns BEFORE fork.
         // The child's pre_exec will join it via setns — no race whatsoever.
@@ -1757,10 +1757,9 @@ impl Command {
                     // Step 1.5: If we created a mount namespace, make all mounts private
                     // to prevent mount propagation leaking to the parent namespace.
                     if namespaces.contains(Namespace::MOUNT) {
-                        use std::ffi::CStr;
                         use std::ptr;
 
-                        let root = CStr::from_bytes_with_nul(b"/\0").unwrap();
+                        let root = c"/";
                         let result = libc::mount(
                             ptr::null(),                     // source: NULL (remount)
                             root.as_ptr(),                   // target: root
@@ -1953,11 +1952,11 @@ impl Command {
                             work.to_string_lossy()
                         ))
                         .unwrap();
-                        let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
+                        let ov_type = c"overlay";
                         let ret = libc::mount(
-                            ov_type,
+                            ov_type.as_ptr(),
                             merged.as_ptr(),
-                            ov_type,
+                            ov_type.as_ptr(),
                             0,
                             opts.as_ptr() as *const libc::c_void,
                         );
@@ -2585,7 +2584,7 @@ impl Command {
             if self
                 .network_config
                 .as_ref()
-                .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
+                .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge)
             {
                 return Err(Error::Io(io::Error::other(
                     "NetworkMode::Bridge requires root; use NetworkMode::Pasta for rootless internet access",
@@ -2597,7 +2596,7 @@ impl Command {
         let is_pasta = self
             .network_config
             .as_ref()
-            .map_or(false, |c| c.mode == crate::network::NetworkMode::Pasta);
+            .is_some_and(|c| c.mode == crate::network::NetworkMode::Pasta);
         if is_pasta {
             if !crate::network::is_pasta_available() {
                 return Err(Error::Io(io::Error::other(
@@ -2629,14 +2628,14 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let hostname = self.hostname.clone();
-        let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
+        let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
         });
         let is_bridge = self
             .network_config
             .as_ref()
-            .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge);
+            .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge);
 
         // Bridge mode: create and fully configure the named netns BEFORE fork.
         let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
@@ -2888,8 +2887,7 @@ impl Command {
                     }
 
                     if namespaces.contains(Namespace::MOUNT) {
-                        use std::ffi::CStr;
-                        let root = CStr::from_bytes_with_nul(b"/\0").unwrap();
+                        let root = c"/";
                         let result = libc::mount(
                             ptr::null(),
                             root.as_ptr(),
@@ -3041,11 +3039,11 @@ impl Command {
                             work.to_string_lossy()
                         ))
                         .unwrap();
-                        let ov_type = b"overlay\0".as_ptr() as *const libc::c_char;
+                        let ov_type = c"overlay";
                         let ret = libc::mount(
-                            ov_type,
+                            ov_type.as_ptr(),
                             merged.as_ptr(),
-                            ov_type,
+                            ov_type.as_ptr(),
                             0,
                             opts.as_ptr() as *const libc::c_void,
                         );

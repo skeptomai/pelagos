@@ -195,6 +195,7 @@ fn allocate_ip() -> io::Result<Ipv4Addr> {
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(IPAM_FILE)?;
@@ -403,6 +404,7 @@ fn enable_nat() -> io::Result<()> {
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(NAT_REFCOUNT_FILE)?;
@@ -451,6 +453,7 @@ fn enable_nat() -> io::Result<()> {
 fn disable_nat() {
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(NAT_REFCOUNT_FILE);
@@ -505,18 +508,15 @@ fn disable_nat() {
             // Port forwards still active — remove MASQUERADE but keep the table.
             let _ = run_nft("flush chain ip remora postrouting\n");
         }
-    } else {
-        if let Err(e) = file
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| file.set_len(0))
-            .and_then(|_| {
-                write!(file, "{}", count - 1)?;
-                Ok(())
-            })
-        {
-            log::warn!("NAT refcount write (non-fatal): {}", e);
-        }
-        // flock released when `file` is dropped.
+    } else if let Err(e) = file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| file.set_len(0))
+        .and_then(|_| {
+            write!(file, "{}", count - 1)?;
+            Ok(())
+        })
+    {
+        log::warn!("NAT refcount write (non-fatal): {}", e);
     }
 }
 
@@ -593,6 +593,7 @@ fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(PORT_FORWARDS_FILE)?;
@@ -609,7 +610,7 @@ fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
     for (ip, hp, cp) in &entries {
-        write!(file, "{}:{}:{}\n", ip, hp, cp)?;
+        writeln!(file, "{}:{}:{}", ip, hp, cp)?;
     }
 
     // Install nftables DNAT rules.
@@ -630,6 +631,7 @@ fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::
 fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(PORT_FORWARDS_FILE);
@@ -664,7 +666,7 @@ fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
         return;
     }
     for (ip, hp, cp) in &remaining {
-        let _ = write!(file, "{}:{}:{}\n", ip, hp, cp);
+        let _ = writeln!(file, "{}:{}:{}", ip, hp, cp);
     }
 
     // flock released; now update nftables.

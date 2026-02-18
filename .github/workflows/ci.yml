@@ -40,4 +40,4 @@ jobs:
       - name: Reset test environment
         run: sudo ./scripts/reset-test-env.sh
       - name: Run integration tests
-        run: sudo -E cargo test --test integration_tests -- --test-threads=1
+        run: sudo -E env "PATH=$PATH" cargo test --test integration_tests -- --test-threads=1
