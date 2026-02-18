@@ -125,8 +125,13 @@ pub struct RunArgs {
     #[clap(long = "masked-path")]
     pub masked_path: Vec<String>,
 
+    /// Run from a pulled OCI image instead of a rootfs (e.g. --image alpine)
+    #[clap(long)]
+    pub image: Option<String>,
+
     /// Rootfs name followed by optional command: ROOTFS [COMMAND [ARGS...]]
-    #[clap(required = true, multiple_values = true, allow_hyphen_values = true)]
+    /// Not required when --image is given.
+    #[clap(multiple_values = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
 
@@ -134,13 +139,6 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.detach && args.interactive {
         return Err("--detach and --interactive are mutually exclusive".into());
     }
-
-    // Split positional args: first is rootfs name, rest is command.
-    let rootfs_name = args.args[0].clone();
-    let cmd_args: Vec<String> = args.args[1..].to_vec();
-
-    // Resolve rootfs name → directory
-    let rootfs_dir = rootfs_path(&rootfs_name)?;
 
     // Generate container name
     let name = match args.name {
@@ -158,28 +156,108 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Determine command
-    let exe_and_args: Vec<String> = if cmd_args.is_empty() {
-        vec!["/bin/sh".to_string()]
-    } else {
-        cmd_args
-    };
-
-    // Parse port forwards
+    // Parse port forwards and network mode (shared by both paths).
     let port_forwards = parse_port_forwards(&args.publish)?;
-
-    // Parse network mode
     let network_mode = parse_network_mode(&args.network)?;
 
-    // Build the Command
-    let cmd = build_command(&args, &rootfs_dir, &exe_and_args, &port_forwards, network_mode)?;
+    // Branch: --image (OCI image layers) vs positional args (rootfs).
+    let (rootfs_label, exe_and_args, cmd) = if let Some(ref image_ref) = args.image {
+        build_image_run(&args, image_ref, &port_forwards, network_mode)?
+    } else {
+        if args.args.is_empty() {
+            return Err("either --image or a rootfs name is required".into());
+        }
+        let rootfs_name = args.args[0].clone();
+        let cmd_args: Vec<String> = args.args[1..].to_vec();
+        let rootfs_dir = rootfs_path(&rootfs_name)?;
+        let exe_and_args: Vec<String> = if cmd_args.is_empty() {
+            vec!["/bin/sh".to_string()]
+        } else {
+            cmd_args
+        };
+        let cmd = build_command(&args, &rootfs_dir, &exe_and_args, &port_forwards, network_mode)?;
+        (rootfs_name, exe_and_args, cmd)
+    };
 
     if args.detach {
-        run_detached(name, rootfs_name, exe_and_args, cmd)
+        run_detached(name, rootfs_label, exe_and_args, cmd)
     } else if args.interactive {
         run_interactive(cmd)
     } else {
-        run_foreground(name, rootfs_name, exe_and_args, cmd)
+        run_foreground(name, rootfs_label, exe_and_args, cmd)
+    }
+}
+
+/// Build a Command from a pulled OCI image.
+fn build_image_run(
+    args: &RunArgs,
+    image_ref: &str,
+    port_forwards: &[(u16, u16)],
+    network_mode: NetworkMode,
+) -> Result<(String, Vec<String>, Command), Box<dyn std::error::Error>> {
+    use remora::image;
+
+    // Normalise and load the image manifest.
+    let full_ref = normalise_image_reference(image_ref);
+    let manifest = image::load_image(&full_ref)
+        .map_err(|e| format!("image '{}' not found locally (run 'remora image pull {}'): {}", image_ref, image_ref, e))?;
+
+    // Resolve layer directories (top-first for overlayfs).
+    let layers = image::layer_dirs(&manifest);
+    if layers.is_empty() {
+        return Err("image has no layers".into());
+    }
+
+    // Determine the command: CLI args override image Entrypoint+Cmd.
+    let exe_and_args = if !args.args.is_empty() {
+        args.args.clone()
+    } else {
+        let mut cmd_vec = manifest.config.entrypoint.clone();
+        cmd_vec.extend(manifest.config.cmd.clone());
+        if cmd_vec.is_empty() {
+            vec!["/bin/sh".to_string()]
+        } else {
+            cmd_vec
+        }
+    };
+
+    let exe = &exe_and_args[0];
+    let rest = &exe_and_args[1..];
+
+    let mut cmd = Command::new(exe)
+        .args(rest)
+        .with_image_layers(layers);
+
+    // Apply image config defaults: environment.
+    for env_str in &manifest.config.env {
+        if let Some((k, v)) = env_str.split_once('=') {
+            cmd = cmd.env(k, v);
+        }
+    }
+
+    // Apply image config working directory.
+    if !manifest.config.working_dir.is_empty() && args.workdir.is_none() {
+        cmd = cmd.with_cwd(&manifest.config.working_dir);
+    }
+
+    // Apply shared CLI options (network, volumes, security, etc.)
+    cmd = apply_cli_options(cmd, args, port_forwards, network_mode)?;
+
+    Ok((full_ref, exe_and_args, cmd))
+}
+
+/// Expand bare image names: "alpine" → "docker.io/library/alpine:latest".
+fn normalise_image_reference(reference: &str) -> String {
+    let r = reference.to_string();
+    let r = if !r.contains(':') && !r.contains('@') {
+        format!("{}:latest", r)
+    } else {
+        r
+    };
+    if !r.contains('/') {
+        format!("docker.io/library/{}", r)
+    } else {
+        r
     }
 }
 
@@ -199,6 +277,18 @@ fn build_command(
         .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
         .with_proc_mount();
 
+    cmd = apply_cli_options(cmd, args, port_forwards, network_mode)?;
+    Ok(cmd)
+}
+
+/// Apply all CLI options (network, filesystem, env, security, etc.) to a Command.
+/// Shared between the rootfs path and the --image path.
+fn apply_cli_options(
+    mut cmd: Command,
+    args: &RunArgs,
+    port_forwards: &[(u16, u16)],
+    network_mode: NetworkMode,
+) -> Result<Command, Box<dyn std::error::Error>> {
     // Network
     if network_mode != NetworkMode::None {
         cmd = cmd.with_network(network_mode);
@@ -227,10 +317,8 @@ fn build_command(
     for v in &args.volume {
         if let Some((src, tgt)) = v.split_once(':') {
             if src.starts_with('/') {
-                // Bind mount
                 cmd = cmd.with_bind_mount(src, tgt);
             } else {
-                // Named volume — auto-create if absent
                 let vol = Volume::open(src).or_else(|_| Volume::create(src))?;
                 cmd = cmd.with_volume(&vol, tgt);
             }
@@ -267,7 +355,6 @@ fn build_command(
         if let Some((k, v)) = e.split_once('=') {
             cmd = cmd.env(k, v);
         } else {
-            // Pass through env var from host if no '='
             if let Ok(v) = std::env::var(e) {
                 cmd = cmd.env(e, v);
             }
@@ -278,7 +365,7 @@ fn build_command(
 
     // User
     if let Some(ref u) = args.user {
-        let (uid, gid) = parse_user(u).map_err(|e| e)?;
+        let (uid, gid) = parse_user(u)?;
         cmd = cmd.with_uid(uid);
         if let Some(g) = gid {
             cmd = cmd.with_gid(g);
@@ -297,11 +384,11 @@ fn build_command(
 
     // Cgroups
     if let Some(ref m) = args.memory {
-        let bytes = parse_memory(m).map_err(|e| e)?;
+        let bytes = parse_memory(m)?;
         cmd = cmd.with_cgroup_memory(bytes);
     }
     if let Some(ref c) = args.cpus {
-        let (quota, period) = parse_cpus(c).map_err(|e| e)?;
+        let (quota, period) = parse_cpus(c)?;
         cmd = cmd.with_cgroup_cpu_quota(quota, period);
     }
     if let Some(shares) = args.cpu_shares {
@@ -313,7 +400,7 @@ fn build_command(
 
     // Ulimits
     for u in &args.ulimit {
-        let (res, soft, hard) = parse_ulimit(u).map_err(|e| e)?;
+        let (res, soft, hard) = parse_ulimit(u)?;
         cmd = cmd.with_rlimit(res, soft, hard);
     }
 
@@ -321,10 +408,9 @@ fn build_command(
     let drop_all = args.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL"));
     if drop_all {
         cmd = cmd.drop_all_capabilities();
-        // Add back specific capabilities
         let mut add_caps = Capability::empty();
         for cap_name in &args.cap_add {
-            let cap = parse_capability(cap_name).map_err(|e| e)?;
+            let cap = parse_capability(cap_name)?;
             add_caps |= cap;
         }
         if !add_caps.is_empty() {

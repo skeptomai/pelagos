@@ -3776,3 +3776,251 @@ mod linking {
         }
     }
 }
+
+mod images {
+    use super::*;
+
+    /// Copy the rootfs into a temp directory, excluding pseudo-filesystem
+    /// contents (/sys, /proc, /dev) that can't be copied from a live mount.
+    /// Re-creates the empty mount-point directories afterward.
+    fn copy_rootfs(rootfs: &std::path::Path, dest: &std::path::Path) {
+        let status = std::process::Command::new("rsync")
+            .args(&[
+                "-a",
+                "--exclude=/sys",
+                "--exclude=/proc",
+                "--exclude=/dev",
+            ])
+            .arg(rootfs.to_str().unwrap().to_string() + "/")
+            .arg(dest.to_str().unwrap().to_string() + "/")
+            .status()
+            .expect("rsync rootfs to layer (is rsync installed?)");
+        assert!(status.success(), "rsync should succeed");
+        // Re-create empty mount-point dirs that rsync excluded.
+        std::fs::create_dir_all(dest.join("proc")).unwrap();
+        std::fs::create_dir_all(dest.join("sys")).unwrap();
+        std::fs::create_dir_all(dest.join("dev")).unwrap();
+    }
+
+    /// test_layer_extraction
+    ///
+    /// Requires: root (for mknod whiteout devices in extract_layer).
+    ///
+    /// Creates a synthetic tar.gz layer containing two files, extracts it via
+    /// `image::extract_layer()`, and verifies the files exist with correct content.
+    ///
+    /// Failure indicates the tar+gzip extraction pipeline or layer store layout is broken.
+    #[test]
+    #[serial]
+    fn test_layer_extraction() {
+        if !is_root() {
+            eprintln!("Skipping test_layer_extraction: requires root");
+            return;
+        }
+
+        use remora::image;
+
+        // Create a synthetic tar.gz with two files.
+        let tmp_dir = tempfile::tempdir().expect("create tempdir");
+        let tar_gz_path = tmp_dir.path().join("layer.tar.gz");
+        {
+            let file = std::fs::File::create(&tar_gz_path).expect("create tar.gz");
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(gz);
+
+            // Add a regular file.
+            let data = b"hello from layer";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, "test-file.txt", &data[..]).unwrap();
+
+            // Add a file in a subdirectory.
+            let data2 = b"nested content";
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_size(data2.len() as u64);
+            header2.set_mode(0o644);
+            header2.set_cksum();
+            builder.append_data(&mut header2, "subdir/nested.txt", &data2[..]).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        // Use a unique digest so we don't collide with real layers.
+        let digest = "sha256:test_layer_extraction_deadbeef";
+        let layer_path = image::layer_dir(digest);
+        // Clean up any previous run.
+        let _ = std::fs::remove_dir_all(&layer_path);
+
+        let result = image::extract_layer(digest, &tar_gz_path);
+        assert!(result.is_ok(), "extract_layer should succeed: {:?}", result.err());
+        let extracted = result.unwrap();
+        assert!(extracted.join("test-file.txt").exists(), "test-file.txt should exist");
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("test-file.txt")).unwrap(),
+            "hello from layer"
+        );
+        assert!(extracted.join("subdir/nested.txt").exists(), "subdir/nested.txt should exist");
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("subdir/nested.txt")).unwrap(),
+            "nested content"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&layer_path);
+    }
+
+    /// test_multi_layer_overlay_merge
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates two temporary layers: bottom has /layer-bottom, top has /layer-top.
+    /// Uses `with_image_layers()` to merge them via overlayfs. Runs `cat` inside
+    /// the container to verify both files are visible.
+    ///
+    /// Failure indicates multi-layer overlayfs mount construction or lowerdir
+    /// ordering is broken.
+    #[test]
+    #[serial]
+    fn test_multi_layer_overlay_merge() {
+        if !is_root() {
+            eprintln!("Skipping test_multi_layer_overlay_merge: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_multi_layer_overlay_merge: alpine-rootfs not found");
+            return;
+        };
+
+        // Create two synthetic layers.
+        let bottom = tempfile::tempdir().expect("bottom layer dir");
+        let top = tempfile::tempdir().expect("top layer dir");
+
+        // Copy rootfs contents into the bottom layer so we have a working system.
+        copy_rootfs(&rootfs, bottom.path());
+
+        // Add marker files.
+        std::fs::write(bottom.path().join("layer-bottom"), "bottom").unwrap();
+        std::fs::write(top.path().join("layer-top"), "top").unwrap();
+
+        // layer_dirs: top-first
+        let layers = vec![top.path().to_path_buf(), bottom.path().to_path_buf()];
+
+        let child = Command::new("/bin/sh")
+            .args(&["-c", "cat /layer-bottom && echo --- && cat /layer-top"])
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn with image layers");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(status.success(), "container should exit 0, stderr: {}", err);
+        assert!(out.contains("bottom"), "should see bottom layer file, got: {}", out);
+        assert!(out.contains("top"), "should see top layer file, got: {}", out);
+    }
+
+    /// test_multi_layer_overlay_shadow
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates bottom layer with /shadow-file containing "bottom" and top layer
+    /// with /shadow-file containing "top". Uses `with_image_layers()` to verify
+    /// the top layer's file shadows the bottom.
+    ///
+    /// Failure indicates overlayfs layer ordering (top-first lowerdir) is incorrect.
+    #[test]
+    #[serial]
+    fn test_multi_layer_overlay_shadow() {
+        if !is_root() {
+            eprintln!("Skipping test_multi_layer_overlay_shadow: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_multi_layer_overlay_shadow: alpine-rootfs not found");
+            return;
+        };
+
+        let bottom = tempfile::tempdir().expect("bottom layer dir");
+        let top = tempfile::tempdir().expect("top layer dir");
+
+        // Copy rootfs into bottom.
+        copy_rootfs(&rootfs, bottom.path());
+
+        // Same file in both layers — top should win.
+        std::fs::write(bottom.path().join("shadow-file"), "bottom-value").unwrap();
+        std::fs::write(top.path().join("shadow-file"), "top-value").unwrap();
+
+        let layers = vec![top.path().to_path_buf(), bottom.path().to_path_buf()];
+
+        let child = Command::new("/bin/cat")
+            .args(&["/shadow-file"])
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn with image layers");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+
+        assert!(status.success(), "container should exit 0, stderr: {}", err);
+        assert_eq!(out.trim(), "top-value", "top layer should shadow bottom, got: {}", out);
+    }
+
+    /// test_image_layers_cleanup
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Spawns a container with `with_image_layers()`, captures the overlay
+    /// merged-dir path, waits for exit, then verifies the ephemeral overlay
+    /// directory (merged + upper + work) was cleaned up.
+    ///
+    /// Failure indicates the `wait()` cleanup for image-layer overlay dirs is broken.
+    #[test]
+    #[serial]
+    fn test_image_layers_cleanup() {
+        if !is_root() {
+            eprintln!("Skipping test_image_layers_cleanup: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_image_layers_cleanup: alpine-rootfs not found");
+            return;
+        };
+
+        let layer = tempfile::tempdir().expect("layer dir");
+        copy_rootfs(&rootfs, layer.path());
+
+        let layers = vec![layer.path().to_path_buf()];
+
+        let mut child = Command::new("/bin/true")
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn");
+
+        let merged = child.overlay_merged_dir().expect("should have merged dir").to_path_buf();
+        let overlay_base = merged.parent().expect("merged should have parent").to_path_buf();
+        assert!(overlay_base.exists(), "overlay base dir should exist before wait");
+
+        let status = child.wait().expect("wait");
+        assert!(status.success(), "container should exit 0");
+        assert!(!overlay_base.exists(), "overlay base dir should be cleaned up after wait: {:?}", overlay_base);
+    }
+}

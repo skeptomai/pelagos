@@ -75,6 +75,14 @@ enum CliCommand {
         cmd: VolumeCmd,
     },
 
+    // ── Image management ─────────────────────────────────────────────────
+
+    /// Manage OCI images
+    Image {
+        #[clap(subcommand)]
+        cmd: ImageCmd,
+    },
+
     // ── OCI lifecycle (unchanged) ─────────────────────────────────────────
 
     /// OCI lifecycle: create a container (machine interface)
@@ -136,6 +144,22 @@ enum VolumeCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ImageCmd {
+    /// Pull an image from an OCI registry
+    Pull {
+        /// Image reference (e.g. alpine, alpine:3.19, docker.io/library/alpine:latest)
+        reference: String,
+    },
+    /// List locally stored images
+    Ls,
+    /// Remove a locally stored image
+    Rm {
+        /// Image reference
+        reference: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -165,6 +189,13 @@ fn main() {
             VolumeCmd::Create { name } => cli::volume::cmd_volume_create(&name),
             VolumeCmd::Ls => cli::volume::cmd_volume_ls(),
             VolumeCmd::Rm { name } => cli::volume::cmd_volume_rm(&name),
+        },
+
+        // Image
+        CliCommand::Image { cmd } => match cmd {
+            ImageCmd::Pull { reference } => cli::image::cmd_image_pull(&reference),
+            ImageCmd::Ls => cli::image::cmd_image_ls(),
+            ImageCmd::Rm { reference } => cli::image::cmd_image_rm(&reference),
         },
 
         // OCI lifecycle

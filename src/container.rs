@@ -346,6 +346,9 @@ pub struct OverlayConfig {
     pub upper_dir: PathBuf,
     /// Required by overlayfs; must be on the same filesystem as `upper_dir`.
     pub work_dir: PathBuf,
+    /// Additional lower layers (top-first). When non-empty, these are used as the
+    /// overlayfs `lowerdir=` stack instead of the single `chroot_dir`.
+    pub lower_dirs: Vec<PathBuf>,
 }
 
 /// A named volume backed by a host directory under `/var/lib/remora/volumes/<name>/`.
@@ -1045,7 +1048,32 @@ impl Command {
         self.overlay = Some(OverlayConfig {
             upper_dir: upper_dir.into(),
             work_dir: work_dir.into(),
+            lower_dirs: Vec::new(),
         });
+        self
+    }
+
+    /// Set up a multi-layer overlay from pre-extracted OCI image layers.
+    ///
+    /// `layer_dirs` must be ordered **top-first** (as overlayfs expects for `lowerdir=`).
+    /// The bottom (last) layer is used as the chroot directory.  An ephemeral upper and
+    /// work directory are auto-created under `/run/remora/overlay-{pid}-{n}/` and removed
+    /// after `wait()`.
+    ///
+    /// Automatically enables `Namespace::MOUNT` and `/proc` mount.
+    ///
+    /// Do not combine with `with_chroot()` or `with_overlay()` — this method sets both.
+    pub fn with_image_layers(mut self, layer_dirs: Vec<PathBuf>) -> Self {
+        assert!(!layer_dirs.is_empty(), "with_image_layers requires at least one layer");
+        // Bottom layer (last element) serves as the chroot anchor.
+        self.chroot_dir = Some(layer_dirs.last().unwrap().clone());
+        self.overlay = Some(OverlayConfig {
+            upper_dir: PathBuf::new(),  // placeholder — auto-created by spawn
+            work_dir: PathBuf::new(),   // placeholder — auto-created by spawn
+            lower_dirs: layer_dirs,
+        });
+        self.namespaces |= Namespace::MOUNT;
+        self.mount_proc = true;
         self
     }
 
@@ -1459,11 +1487,22 @@ impl Command {
 
         // Create the overlay merged dir before fork. The actual mount happens in
         // pre_exec (after unshare(NEWNS)), but the directory must exist first.
-        let overlay_merged_dir: Option<PathBuf> = if self.overlay.is_some() {
+        // When upper/work are empty (image-layer mode), auto-create them as siblings of merged.
+        let overlay_merged_dir: Option<PathBuf> = if let Some(ref mut ov) = self.overlay {
             let pid = unsafe { libc::getpid() };
             let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let merged = PathBuf::from(format!("/run/remora/overlay-{}-{}/merged", pid, n));
+            let base = PathBuf::from(format!("/run/remora/overlay-{}-{}", pid, n));
+            let merged = base.join("merged");
             std::fs::create_dir_all(&merged).map_err(Error::Io)?;
+            // Auto-create ephemeral upper/work for image-layer mode.
+            if ov.upper_dir.as_os_str().is_empty() {
+                let upper = base.join("upper");
+                let work = base.join("work");
+                std::fs::create_dir_all(&upper).map_err(Error::Io)?;
+                std::fs::create_dir_all(&work).map_err(Error::Io)?;
+                ov.upper_dir = upper;
+                ov.work_dir = work;
+            }
             Some(merged)
         } else {
             None
@@ -1475,8 +1514,17 @@ impl Command {
             match (&self.overlay, &overlay_merged_dir) {
                 (Some(ov), Some(merged)) => {
                     use std::os::unix::ffi::OsStrExt as _;
+                    // Build lowerdir: use lower_dirs if present, else chroot_dir.
+                    let lower_str = if !ov.lower_dirs.is_empty() {
+                        ov.lower_dirs.iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(":")
+                    } else {
+                        self.chroot_dir.as_ref().unwrap().to_string_lossy().into_owned()
+                    };
                     Some((
-                        std::ffi::CString::new(self.chroot_dir.as_ref().unwrap().as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(lower_str.as_bytes()).unwrap(),
                         std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
                         std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
                         std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
@@ -2447,11 +2495,21 @@ impl Command {
         }
 
         // Create the overlay merged dir before fork.
-        let overlay_merged_dir: Option<PathBuf> = if self.overlay.is_some() {
+        // When upper/work are empty (image-layer mode), auto-create them as siblings of merged.
+        let overlay_merged_dir: Option<PathBuf> = if let Some(ref mut ov) = self.overlay {
             let pid = unsafe { libc::getpid() };
             let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let merged = PathBuf::from(format!("/run/remora/overlay-{}-{}/merged", pid, n));
+            let base = PathBuf::from(format!("/run/remora/overlay-{}-{}", pid, n));
+            let merged = base.join("merged");
             std::fs::create_dir_all(&merged).map_err(Error::Io)?;
+            if ov.upper_dir.as_os_str().is_empty() {
+                let upper = base.join("upper");
+                let work = base.join("work");
+                std::fs::create_dir_all(&upper).map_err(Error::Io)?;
+                std::fs::create_dir_all(&work).map_err(Error::Io)?;
+                ov.upper_dir = upper;
+                ov.work_dir = work;
+            }
             Some(merged)
         } else {
             None
@@ -2462,8 +2520,16 @@ impl Command {
             match (&self.overlay, &overlay_merged_dir) {
                 (Some(ov), Some(merged)) => {
                     use std::os::unix::ffi::OsStrExt as _;
+                    let lower_str = if !ov.lower_dirs.is_empty() {
+                        ov.lower_dirs.iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(":")
+                    } else {
+                        self.chroot_dir.as_ref().unwrap().to_string_lossy().into_owned()
+                    };
                     Some((
-                        std::ffi::CString::new(self.chroot_dir.as_ref().unwrap().as_os_str().as_bytes()).unwrap(),
+                        std::ffi::CString::new(lower_str.as_bytes()).unwrap(),
                         std::ffi::CString::new(ov.upper_dir.as_os_str().as_bytes()).unwrap(),
                         std::ffi::CString::new(ov.work_dir.as_os_str().as_bytes()).unwrap(),
                         std::ffi::CString::new(merged.as_os_str().as_bytes()).unwrap(),
@@ -3240,9 +3306,9 @@ impl Child {
             crate::network::teardown_pasta_network(p);
         }
         if let Some(ref merged) = self.overlay_merged_dir {
-            let _ = std::fs::remove_dir(merged);
+            // Remove the entire overlay base dir (merged + ephemeral upper/work).
             if let Some(parent) = merged.parent() {
-                let _ = std::fs::remove_dir(parent);
+                let _ = std::fs::remove_dir_all(parent);
             }
         }
         if let Some(ref dir) = self.dns_temp_dir {
@@ -3271,9 +3337,9 @@ impl Child {
             crate::network::teardown_pasta_network(p);
         }
         if let Some(ref merged) = self.overlay_merged_dir {
-            let _ = std::fs::remove_dir(merged);
+            // Remove the entire overlay base dir (merged + ephemeral upper/work).
             if let Some(parent) = merged.parent() {
-                let _ = std::fs::remove_dir(parent);
+                let _ = std::fs::remove_dir_all(parent);
             }
         }
         if let Some(ref dir) = self.dns_temp_dir {

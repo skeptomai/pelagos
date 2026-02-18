@@ -804,3 +804,39 @@ Attempts to spawn a container with `with_link("nonexistent-container-xyz")`. Ver
 that spawn fails with an error message that mentions the missing container name. Failure
 indicates that link resolution doesn't properly validate the target container exists before
 proceeding with the spawn.
+
+---
+
+## Module: `images`
+
+### `test_layer_extraction`
+**Requires:** root
+
+Creates a synthetic tar.gz layer containing two files (one in a subdirectory), extracts
+it via `image::extract_layer()`, and verifies the files exist with correct content in
+the content-addressable layer store. Failure indicates the tar+gzip extraction pipeline
+or layer store layout is broken.
+
+### `test_multi_layer_overlay_merge`
+**Requires:** root, rootfs
+
+Creates two temporary layers: bottom (rootfs + `/layer-bottom`) and top (`/layer-top`).
+Uses `with_image_layers()` to mount them via overlayfs. Runs `cat` inside the container
+to verify both files are visible. Failure indicates multi-layer overlayfs mount construction
+or `lowerdir` ordering is broken.
+
+### `test_multi_layer_overlay_shadow`
+**Requires:** root, rootfs
+
+Creates bottom layer with `/shadow-file` containing "bottom-value" and top layer with
+`/shadow-file` containing "top-value". Uses `with_image_layers()` to verify the top
+layer's file shadows the bottom. Failure indicates overlayfs layer ordering (top-first
+lowerdir) is incorrect.
+
+### `test_image_layers_cleanup`
+**Requires:** root, rootfs
+
+Spawns a container with `with_image_layers()`, captures the overlay merged-dir path,
+waits for exit, then verifies the ephemeral overlay directory (merged + upper + work)
+was cleaned up by `wait()`. Failure indicates the cleanup logic for image-layer overlay
+dirs is broken.

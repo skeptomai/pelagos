@@ -91,6 +91,15 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **Named volumes**: `Volume::create/open/delete` backed by `/var/lib/remora/volumes/<name>/`; `with_volume()` builder method
 - **Overlay filesystem**: `with_overlay(upper_dir, work_dir)` — copy-on-write layered rootfs; requires `Namespace::MOUNT` + `with_chroot`; merged dir auto-managed at `/run/remora/overlay-{pid}-{n}/merged/`
 
+**OCI Image Layers (COMPLETE ✅):**
+- **Image pull**: `remora image pull alpine` — native OCI registry pulls via `oci-client`; anonymous auth; layers cached content-addressably at `/var/lib/remora/layers/<sha256>/`
+- **Image run**: `remora run --image alpine /bin/sh` — multi-layer overlayfs mount with ephemeral upper/work; image config (Env, Cmd, Entrypoint, WorkingDir) applied as defaults
+- **Image management**: `remora image ls`, `remora image rm <ref>` — list/remove locally stored images
+- **Multi-layer overlay**: `with_image_layers(layer_dirs)` — API for mounting multiple overlay lower layers; auto-creates ephemeral upper/work dirs
+- **OCI whiteouts**: `.wh.*` files converted to overlayfs char device (0,0) whiteouts; `.wh..wh..opq` sets `trusted.overlay.opaque` xattr
+- **`src/image.rs`**: `ImageConfig`, `ImageManifest`, `extract_layer()`, `save_image()`, `load_image()`, `layer_dirs()`
+- **`src/cli/image.rs`**: `cmd_image_pull()`, `cmd_image_ls()`, `cmd_image_rm()`
+
 **Networking (Phase 6 COMPLETE ✅):**
 - **N1 Loopback**: `with_network(NetworkMode::Loopback)` — isolated NET namespace, lo brought up via ioctl (127.0.0.1 active)
 - **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via `/run/remora/next_ip`
@@ -128,6 +137,7 @@ src/
   network.rs              # Native networking (N1 loopback, N2 bridge)
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
+  image.rs                # OCI image store: layer extraction, manifest persistence
   cli/
     mod.rs                # Shared types: ContainerState, helpers, parsers
     run.rs                # remora run — build + launch containers
@@ -137,9 +147,10 @@ src/
     logs.rs               # remora logs [--follow] — view container output
     rootfs.rs             # remora rootfs import/ls/rm
     volume.rs             # remora volume create/ls/rm
+    image.rs              # remora image pull/ls/rm — OCI registry pulls
 
 tests/
-  integration_tests.rs    # 68 integration tests (require root)
+  integration_tests.rs    # 72 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -173,6 +184,11 @@ cgroups-rs = "0.5.0"      # For future cgroup management
 seccompiler = "0.5.0"     # Pure Rust seccomp-BPF (Firecracker)
 serde = { version = "1", features = ["derive"] }  # OCI config.json / state.json
 serde_json = "1"          # JSON for OCI bundle config and state files
+oci-client = "0.16"       # OCI registry client for image pulls
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }  # Async runtime (image pulls)
+flate2 = "1"              # Gzip decompression for OCI layer tarballs
+tar = "0.4"               # Tar extraction for OCI layers
+tempfile = "3"            # Temp files for layer downloads
 ```
 
 **Removed dependencies:**
@@ -366,6 +382,7 @@ Many features require root or CAP_SYS_ADMIN
 | Overlay filesystem | ✅ CoW layered rootfs | ✅ |
 | Networking | ✅ N1–N5 + pasta (Loopback/Bridge/NAT/Ports/DNS/Pasta) | ✅ Native libnetwork |
 | Rootless networking | ✅ pasta (full internet, no root) | ✅ |
+| OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
 | OCI Compatible | 🔄 Partial | ✅ |
 
 **Current parity: ~90% of runc features**

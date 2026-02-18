@@ -1,107 +1,213 @@
 # Ongoing Tasks
 
-## Current: Networking End-to-End Test Suite
+## Current: OCI Image Layers — COMPLETE ✅
 
-### Motivation
+### Goal
 
-Rule/config existence tests pass while actual traffic is broken — proven by
-the NAT debugging session where nftables MASQUERADE was present but TCP/UDP
-was silently dropped by iptables FORWARD policy DROP. We need tests that
-send real packets through every networking feature.
+Enable `remora image pull alpine` → `remora run --image alpine /bin/sh`.
+Replace the manual rootfs download workflow with native OCI registry pulls.
 
-### Plan
+### Technology
 
-#### Test 1: `test_port_forward_end_to_end` (integration test)
+`oci-client` v0.16.0 (Apache-2.0) — native Rust OCI registry client. No
+external tools (skopeo, etc.). Brings tokio + reqwest as transitive deps.
 
-**Module:** `networking`
-**Requires:** root, rootfs
-**Serial key:** `nat`
+### New Dependencies
 
-Container A runs `echo HELLO | nc -l -p 80` with
-`with_port_forward(19090, 80)` + `with_nat()`. A temporary external network
-namespace (`pf-test-client`, 10.99.0.0/24 veth pair) connects to host on
-forwarded port. Traffic goes through PREROUTING → DNAT → FORWARD → bridge → A.
+```toml
+# Cargo.toml changes
+edition = "2021"                                   # upgrade from 2018
+oci-client = "0.16"                                # OCI registry client
+tokio = { version = "1", features = ["rt"] }       # async runtime (pulls only)
+flate2 = "1"                                       # gzip decompression
+tar = "0.4"                                        # tar extraction
+tempfile = "3"                                     # move from dev-deps to deps
+```
 
-Note: DNAT prerouting doesn't apply to locally-originated traffic (OUTPUT chain)
-or bridge-internal traffic (hairpin issues). Must test from external netns.
+### Storage Layout
 
-**What it proves:** The full DNAT path works — external traffic → nftables
-prerouting → FORWARD → container. Current tests only check rule strings exist.
+```
+/var/lib/remora/images/<name>_<tag>/
+  manifest.json              # reference, digest, ordered layer digests, config
 
-#### Test 2: `test_bridge_cleanup_after_sigkill` (integration test)
+/var/lib/remora/layers/<sha256-hex>/
+  bin/ etc/ usr/ ...         # extracted layer (content-addressable, shared)
+```
 
-**Module:** `networking`
-**Requires:** root, rootfs
-**Serial key:** `nat`
+### New File: `src/image.rs` (~300 lines) — Image Store Library
 
-Spawn a bridge+NAT container running `sleep 60`. Record the veth name
-(`child.veth_name()`), netns name (`child.netns_name()`), and confirm
-iptables FORWARD rules exist. Then SIGKILL the container and call `wait()`.
+Pure sync module. No tokio, no networking. Filesystem operations only.
 
-Assert after wait:
-- veth is gone (`ip link show {veth}` fails)
-- netns is gone (`/run/netns/{ns}` absent)
-- nftables table is gone (`nft list table ip remora` fails)
-- iptables FORWARD rules are gone (`iptables -C ...` fails)
+```rust
+pub const IMAGES_DIR: &str = "/var/lib/remora/images";
+pub const LAYERS_DIR: &str = "/var/lib/remora/layers";
 
-**What it proves:** `wait()` runs full teardown even after ungraceful death.
-All existing cleanup tests use normal exit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageConfig {
+    pub env: Vec<String>,           // ["PATH=/usr/bin", "HOME=/root"]
+    pub cmd: Vec<String>,           // default command
+    pub entrypoint: Vec<String>,    // entrypoint prefix
+    pub working_dir: String,        // e.g. "/app"
+    pub user: String,               // e.g. "1000" or "nobody"
+}
 
-#### Test 3: `test_nat_end_to_end_tcp` (integration test)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageManifest {
+    pub reference: String,          // "alpine:latest"
+    pub digest: String,             // "sha256:abc123..."
+    pub layers: Vec<String>,        // ordered layer digests, bottom to top
+    pub config: ImageConfig,
+}
 
-**Module:** `networking`
-**Requires:** root, rootfs, outbound internet
-**Serial key:** `nat`
+pub fn reference_to_dirname(reference: &str) -> String  // "alpine:latest" → "alpine_latest"
+pub fn image_dir(reference: &str) -> PathBuf
+pub fn layer_dir(digest: &str) -> PathBuf               // strips "sha256:" prefix
+pub fn layer_exists(digest: &str) -> bool
+pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf>
+pub fn save_image(manifest: &ImageManifest) -> io::Result<()>
+pub fn load_image(reference: &str) -> io::Result<ImageManifest>
+pub fn list_images() -> Vec<ImageManifest>
+pub fn remove_image(reference: &str) -> io::Result<()>
+pub fn layer_dirs(manifest: &ImageManifest) -> Vec<PathBuf>  // top-first for overlayfs
+```
 
-Spawn a bridge+NAT+DNS container that runs
-`wget -q -T 5 --spider http://1.1.1.1/`. Assert exit code 0.
+`extract_layer()`:
+- Uses `flate2::read::GzDecoder` + `tar::Archive::unpack()`
+- Handles OCI whiteout files during extraction:
+  - `.wh.NAME` → create overlayfs char device (0,0) named `NAME` via `libc::mknod`
+  - `.wh..wh..opq` → set `trusted.overlay.opaque` xattr on parent dir
 
-Skip gracefully if no internet (check with host-side ping first).
-Follows the same pattern as `test_pasta_connectivity`.
+Add `pub mod image;` to `src/lib.rs`.
 
-**What it proves:** TCP actually flows through NAT to the internet. Our
-existing NAT tests only verify nftables/iptables rules exist.
+### New File: `src/cli/image.rs` (~200 lines) — CLI + Registry Pull
 
-#### Test 4: `examples/full_stack_smoke/main.rs` (example script)
+Tokio runtime constructed locally: `Runtime::new().unwrap().block_on(...)`.
+Only used for the pull command.
 
-Compose every major feature in one container setup:
-- Overlay filesystem (upper + work dirs)
-- Bridge networking + NAT + DNS
-- Container linking (2 containers)
-- tmpfs mount
+```rust
+pub fn cmd_image_pull(reference: &str) -> Result<...>
+pub fn cmd_image_ls() -> Result<...>
+pub fn cmd_image_rm(reference: &str) -> Result<...>
+```
 
-Container A: bridge+NAT+DNS+overlay, runs `wget -qO- http://1.1.1.1/` to
-prove internet works, then runs `nc -l -p 8080` serving a message.
-Container B: bridge+overlay+link to A, connects to A by name, prints result.
+`cmd_image_pull` flow:
+1. Parse reference → `oci_client::Reference`
+2. Create `oci_client::Client` with `RegistryAuth::Anonymous`
+3. `client.pull_manifest_and_config()` → manifest + config JSON
+4. For each layer: skip if `layer_exists()`, else `client.pull_blob()` to tempfile → `extract_layer()`
+5. Parse config JSON → `ImageConfig` (Env, Cmd, Entrypoint, WorkingDir)
+6. `save_image()` with metadata
+7. Print summary: reference, layer count, cached vs downloaded
 
-**What it proves:** Features compose correctly. Each works alone but
-interactions are untested. This is a smoke test, not a unit assertion.
+Add `pub mod image;` to `src/cli/mod.rs`.
 
-### Files to change
+### Modify: `src/container.rs` — Multi-Layer Overlay
 
-| Action | File |
-|--------|------|
-| Edit | `tests/integration_tests.rs` — add tests 1-3 to `networking` module |
-| Edit | `docs/INTEGRATION_TESTS.md` — document all 3 new tests |
-| Create | `examples/full_stack_smoke/main.rs` — composition smoke test |
-| Edit | `ONGOING_TASKS.md` — mark complete when done |
+**Extend `OverlayConfig`** (line ~344):
+```rust
+pub struct OverlayConfig {
+    pub upper_dir: PathBuf,
+    pub work_dir: PathBuf,
+    pub lower_dirs: Vec<PathBuf>,   // NEW: when non-empty, used instead of chroot as lowerdir
+}
+```
 
-### Order of implementation
+**Update `with_overlay()`** (line ~1042): set `lower_dirs: Vec::new()` for backward compat.
 
-1. `test_port_forward_end_to_end` — self-contained, no internet needed
-2. `test_bridge_cleanup_after_sigkill` — self-contained, no internet needed
-3. `test_nat_end_to_end_tcp` — needs internet, skip guard
-4. `examples/full_stack_smoke/main.rs` — last, depends on all above passing
+**Add `with_image_layers(layer_dirs: Vec<PathBuf>)`** builder method:
+- Sets `chroot_dir` to bottom layer (last in the vec)
+- Sets `overlay.lower_dirs` to all layers (top-first, as overlayfs expects)
+- Sets `overlay.upper_dir` / `work_dir` to empty `PathBuf` (placeholder — auto-created by spawn)
+- Caller should NOT also call `with_chroot()` or `with_overlay()`
 
----
+**Update overlay mount logic** in both `spawn()` (~line 1472-1812) and
+`spawn_interactive()` (~line 2460-2768):
+- Build `lowerdir=` string: if `lower_dirs` non-empty, join with `:`;
+  else use chroot dir as single lower (existing behavior)
+- Auto-create upper/work when empty (image-layer mode):
+  `/run/remora/overlay-{pid}-{n}/upper/` and `/work/`
 
-## Planned Feature 1: OCI Image Layers
+### Modify: `src/main.rs` — Image Subcommand
 
-**Priority:** High — enables `remora pull alpine` instead of manual rootfs setup
-**Effort:** Significant Work
+Add after Volume (~line 76):
+```rust
+Image {
+    #[clap(subcommand)]
+    cmd: ImageCmd,
+}
+```
 
-Pull OCI/Docker images from registries, unpack their layers, and run containers
-from them using overlayfs. See git history for full design notes.
+Add `ImageCmd` enum with `Pull { reference }`, `Ls`, `Rm { reference }`.
+Add dispatch in `main()`.
+
+### Modify: `src/cli/run.rs` — `--image` Flag
+
+**Add to `RunArgs`** (before `args` at line ~128):
+```rust
+#[clap(long)]
+pub image: Option<String>,
+```
+
+**Change `args` field**: Remove `required = true` (not required with `--image`).
+
+**Update `cmd_run()`** (line ~133) — branch on `args.image`:
+- `--image`: load manifest via `image::load_image()`, resolve layer dirs,
+  determine command (CLI args override image Entrypoint+Cmd, fall back to
+  `/bin/sh`), call `build_command_for_image()`
+- No `--image`: existing rootfs flow (error if `args` empty)
+
+**Add `build_command_for_image()`**: Uses `with_image_layers()` instead of
+`with_chroot()`. Applies image config defaults (Env, WorkingDir) before
+CLI overrides.
+
+**Refactor**: Extract common CLI option logic (network, volumes, bind mounts,
+tmpfs, env, caps, security, sysctl, masked paths) from `build_command()` into
+`apply_cli_options(cmd, args, ...)` shared by both paths.
+
+### Implementation Order
+
+1. `Cargo.toml` — bump edition, add deps, verify build
+2. `src/image.rs` — image store + layer extraction + unit tests
+3. `src/container.rs` — extend OverlayConfig, add `with_image_layers`, update mount logic
+4. `src/cli/image.rs` — registry pull + CLI commands
+5. `src/main.rs` — Image subcommand + dispatch
+6. `src/cli/run.rs` — `--image` flag, `build_command_for_image`, refactor shared logic
+7. Integration tests
+8. Docs (INTEGRATION_TESTS.md, ONGOING_TASKS.md, CLAUDE.md)
+
+### Tests
+
+**Unit tests in `src/image.rs`:**
+- `test_reference_to_dirname` — name sanitization
+- `test_layer_dir_strips_prefix` — "sha256:abc" → "abc"
+- `test_manifest_roundtrip` — save + load
+
+**Integration tests (new `images` module in `tests/integration_tests.rs`):**
+- `test_layer_extraction` — create synthetic tar.gz, extract, verify files
+- `test_multi_layer_overlay_merge` — two temp layers, container sees both files
+- `test_multi_layer_overlay_shadow` — top layer file shadows bottom layer
+- `test_image_layers_cleanup` — ephemeral upper/work removed after wait()
+
+Document all new tests in `docs/INTEGRATION_TESTS.md`.
+
+**Manual verification (requires internet, user runs):**
+```bash
+sudo -E cargo run -- image pull alpine
+sudo -E cargo run -- image ls
+sudo -E cargo run -- run --image alpine /bin/sh -c "cat /etc/alpine-release"
+sudo -E cargo run -- image rm alpine
+```
+
+### Notes / Risks
+
+- **Edition 2021**: Safe upgrade from 2018, backward compatible
+- **Binary size**: oci-client brings tokio+reqwest+rustls — significant increase.
+  Could gate behind cargo feature flag later if needed
+- **Auth**: Anonymous-only for v1. Docker Hub public images work. Credential
+  helpers are a future enhancement
+- **Platform**: oci-client handles multi-arch manifest selection automatically
+- **Whiteout files**: Convert OCI `.wh.*` to overlayfs char device (0,0) via `libc::mknod`
+- **tempfile**: Move from dev-deps to deps (needed for layer download temp files)
 
 ---
 
