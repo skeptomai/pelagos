@@ -1,7 +1,7 @@
 # Remora Development Roadmap
 
 **Last Updated:** 2026-02-18
-**Current Status:** OCI image layers complete — `remora image pull` + `remora run --image`
+**Current Status:** Container exec complete — `remora exec <name> <command>`
 
 ---
 
@@ -172,6 +172,22 @@ Full internet access in rootless containers via [pasta](https://passt.top/passt/
 
 ---
 
+### Container Exec ✅
+
+Run commands inside running containers — analogous to `docker exec`.
+
+- `remora exec <name> <command>`: run a process in a running container's namespaces
+- `remora exec -i <name> /bin/sh`: interactive mode with PTY
+- Options: `-e KEY=VALUE` (env), `-w /path` (workdir), `-u UID[:GID]` (user)
+- Namespace discovery: compares `/proc/{pid}/ns/*` inodes against `/proc/1/ns/*`
+- Environment inheritance: reads `/proc/{pid}/environ`, CLI `-e` overrides
+- Mount namespace joining via `setns()` + `fchdir(root_fd)` + `chroot(".")` in
+  pre_exec callback (same technique as `nsenter(1)`)
+- No changes to `container.rs` — composes existing primitives
+- No resource teardown — exec'd process is ephemeral
+
+---
+
 ## In Progress
 
 (nothing currently in progress)
@@ -194,3 +210,4 @@ Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.
 | OCI compliance (Phase 1) ✅ | ~85% |
 | Rootless Phase 1 + Phase 2 (pasta) ✅ | ~90% |
 | OCI image layers ✅ | ~93% |
+| Container exec ✅ | ~95% |

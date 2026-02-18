@@ -1,5 +1,7 @@
 # Remora
 
+[![CI](https://github.com/skeptomai/remora/actions/workflows/ci.yml/badge.svg)](https://github.com/skeptomai/remora/actions/workflows/ci.yml)
+
 A modern, lightweight Linux container runtime library written in Rust.
 
 Remora provides a safe, ergonomic API for creating containerized processes using
@@ -201,6 +203,7 @@ and `docs/ROADMAP.md` for what's next.
 | `docs/PTY_DEEP_DIVE.md` | PTY/interactive session design |
 | `docs/CGROUPS.md` | Cgroups v1 vs v2 analysis |
 | `docs/BUILD_ROOTFS.md` | How to build the Alpine rootfs |
+| `CHANGELOG.md` | Version history and release notes |
 
 ## Requirements
 

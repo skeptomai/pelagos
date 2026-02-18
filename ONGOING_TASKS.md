@@ -1,6 +1,26 @@
 # Ongoing Tasks
 
-## Current: Rewrite USER_GUIDE.md — COMPLETE ✅
+## Current: GitHub Actions CI + Release Workflow — COMPLETE ✅
+
+Added GitHub Actions CI and release workflows plus a CHANGELOG.
+
+**Files created:**
+- `.github/workflows/ci.yml` — CI on push/PR: lint (fmt + clippy), unit tests, integration tests
+- `.github/workflows/release.yml` — Static binary release on `v*` tag push (musl, x86_64)
+- `CHANGELOG.md` — Keep a Changelog format, all features under `[Unreleased]`
+
+**Files modified:**
+- `README.md` — Added CI badge, added CHANGELOG to documentation table
+
+**CI details:**
+- Three parallel jobs: lint, unit-tests, integration-tests
+- Integration tests install nftables, iproute2, passt; build rootfs via tarball script
+- `--test-threads=1` for integration tests (shared network state)
+- Release builds static binary via `x86_64-unknown-linux-musl`, includes SHA256 checksum
+
+---
+
+## Previous: Rewrite USER_GUIDE.md — COMPLETE ✅
 
 Rewrote `docs/USER_GUIDE.md` to be CLI-first (like a podman/nerdctl quickstart).
 Added sections for OCI images, `remora exec`, networking, storage, security,
