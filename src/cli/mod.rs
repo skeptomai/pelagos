@@ -33,9 +33,18 @@ pub fn rootfs_store() -> PathBuf {
 }
 
 /// Resolve a named rootfs to its absolute path.
+///
+/// Accepts either a filesystem path (absolute or relative) that points to an
+/// existing directory, or a name registered in the rootfs store
+/// (`/var/lib/remora/rootfs/<name>` — a directory or symlink).
 pub fn rootfs_path(name: &str) -> std::io::Result<PathBuf> {
+    // If the argument is a path to an existing directory, use it directly.
+    let as_path = PathBuf::from(name);
+    if as_path.is_dir() {
+        return as_path.canonicalize();
+    }
+    // Otherwise look it up in the rootfs store.
     let link = rootfs_store().join(name);
-    // If the path is already a directory (not a symlink), use it directly.
     if link.is_dir() && !link.is_symlink() {
         return Ok(link);
     }

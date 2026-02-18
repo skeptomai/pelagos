@@ -336,14 +336,21 @@ pub fn teardown_network(setup: &NetworkSetup) {
 
 // ── N3: NAT / MASQUERADE ─────────────────────────────────────────────────────
 
-/// nftables script that installs MASQUERADE for the remora subnet.
+/// nftables script that installs MASQUERADE + FORWARD rules for the remora subnet.
 ///
 /// Uses `add` so the commands are idempotent if the table already exists
 /// (e.g. if a previous run crashed with the refcount > 0).
+///
+/// The forward chain is required because the host's default FORWARD policy may
+/// be DROP (common on systems with a firewall). Without it, ICMP (ping) may
+/// work but TCP/UDP traffic is silently dropped.
 const NFT_ADD_SCRIPT: &str = "\
 add table ip remora
 add chain ip remora postrouting { type nat hook postrouting priority 100; }
 add rule ip remora postrouting ip saddr 172.19.0.0/24 oifname != \"remora0\" masquerade
+add chain ip remora forward { type filter hook forward priority 0; }
+add rule ip remora forward ip saddr 172.19.0.0/24 accept
+add rule ip remora forward ip daddr 172.19.0.0/24 accept
 ";
 
 /// Pipe an nft script to `nft -f -`, returning an error on non-zero exit.
@@ -393,6 +400,13 @@ fn enable_nat() -> io::Result<()> {
         std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
         // Install the nftables MASQUERADE rule set.
         run_nft(NFT_ADD_SCRIPT)?;
+        // Also insert iptables FORWARD rules for compatibility with hosts
+        // running UFW, Docker, or other iptables-based firewalls that set
+        // the FORWARD chain policy to DROP. Without these, TCP/UDP packets
+        // from the remora subnet are silently dropped even though nftables
+        // MASQUERADE is in place (ICMP/ping may still work via conntrack).
+        let _ = run("iptables", &["-I", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"]);
+        let _ = run("iptables", &["-I", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"]);
     }
 
     file.seek(SeekFrom::Start(0))?;
@@ -440,6 +454,10 @@ fn disable_nat() {
         }
         // flock on refcount released; now decide what to do with the table.
         drop(file);
+
+        // Remove the iptables FORWARD rules added by enable_nat().
+        let _ = run("iptables", &["-D", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"]);
+        let _ = run("iptables", &["-D", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"]);
 
         if read_port_forwards_count() == 0 {
             // No active port forwards either — remove the entire table.
