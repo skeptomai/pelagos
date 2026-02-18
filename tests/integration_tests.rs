@@ -2856,3 +2856,225 @@ fn test_user_namespace_explicit() {
     let out = String::from_utf8_lossy(&stdout);
     assert!(out.contains("uid=0"), "expected uid=0 inside user namespace, got: {}", out);
 }
+
+// ── Pasta networking tests ────────────────────────────────────────────────────
+
+/// Check whether `pasta` is on PATH and responds to `--version`.
+fn is_pasta_available() -> bool {
+    remora::network::is_pasta_available()
+}
+
+/// Verify that pasta creates a TAP interface with an IP address inside the container's netns.
+///
+/// Spawns a container with `NetworkMode::Pasta` and runs `ip addr show` after a short
+/// sleep to let pasta attach and configure the interface via `--config-net`. Asserts:
+/// 1. A non-loopback interface exists (pasta created the TAP).
+/// 2. That interface has an `inet` address assigned (pasta's `--config-net` configured it).
+/// Failure on (1) means pasta did not attach to the netns. Failure on (2) means
+/// `--config-net` is not working — the container would have a TAP with no IP.
+///
+/// **Rootless only.** pasta's privilege-dropping (root→nobody via user namespace)
+/// makes it unable to access the container's namespace file descriptors when run as
+/// root. pasta is designed for rootless mode.
+#[test]
+fn test_pasta_interface_exists() {
+    if is_root() {
+        eprintln!("Skipping test_pasta_interface_exists: pasta is designed for rootless mode");
+        return;
+    }
+    if !is_pasta_available() {
+        eprintln!("Skipping test_pasta_interface_exists: pasta not installed");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_pasta_interface_exists: alpine-rootfs not found"); return; }
+    };
+
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "sleep 1 && ip addr show"])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_proc_mount()
+        .with_network(NetworkMode::Pasta)
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+    assert!(status.success(), "container exited non-zero");
+
+    let out = String::from_utf8_lossy(&stdout);
+    let has_non_loopback = out.lines().any(|l| {
+        l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
+    });
+    assert!(has_non_loopback,
+        "expected a non-loopback TAP interface from pasta, got:\n{}", out);
+
+    // With --config-net, pasta configures the IP address inside the container's netns.
+    // A non-127.x inet address means pasta did more than just create the TAP.
+    let has_tap_ip = out.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("inet ") && !l.starts_with("inet 127.")
+    });
+    assert!(has_tap_ip,
+        "expected inet address on pasta TAP (--config-net), got:\n{}", out);
+}
+
+/// Verify that pasta works in the rootless (USER+NET two-phase unshare) path and
+/// that --config-net assigns an IP to the TAP interface.
+///
+/// Non-root only. Spawns with `NetworkMode::Pasta` without explicit `Namespace::USER`
+/// — rootless auto-adds it. Asserts a non-loopback interface with an inet address is
+/// present. Failure means pasta does not work through the rootless USER+NET path, or
+/// that `--config-net` is not being passed to pasta.
+#[test]
+fn test_pasta_rootless() {
+    if is_root() {
+        eprintln!("Skipping test_pasta_rootless: must run as non-root (no sudo)");
+        return;
+    }
+    if !is_pasta_available() {
+        eprintln!("Skipping test_pasta_rootless: pasta not installed");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_pasta_rootless: alpine-rootfs not found"); return; }
+    };
+
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "sleep 1 && ip addr show"])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_proc_mount()
+        .with_network(NetworkMode::Pasta)
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (status, stdout, _) = child.wait_with_output().expect("wait failed");
+    assert!(status.success(), "container exited non-zero");
+
+    let out = String::from_utf8_lossy(&stdout);
+    let has_non_loopback = out.lines().any(|l| {
+        l.contains(": ") && !l.contains("lo:") && !l.contains(" lo@")
+    });
+    assert!(has_non_loopback,
+        "expected a non-loopback TAP interface from pasta in rootless mode, got:\n{}", out);
+
+    let has_tap_ip = out.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("inet ") && !l.starts_with("inet 127.")
+    });
+    assert!(has_tap_ip,
+        "expected inet address on pasta TAP in rootless mode, got:\n{}", out);
+}
+
+/// Verify actual end-to-end internet connectivity through pasta.
+///
+/// Non-root only. Spawns with `NetworkMode::Pasta`, sleeps briefly to let pasta
+/// attach and configure the interface, then fetches `http://1.1.1.1/` (Cloudflare)
+/// using `wget`. Asserts the command succeeds (exit 0).
+///
+/// Failure means packets are not flowing through pasta's relay despite the TAP
+/// interface and IP being present (verified by `test_pasta_interface_exists`).
+/// This test requires outbound internet access.
+#[test]
+fn test_pasta_connectivity() {
+    if is_root() {
+        eprintln!("Skipping test_pasta_connectivity: pasta is designed for rootless mode");
+        return;
+    }
+    if !is_pasta_available() {
+        eprintln!("Skipping test_pasta_connectivity: pasta not installed");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => { eprintln!("Skipping test_pasta_connectivity: alpine-rootfs not found"); return; }
+    };
+
+    // sleep 2: give pasta time to attach the TAP and configure IP+routes via --config-net.
+    // wget --spider: HEAD request — no body to save, so no /dev/null needed (the chroot
+    // only has proc mounted, not a full /dev with device nodes).
+    let child = Command::new("/bin/ash")
+        .args(&["-c", "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED"])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+        .with_proc_mount()
+        .with_network(NetworkMode::Pasta)
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+    let out = String::from_utf8_lossy(&stdout);
+    let err = String::from_utf8_lossy(&stderr);
+    assert!(status.success(),
+        "pasta connectivity test failed (is outbound internet available?)\nstdout: {}\nstderr: {}", out, err);
+    assert!(out.contains("CONNECTED"),
+        "wget succeeded but CONNECTED marker missing:\n{}", out);
+}
+
+/// Verify that a container with a PID namespace can fork() repeatedly.
+///
+/// Regression test for a bug where `unshare(CLONE_NEWPID)` left the container
+/// process OUTSIDE the new PID namespace — only its children entered it.  The
+/// first child became PID 1; when it exited the kernel marked the namespace
+/// defunct, causing every subsequent `fork()` to fail with ENOMEM.
+///
+/// The fix is a double-fork in `pre_exec`: after `unshare(CLONE_NEWPID)` we
+/// fork once more so the container process IS PID 1 in the new namespace.
+///
+/// This test runs a shell loop that forks `sleep` 5 times.  Without the fix,
+/// the second (or later) fork fails with "can't fork: Out of memory".
+///
+/// Requires root and alpine-rootfs.
+#[test]
+#[serial]
+fn test_pid_namespace_repeated_fork() {
+    if !is_root() {
+        eprintln!("Skipping test_pid_namespace_repeated_fork: requires root");
+        return;
+    }
+
+    let Some(rootfs) = get_test_rootfs() else {
+        eprintln!("Skipping test_pid_namespace_repeated_fork: alpine-rootfs not found");
+        return;
+    };
+
+    // Fork 5 times via external `sleep 0` (not a builtin — forces fork+exec).
+    // Count successes.  All 5 must succeed.
+    let child = Command::new("/bin/sh")
+        .args(&["-c", r#"i=0; while [ $i -lt 5 ]; do sleep 0; i=$((i+1)); done; echo "FORKS_OK""#])
+        .with_chroot(&rootfs)
+        .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
+        .with_proc_mount()
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("Failed to spawn with PID namespace");
+
+    let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+    let out = String::from_utf8_lossy(&stdout);
+    let err = String::from_utf8_lossy(&stderr);
+
+    assert!(
+        status.success(),
+        "Container with PID namespace failed (exit {:?}).\nstdout: {}\nstderr: {}",
+        status.code(), out, err
+    );
+    assert!(
+        out.contains("FORKS_OK"),
+        "Container could not fork() repeatedly in PID namespace (defunct namespace bug).\nstdout: {}\nstderr: {}",
+        out, err
+    );
+}

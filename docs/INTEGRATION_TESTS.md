@@ -616,3 +616,68 @@ lives under `/home/cb/` which is not traversable from inside a USER namespace wi
 single-uid map (DAC_OVERRIDE only applies for inodes whose uid is in the map). Asserts the
 container process outputs `uid=0`. Failure indicates a regression in the uid_map writing
 path or the MS_PRIVATE MNT_LOCKED skip logic.
+
+---
+
+## Pasta Networking Tests
+
+The following tests verify `NetworkMode::Pasta` (user-mode networking via the `pasta`
+binary from the passt project). All tests skip gracefully when `pasta` is not installed.
+All require a non-root user — pasta's privilege-dropping (root→nobody via an internal
+user namespace) makes it unable to access container namespace file descriptors when run
+as root. pasta is designed for rootless mode.
+
+To run these tests:
+
+```bash
+# All pasta tests — run without sudo:
+cargo test --test integration_tests test_pasta
+```
+
+### `test_pasta_interface_exists`
+**Requires:** non-root user, rootfs, pasta installed
+
+Spawns a container with `NetworkMode::Pasta`, sleeps 1 second to let pasta attach, then
+runs `ip addr show`. Makes two assertions:
+1. A non-loopback interface exists — pasta attached its TAP to the container's netns.
+2. That interface has an `inet` address that is not 127.x — pasta's `--config-net` flag
+   configured the IP inside the netns (without this, the TAP would exist but have no IP).
+
+Failure on (1) means `setup_pasta_network()` is not being called or pasta cannot attach.
+Failure on (2) means `--config-net` is not being passed, so the container has a TAP
+with no address — no connectivity is possible.
+
+### `test_pasta_rootless`
+**Requires:** non-root user, rootfs, pasta installed
+
+Same assertions as `test_pasta_interface_exists` but specifically exercises the rootless
+auto-detection path: `Namespace::USER` is not set explicitly — remora adds it automatically
+when `getuid() != 0`. Confirms that the USER+NET two-phase unshare and pasta still coexist
+correctly when rootless mode is triggered implicitly.
+
+### `test_pasta_connectivity`
+**Requires:** non-root user, rootfs, pasta installed, outbound internet access
+
+Spawns a container with `NetworkMode::Pasta`, sleeps 2 seconds (TAP attach + `--config-net`
+routing setup), then runs `wget -q -T 5 --spider http://1.1.1.1/` (HEAD request — no body
+to write, avoiding `/dev/null` which doesn't exist as a device node in the chroot). Asserts
+the command exits 0 and prints `CONNECTED`. This is the end-to-end connectivity check — it verifies
+that packets actually flow through pasta's relay to the internet, not just that the
+interface exists and has an IP. Failure indicates pasta's packet relay is broken or outbound
+internet is unavailable in the test environment.
+
+---
+
+## PID Namespace Tests
+
+### `test_pid_namespace_repeated_fork`
+**Requires:** root, rootfs
+
+Regression test for a bug where `unshare(CLONE_NEWPID)` left the container process outside
+the new PID namespace. Only the container's children entered it, so the first forked child
+became PID 1. When that child exited, the kernel marked the namespace defunct and every
+subsequent `fork()` failed with ENOMEM — even with abundant system memory.
+
+Runs a shell loop that forks an external command (`sleep 0`) five times. All five forks must
+succeed and the container must print `FORKS_OK`. Failure indicates the double-fork mechanism
+in `pre_exec` (which makes the container process PID 1 in the new namespace) is broken.

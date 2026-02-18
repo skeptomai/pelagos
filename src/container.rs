@@ -425,6 +425,8 @@ pub struct Command {
     devices: Vec<DeviceNode>,
     // Pre-compiled seccomp BPF program (takes priority over seccomp_profile).
     seccomp_program: Option<seccompiler::BpfProgram>,
+    // Hostname to set inside the container's UTS namespace.
+    hostname: Option<String>,
 }
 
 impl Command {
@@ -464,6 +466,7 @@ impl Command {
             sysctl: Vec::new(),
             devices: Vec::new(),
             seccomp_program: None,
+            hostname: None,
         }
     }
 
@@ -980,6 +983,15 @@ impl Command {
         self
     }
 
+    /// Set the hostname inside the container.
+    ///
+    /// Requires `Namespace::UTS` to be active; the hostname is set via
+    /// `sethostname(2)` in the container's UTS namespace after unshare.
+    pub fn with_hostname(mut self, name: impl Into<String>) -> Self {
+        self.hostname = Some(name.into());
+        self
+    }
+
     /// Configure OCI create/start synchronization.
     ///
     /// Internal — used by `remora create`. The child's pre_exec writes its PID
@@ -1290,11 +1302,22 @@ impl Command {
                 .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
             {
                 return Err(Error::Io(io::Error::other(
-                    "NetworkMode::Bridge requires root; use NetworkMode::Loopback for rootless containers",
+                    "NetworkMode::Bridge requires root; use NetworkMode::Pasta for rootless internet access",
                 )));
             }
         }
 
+        // Pasta mode: validate pasta is available and auto-add NET namespace.
+        let is_pasta = self.network_config.as_ref()
+            .map_or(false, |c| c.mode == crate::network::NetworkMode::Pasta);
+        if is_pasta {
+            if !crate::network::is_pasta_available() {
+                return Err(Error::Io(io::Error::other(
+                    "NetworkMode::Pasta requires pasta — install from https://passt.top"
+                )));
+            }
+            self.namespaces |= Namespace::NET;
+        }
 
         // Collect configuration to move into pre_exec closure
         let namespaces = self.namespaces;
@@ -1318,10 +1341,12 @@ impl Command {
         let devices = self.devices.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
-        // Loopback mode: bring up lo inside pre_exec (after unshare(NEWNET)).
+        let hostname = self.hostname.clone();
+        // Loopback/Pasta mode: bring up lo inside pre_exec (after unshare(NEWNET)).
         // Bridge mode uses setns instead — lo is configured by setup_bridge_network.
         let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
             c.mode == crate::network::NetworkMode::Loopback
+                || c.mode == crate::network::NetworkMode::Pasta
         });
         let is_bridge = self.network_config.as_ref().map_or(false, |c| {
             c.mode == crate::network::NetworkMode::Bridge
@@ -1510,6 +1535,70 @@ impl Command {
                             .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
                     }
 
+                    // Step 1.61: Set container hostname in the UTS namespace.
+                    if let Some(ref name) = hostname {
+                        let r = libc::sethostname(
+                            name.as_ptr() as *const libc::c_char,
+                            name.len(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+
+                // Step 1.65: PID namespace double-fork.
+                //
+                // unshare(CLONE_NEWPID) puts our CHILDREN into a new PID namespace —
+                // we ourselves stay in the parent namespace.  This means:
+                //   (a) we are NOT PID 1 in the new namespace
+                //   (b) the first child we fork becomes PID 1
+                //   (c) when that PID 1 exits, the kernel marks the namespace defunct
+                //   (d) every subsequent fork() fails with ENOMEM
+                //
+                // Fix: fork once more so the child IS PID 1 in the new namespace.
+                // The intermediate process (us) just waits and propagates the exit
+                // status.  PR_SET_PDEATHSIG ensures PID 1 is killed if we die.
+                if namespaces.contains(Namespace::PID) {
+                    let inner_pid = libc::fork();
+                    if inner_pid < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if inner_pid > 0 {
+                        // Intermediate: wait for the real container (PID 1) and exit
+                        // with its status.  Never returns from pre_exec.
+                        //
+                        // Close all fds > 2 first.  std::process::Command uses an
+                        // internal CLOEXEC pipe to report pre_exec/exec errors back
+                        // to the parent.  Both we and the child hold the write end
+                        // after fork.  If we keep ours open, the parent's read()
+                        // blocks forever because the pipe never reaches EOF.
+                        // The intermediate only needs waitpid — no fds required.
+                        for fd in 3..1024 {
+                            libc::close(fd);
+                        }
+                        let mut status: libc::c_int = 0;
+                        loop {
+                            let r = libc::waitpid(inner_pid, &mut status, 0);
+                            if r == inner_pid {
+                                break;
+                            }
+                            if r < 0 {
+                                let e = *libc::__errno_location();
+                                if e != libc::EINTR {
+                                    libc::_exit(1);
+                                }
+                            }
+                        }
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        } else {
+                            libc::_exit(128 + libc::WTERMSIG(status));
+                        }
+                    }
+                    // Child: we are now PID 1 in the new PID namespace.
+                    // Ensure we die if the intermediate (our parent) is killed.
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 }
 
                 // Step 1.7: Bridge mode — join the pre-configured named netns via setns.
@@ -2048,7 +2137,17 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
-        Ok(Child { inner: child_inner, cgroup, network, overlay_merged_dir, dns_temp_dir })
+        // Pasta: spawn the relay after the child has exec'd (/proc/{pid}/ns/net is live).
+        let pasta: Option<crate::network::PastaSetup> = if is_pasta {
+            Some(crate::network::setup_pasta_network(
+                child_inner.id(),
+                &self.port_forwards,
+            ).map_err(Error::Io)?)
+        } else {
+            None
+        };
+
+        Ok(Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir })
     }
 
     /// Spawn the container with a PTY for proper session isolation.
@@ -2143,9 +2242,21 @@ impl Command {
                 .map_or(false, |c| c.mode == crate::network::NetworkMode::Bridge)
             {
                 return Err(Error::Io(io::Error::other(
-                    "NetworkMode::Bridge requires root; use NetworkMode::Loopback for rootless containers",
+                    "NetworkMode::Bridge requires root; use NetworkMode::Pasta for rootless internet access",
                 )));
             }
+        }
+
+        // Pasta mode: validate pasta is available and auto-add NET namespace.
+        let is_pasta = self.network_config.as_ref()
+            .map_or(false, |c| c.mode == crate::network::NetworkMode::Pasta);
+        if is_pasta {
+            if !crate::network::is_pasta_available() {
+                return Err(Error::Io(io::Error::other(
+                    "NetworkMode::Pasta requires pasta — install from https://passt.top"
+                )));
+            }
+            self.namespaces |= Namespace::NET;
         }
 
         let namespaces = self.namespaces;
@@ -2169,8 +2280,10 @@ impl Command {
         let devices = self.devices.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
+        let hostname = self.hostname.clone();
         let bring_up_loopback = self.network_config.as_ref().map_or(false, |c| {
             c.mode == crate::network::NetworkMode::Loopback
+                || c.mode == crate::network::NetworkMode::Pasta
         });
         let is_bridge = self.network_config.as_ref().map_or(false, |c| {
             c.mode == crate::network::NetworkMode::Bridge
@@ -2359,6 +2472,50 @@ impl Command {
                             .map_err(|e| io::Error::other(format!("loopback up: {}", e)))?;
                     }
 
+                    // Set container hostname in the UTS namespace.
+                    if let Some(ref name) = hostname {
+                        let r = libc::sethostname(
+                            name.as_ptr() as *const libc::c_char,
+                            name.len(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                }
+
+                // PID namespace double-fork (same as spawn() Step 1.65).
+                // See spawn() for detailed explanation.
+                if namespaces.contains(Namespace::PID) {
+                    let inner_pid = libc::fork();
+                    if inner_pid < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if inner_pid > 0 {
+                        // Close all fds > 2 — see spawn() Step 1.65 for rationale.
+                        for fd in 3..1024 {
+                            libc::close(fd);
+                        }
+                        let mut status: libc::c_int = 0;
+                        loop {
+                            let r = libc::waitpid(inner_pid, &mut status, 0);
+                            if r == inner_pid {
+                                break;
+                            }
+                            if r < 0 {
+                                let e = *libc::__errno_location();
+                                if e != libc::EINTR {
+                                    libc::_exit(1);
+                                }
+                            }
+                        }
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        } else {
+                            libc::_exit(128 + libc::WTERMSIG(status));
+                        }
+                    }
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 }
 
                 // Bridge mode — join the pre-configured named netns via setns.
@@ -2775,9 +2932,19 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
+        // Pasta: spawn the relay after the child has exec'd (/proc/{pid}/ns/net is live).
+        let pasta: Option<crate::network::PastaSetup> = if is_pasta {
+            Some(crate::network::setup_pasta_network(
+                child_inner.id(),
+                &self.port_forwards,
+            ).map_err(Error::Io)?)
+        } else {
+            None
+        };
+
         Ok(crate::pty::InteractiveSession {
             master,
-            child: Child { inner: child_inner, cgroup, network, overlay_merged_dir, dns_temp_dir },
+            child: Child { inner: child_inner, cgroup, network, pasta, overlay_merged_dir, dns_temp_dir },
         })
     }
 }
@@ -2809,6 +2976,8 @@ pub struct Child {
     pub(crate) cgroup: Option<cgroups_rs::fs::Cgroup>,
     /// Optional network state (veth pair). Torn down after the child exits.
     network: Option<crate::network::NetworkSetup>,
+    /// Optional pasta relay process. Killed after the child exits.
+    pasta: Option<crate::network::PastaSetup>,
     /// Overlay merged-dir created before fork; removed after the child exits.
     overlay_merged_dir: Option<PathBuf>,
     /// Per-container DNS temp dir (`/run/remora/dns-{pid}-{n}/`); removed after child exits.
@@ -2840,6 +3009,22 @@ impl Child {
         self.overlay_merged_dir.as_deref()
     }
 
+    /// Take ownership of the child's piped stdout handle.
+    ///
+    /// Returns `None` if stdout was not set to `Stdio::Piped`, or if already taken.
+    /// Call this once before `wait()` to stream output concurrently.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.inner.stdout.take()
+    }
+
+    /// Take ownership of the child's piped stderr handle.
+    ///
+    /// Returns `None` if stderr was not set to `Stdio::Piped`, or if already taken.
+    /// Call this once before `wait()` to stream output concurrently.
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.inner.stderr.take()
+    }
+
     /// Wait for the child process to exit.
     ///
     /// This will block until the process terminates and return its exit status.
@@ -2851,6 +3036,9 @@ impl Child {
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);
+        }
+        if let Some(ref mut p) = self.pasta {
+            crate::network::teardown_pasta_network(p);
         }
         if let Some(ref merged) = self.overlay_merged_dir {
             let _ = std::fs::remove_dir(merged);
@@ -2869,13 +3057,16 @@ impl Child {
     /// Returns (exit_status, stdout_bytes, stderr_bytes).
     /// Only works if Stdio::Piped was set for stdout/stderr.
     /// If a cgroup was configured, it is deleted after the child exits.
-    pub fn wait_with_output(self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
+    pub fn wait_with_output(mut self) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), Error> {
         let output = self.inner.wait_with_output().map_err(Error::Wait)?;
         if let Some(cg) = self.cgroup {
             crate::cgroup::teardown_cgroup(cg);
         }
         if let Some(ref net) = self.network {
             crate::network::teardown_network(net);
+        }
+        if let Some(ref mut p) = self.pasta {
+            crate::network::teardown_pasta_network(p);
         }
         if let Some(ref merged) = self.overlay_merged_dir {
             let _ = std::fs::remove_dir(merged);

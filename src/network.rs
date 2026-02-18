@@ -58,6 +58,12 @@ pub enum NetworkMode {
     Loopback,
     /// Full connectivity via the `remora0` bridge (172.19.0.x/24).
     Bridge,
+    /// User-mode networking via `pasta` — rootless-compatible, full internet access.
+    ///
+    /// pasta creates a TAP interface inside the container's network namespace and
+    /// relays packets to/from the host using ordinary userspace sockets, requiring
+    /// no kernel privileges. Works for both root and rootless containers.
+    Pasta,
 }
 
 /// Network configuration for a container.
@@ -79,6 +85,11 @@ pub struct NetworkSetup {
     pub nat_enabled: bool,
     /// Port forwards configured for this container: `(host_port, container_port)`.
     pub port_forwards: Vec<(u16, u16)>,
+}
+
+/// Runtime state for a pasta-backed container; holds the pasta process for teardown.
+pub struct PastaSetup {
+    process: std::process::Child,
 }
 
 // ── Name generation ───────────────────────────────────────────────────────────
@@ -614,6 +625,71 @@ fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
             log::warn!("nft rebuild prerouting (non-fatal): {}", e);
         }
     }
+}
+
+// ── N5: pasta user-mode networking ───────────────────────────────────────────
+
+/// Spawn pasta attached to an already-running container's network namespace.
+///
+/// Called in the *parent*, immediately after `spawn()` returns (child has exec'd).
+/// pasta receives the container's netns via `/proc/{child_pid}/ns/net`.
+///
+/// pasta runs as a background process; call [`teardown_pasta_network`] after
+/// the container exits to kill it and reap the process.
+pub fn setup_pasta_network(child_pid: u32, port_forwards: &[(u16, u16)]) -> io::Result<PastaSetup> {
+    let mut args: Vec<String> = vec![];
+
+    // Use the PID form: `pasta [OPTIONS] PID`.
+    //
+    // When pasta receives a PID it joins that process's *existing* user namespace
+    // (via /proc/{pid}/ns/user) rather than creating a new one to drop privileges.
+    // In root mode the container's user namespace is the host/initial namespace —
+    // joining it is a no-op, so pasta retains full capabilities and can open the
+    // container's /proc/{pid}/ns/net without "Permission denied".
+    //
+    // The --netns PATH form triggers a different code path where pasta *creates* a
+    // new user namespace for the drop-to-nobody dance, and then lacks access to the
+    // target netns file from within that new user namespace.
+
+    for (host, container) in port_forwards {
+        args.push("-t".to_string());
+        args.push(format!("{}:{}", host, container));
+    }
+    // Tell pasta to configure IP address and routes inside the container's netns.
+    // Without this flag pasta only creates the TAP; the container would need to run
+    // a DHCP client (udhcpc) before the interface has an IP or default route.
+    args.push("--config-net".to_string());
+    args.push("--quiet".to_string());
+    // PID must come last (positional argument).
+    args.push(child_pid.to_string());
+
+    let process = SysCmd::new("pasta")
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| io::Error::other(format!(
+            "failed to start pasta (is it installed?): {}", e
+        )))?;
+
+    Ok(PastaSetup { process })
+}
+
+/// Kill the pasta relay process (best-effort; errors are non-fatal).
+pub fn teardown_pasta_network(setup: &mut PastaSetup) {
+    let _ = setup.process.kill();
+    let _ = setup.process.wait();
+}
+
+/// Returns true if `pasta` is on PATH and responds to `--version`.
+pub fn is_pasta_available() -> bool {
+    SysCmd::new("pasta").arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

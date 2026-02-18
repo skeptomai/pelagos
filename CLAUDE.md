@@ -97,8 +97,9 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **N3 NAT**: `with_nat()` — nftables MASQUERADE, reference-counted via `/run/remora/nat_refcount`
 - **N4 Port mapping**: `with_port_forward(host_port, container_port)` — TCP DNAT via nftables prerouting
 - **N5 DNS**: `with_dns(&[...])` — writes to `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it into the container; shared rootfs is never modified; requires `Namespace::MOUNT` + `with_chroot`
-- **Automatic cleanup**: veth pair, netns, nftables rules cleaned up in `wait()` / `wait_with_output()`
-- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
+- **N6 Pasta**: `with_network(NetworkMode::Pasta)` — user-mode networking via `pasta`; rootless-compatible full internet access; attaches to container netns via `/proc/{pid}/ns/net` after exec
+- **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay cleaned up in `wait()` / `wait_with_output()`
+- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
 
 **OCI Compliance (Phase 1 COMPLETE ✅):**
 - **`remora create <id> <bundle>`**: parse `config.json`, fork shim, block on `exec.sock` until `start`
@@ -120,16 +121,25 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 ```
 src/
   lib.rs                  # Library entry point
-  main.rs                 # CLI binary (OCI subcommands + legacy run)
-  container.rs            # Main API (~2250 lines)
+  main.rs                 # CLI binary (run/ps/stop/rm/logs + OCI lifecycle)
+  container.rs            # Main API (~2270 lines)
   oci.rs                  # OCI Runtime Spec implementation
   cgroup.rs               # Cgroups v2 resource management
   network.rs              # Native networking (N1 loopback, N2 bridge)
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
+  cli/
+    mod.rs                # Shared types: ContainerState, helpers, parsers
+    run.rs                # remora run — build + launch containers
+    ps.rs                 # remora ps — list containers
+    stop.rs               # remora stop — SIGTERM a container
+    rm.rs                 # remora rm — remove a container
+    logs.rs               # remora logs [--follow] — view container output
+    rootfs.rs             # remora rootfs import/ls/rm
+    volume.rs             # remora volume create/ls/rm
 
 tests/
-  integration_tests.rs    # 64 integration tests (require root)
+  integration_tests.rs    # 68 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -139,6 +149,7 @@ Documentation:
   CLAUDE.md                             # This file
   docs/ROADMAP.md                       # Development plan (NO time estimates!)
   docs/INTEGRATION_TESTS.md            # Every integration test documented
+  docs/USER_GUIDE.md                    # Full CLI and API user guide
   docs/RUNTIME_COMPARISON.md            # vs Docker/runc/Podman
   docs/SECCOMP_DEEP_DIVE.md            # Seccomp implementation details
   docs/CGROUPS.md                       # Cgroups v1 vs v2 analysis
@@ -324,6 +335,9 @@ The spawn process has a carefully orchestrated setup:
 - ✅ N4 Port mapping — `with_port_forward(host_port, container_port)`
 - ✅ N5 DNS — `with_dns(&[...])`
 
+**Rootless Mode - Phase 2 (Pasta): COMPLETE ✅**
+- ✅ N6 Pasta — `with_network(NetworkMode::Pasta)` — rootless-compatible full internet via `pasta`
+
 See docs/ROADMAP.md for full plan (no time estimates!)
 
 ## Common Issues
@@ -350,7 +364,8 @@ Many features require root or CAP_SYS_ADMIN
 | tmpfs mounts | ✅ | ✅ |
 | Named volumes | ✅ | ✅ |
 | Overlay filesystem | ✅ CoW layered rootfs | ✅ |
-| Networking | 🔄 N1–N5 (Loopback/Bridge/NAT/Ports/DNS) | ✅ Native libnetwork |
+| Networking | ✅ N1–N5 + pasta (Loopback/Bridge/NAT/Ports/DNS/Pasta) | ✅ Native libnetwork |
+| Rootless networking | ✅ pasta (full internet, no root) | ✅ |
 | OCI Compatible | 🔄 Partial | ✅ |
 
-**Current parity: ~73% of runc features**
+**Current parity: ~90% of runc features**
