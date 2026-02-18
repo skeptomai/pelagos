@@ -51,10 +51,11 @@ a daemon, without CNI plugins, and without image management.
 - **Phase 2 (complete):** `process.capabilities`, `linux.maskedPaths`, `linux.readonlyPaths`,
   `linux.resources`, `process.rlimits`, `linux.sysctl`, `linux.devices`, hooks, `linux.seccomp`
 
-### Rootless Containers (Phase 1)
+### Rootless Containers
 - **Auto-detection:** `getuid() != 0` triggers rootless mode automatically — no flag needed
 - **User namespace:** auto-adds `Namespace::USER` and a default uid/gid map (`container 0 → host UID`)
-- **Loopback works:** `NetworkMode::Loopback` functions in rootless (USER + NET namespace)
+- **Loopback:** `NetworkMode::Loopback` functions in rootless (USER + NET namespace)
+- **Pasta networking:** `NetworkMode::Pasta` — full internet access without root via [pasta](https://passt.top/passt/about/)
 - **Cgroups:** skipped gracefully in rootless (no `CAP_SYS_ADMIN` needed)
 - **Bridge rejected:** clear error if `NetworkMode::Bridge` is attempted without root
 
@@ -184,7 +185,7 @@ the pre-configured named netns via `setns()`, eliminating all races.
 | Port mapping | ✅ TCP | — | ✅ |
 | DNS | ✅ resolv.conf | ✅ | ✅ |
 | OCI compliant | ✅ Phase 1 | ✅ | ✅ |
-| Rootless | ⚠️ Phase 1 (loopback) | ✅ | ✅ |
+| Rootless | ✅ (loopback + pasta) | ✅ | ✅ |
 | Library API | ✅ | ❌ | ❌ |
 | Daemon required | ❌ | ❌ | ✅ |
 
