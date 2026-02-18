@@ -5,6 +5,7 @@
 # Disadvantage: Need to specify Alpine version
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 echo "========================================"
 echo "  Alpine Rootfs Builder (Tarball)"

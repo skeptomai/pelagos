@@ -1,4 +1,6 @@
 #!/bin/sh
+cd "$(dirname "$0")/.." || exit 1
+
 CON=con
 IP=172.16.0.1
 

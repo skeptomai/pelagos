@@ -2,6 +2,7 @@
 # Test namespace joining with setns()
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 echo "==> Testing namespace joining with setns()"
 echo ""

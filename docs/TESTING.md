@@ -171,7 +171,7 @@ sudo -E cargo test --test integration_tests networking:: linking::
 
 ## Prerequisites
 
-- **Alpine rootfs**: Run `./build-rootfs-docker.sh` or `./build-rootfs-tarball.sh`
+- **Alpine rootfs**: Run `scripts/build-rootfs-docker.sh` or `scripts/build-rootfs-tarball.sh`
   to create `alpine-rootfs/` in the project root
 - **Root privileges**: Most categories require `sudo -E` (the `-E` preserves
   environment variables like `PATH` and `CARGO_TARGET_DIR`)

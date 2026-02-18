@@ -5,6 +5,7 @@
 # Disadvantage: Requires Docker daemon running
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 echo "========================================"
 echo "  Alpine Rootfs Builder (Docker)"

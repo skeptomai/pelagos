@@ -1,5 +1,6 @@
 #!/bin/bash
 # Force unmount all proc instances
+cd "$(dirname "$0")/.." || exit 1
 
 echo "==> Force unmounting all proc mounts..."
 while mount | grep -q "alpine-rootfs/proc"; do

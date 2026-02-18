@@ -9,6 +9,7 @@
 #   sudo -E ./run-integration-tests.sh <name>    # Run specific test
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then

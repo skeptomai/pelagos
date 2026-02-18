@@ -5,6 +5,7 @@
 # Usage: sudo -E ./install-httpd.sh
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 echo "=== Installing busybox-extras via remora ==="
 echo ""

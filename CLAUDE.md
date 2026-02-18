@@ -214,12 +214,12 @@ Remora requires an Alpine Linux rootfs to run containers.
 
 1. **With Docker** (recommended):
    ```bash
-   ./build-rootfs-docker.sh
+   scripts/build-rootfs-docker.sh
    ```
 
 2. **Without Docker** (tarball):
    ```bash
-   ./build-rootfs-tarball.sh
+   scripts/build-rootfs-tarball.sh
    ```
 
 See `BUILD_ROOTFS.md` for detailed instructions.
@@ -368,7 +368,7 @@ See docs/ROADMAP.md for full plan (no time estimates!)
 ## Common Issues
 
 ### "alpine-rootfs not found"
-Run: `./fix-rootfs.sh` (requires Docker + sudo)
+Run: `scripts/fix-rootfs.sh` (requires Docker + sudo)
 
 ### Integration tests fail
 User must run with: `sudo -E cargo test --test integration_tests`

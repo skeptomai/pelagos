@@ -2,6 +2,7 @@
 # Launch remora container with proper environment setup
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 echo "==> Preparing container environment..."
 

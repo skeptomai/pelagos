@@ -1,5 +1,6 @@
 #!/bin/bash
 # Cleanup any leftover mounts in the rootfs
+cd "$(dirname "$0")/.." || exit 1
 
 echo "==> Checking for leftover mounts in alpine-rootfs..."
 mount | grep alpine-rootfs

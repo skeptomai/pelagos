@@ -2,6 +2,7 @@
 # Test that the mount propagation fix works
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 echo "==> Testing mount propagation fix"
 echo ""

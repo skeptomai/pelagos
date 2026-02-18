@@ -2,6 +2,7 @@
 # Fix Alpine rootfs - replace ARM version with x86_64 version
 
 set -e
+cd "$(dirname "$0")/.." || exit 1
 
 echo "==> Unmounting any mounted filesystems in old rootfs..."
 sudo umount alpine-rootfs/sys 2>/dev/null || true

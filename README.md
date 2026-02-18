@@ -116,10 +116,10 @@ Remora requires a rootfs directory. The test suite uses Alpine Linux.
 
 ```bash
 # With Docker (recommended):
-./build-rootfs-docker.sh
+scripts/build-rootfs-docker.sh
 
 # Without Docker:
-./build-rootfs-tarball.sh
+scripts/build-rootfs-tarball.sh
 ```
 
 See `docs/BUILD_ROOTFS.md` for details.

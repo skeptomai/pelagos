@@ -4,7 +4,7 @@ Remora requires an Alpine Linux root filesystem to run containers. You have two 
 
 ## Option 1: Using Docker (Recommended)
 
-**Script:** `./build-rootfs-docker.sh`
+**Script:** `scripts/build-rootfs-docker.sh`
 
 **Requires:**
 - Docker installed and running
@@ -17,7 +17,7 @@ Remora requires an Alpine Linux root filesystem to run containers. You have two 
 
 **Usage:**
 ```bash
-./build-rootfs-docker.sh
+scripts/build-rootfs-docker.sh
 ```
 
 **What it does:**
@@ -28,7 +28,7 @@ Remora requires an Alpine Linux root filesystem to run containers. You have two 
 
 ## Option 2: Download Tarball (No Docker)
 
-**Script:** `./build-rootfs-tarball.sh`
+**Script:** `scripts/build-rootfs-tarball.sh`
 
 **Requires:**
 - curl or wget
@@ -42,7 +42,7 @@ Remora requires an Alpine Linux root filesystem to run containers. You have two 
 
 **Usage:**
 ```bash
-./build-rootfs-tarball.sh
+scripts/build-rootfs-tarball.sh
 ```
 
 **What it does:**
@@ -103,7 +103,7 @@ sudo systemctl start docker  # systemd
 sudo service docker start    # sysvinit
 ```
 
-Or use the tarball script instead: `./build-rootfs-tarball.sh`
+Or use the tarball script instead: `scripts/build-rootfs-tarball.sh`
 
 ### Tarball script fails: "Unsupported architecture"
 The tarball script only supports x86_64 and aarch64. Use the Docker script instead.
