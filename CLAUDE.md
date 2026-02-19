@@ -45,6 +45,19 @@ This is a hard requirement, not optional cleanup.
 
 `eprintln!` is reserved for **user-facing error messages** in the CLI binary (e.g. `eprintln!("remora: error: {}", e)`). Everything else goes through `log::*` so it respects `RUST_LOG` filtering and doesn't pollute stderr when users don't want it.
 
+### User Macros
+
+**"Make it so!"** — Clean up, comment, commit, and push:
+1. Remove any temporary debug code or dead comments
+2. Ensure `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test --lib` pass
+3. Commit with a descriptive message
+4. Push to remote
+
+**"Engage!"** — Tag, release, and monitor:
+1. Create a git tag (ask user for version if unclear)
+2. Push the tag to trigger GitHub Actions release workflow
+3. Monitor the release with a background agent and report result
+
 ### Ask Before Major Decisions
 - API design choices
 - Adding new features not explicitly requested
