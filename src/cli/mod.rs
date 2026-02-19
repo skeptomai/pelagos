@@ -19,7 +19,7 @@ pub mod volume;
 // ---------------------------------------------------------------------------
 
 pub fn containers_dir() -> PathBuf {
-    PathBuf::from("/run/remora/containers")
+    remora::paths::containers_dir()
 }
 
 pub fn container_dir(name: &str) -> PathBuf {
@@ -31,7 +31,7 @@ pub fn state_path(name: &str) -> PathBuf {
 }
 
 pub fn rootfs_store() -> PathBuf {
-    PathBuf::from("/var/lib/remora/rootfs")
+    remora::paths::rootfs_store_dir()
 }
 
 /// Resolve a named rootfs to its absolute path.
@@ -182,16 +182,17 @@ pub fn check_liveness(pid: i32) -> bool {
 // Auto-name generation
 // ---------------------------------------------------------------------------
 
-const COUNTER_FILE: &str = "/var/lib/remora/container_counter";
-
 pub fn generate_name() -> std::io::Result<String> {
-    std::fs::create_dir_all("/var/lib/remora")?;
-    let n: u64 = std::fs::read_to_string(COUNTER_FILE)
+    let counter = remora::paths::counter_file();
+    if let Some(parent) = counter.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let n: u64 = std::fs::read_to_string(&counter)
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
     let next = n + 1;
-    std::fs::write(COUNTER_FILE, next.to_string())?;
+    std::fs::write(&counter, next.to_string())?;
     Ok(format!("remora-{}", next))
 }
 

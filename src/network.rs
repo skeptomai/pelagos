@@ -34,15 +34,8 @@ pub const BRIDGE_NAME: &str = "remora0";
 pub const BRIDGE_GW: &str = "172.19.0.1";
 /// CIDR for the bridge subnet.
 const BRIDGE_CIDR: &str = "172.19.0.1/24";
-/// Directory for Remora runtime state (IPAM file, etc.).
-const REMORA_RUN_DIR: &str = "/run/remora";
-/// Tracks the next IP to allocate; protected by flock.
-const IPAM_FILE: &str = "/run/remora/next_ip";
-/// Reference count for active NAT containers; protected by flock.
-const NAT_REFCOUNT_FILE: &str = "/run/remora/nat_refcount";
-/// Active port-forward entries; protected by flock. One line per entry:
-/// `{container_ip}:{host_port}:{container_port}`
-const PORT_FORWARDS_FILE: &str = "/run/remora/port_forwards";
+// Network state files are resolved via crate::paths (rootless-aware).
+// Legacy constants removed — use crate::paths::{runtime_dir,ipam_file,...}().
 
 /// Monotonically increasing counter for generating unique netns/veth names.
 static NS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -191,14 +184,14 @@ fn ensure_bridge() -> io::Result<()> {
 /// Uses `flock(LOCK_EX)` on `/run/remora/next_ip` to serialize concurrent
 /// spawns. Wraps at 254 (skipping 0=network, 1=gateway, 255=broadcast).
 fn allocate_ip() -> io::Result<Ipv4Addr> {
-    std::fs::create_dir_all(REMORA_RUN_DIR)?;
+    std::fs::create_dir_all(crate::paths::runtime_dir())?;
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(IPAM_FILE)?;
+        .open(crate::paths::ipam_file())?;
 
     // Exclusive lock — blocks until other spawns release their lock.
     unsafe {
@@ -396,18 +389,18 @@ fn run_nft(script: &str) -> io::Result<()> {
 
 /// Increment the NAT refcount; install nftables rules when going 0 → 1.
 ///
-/// Uses `flock(LOCK_EX)` on [`NAT_REFCOUNT_FILE`] to serialise concurrent
+/// Uses `flock(LOCK_EX)` on [`crate::paths::nat_refcount_file()`] to serialise concurrent
 /// spawns. IP forwarding is written to `/proc/sys/net/ipv4/ip_forward`
 /// once (never disabled on teardown — other software may rely on it).
 fn enable_nat() -> io::Result<()> {
-    std::fs::create_dir_all(REMORA_RUN_DIR)?;
+    std::fs::create_dir_all(crate::paths::runtime_dir())?;
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(NAT_REFCOUNT_FILE)?;
+        .open(crate::paths::nat_refcount_file())?;
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
@@ -456,7 +449,7 @@ fn disable_nat() {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(NAT_REFCOUNT_FILE);
+        .open(crate::paths::nat_refcount_file());
 
     let mut file = match file {
         Ok(f) => f,
@@ -522,7 +515,7 @@ fn disable_nat() {
 
 // ── N4: Port mapping (DNAT) ───────────────────────────────────────────────────
 
-/// Parse one line from [`PORT_FORWARDS_FILE`]: `{ip}:{host_port}:{container_port}`.
+/// Parse one line from [`crate::paths::port_forwards_file()`]: `{ip}:{host_port}:{container_port}`.
 fn parse_port_forward_line(line: &str) -> Option<(Ipv4Addr, u16, u16)> {
     let mut parts = line.splitn(3, ':');
     let ip: Ipv4Addr = parts.next()?.parse().ok()?;
@@ -546,7 +539,7 @@ fn read_port_forwards_locked(file: &mut std::fs::File) -> io::Result<Vec<(Ipv4Ad
 
 /// Count active port-forward entries (reads without locking — for teardown checks only).
 fn read_port_forwards_count() -> usize {
-    let content = match std::fs::read_to_string(PORT_FORWARDS_FILE) {
+    let content = match std::fs::read_to_string(crate::paths::port_forwards_file()) {
         Ok(c) => c,
         Err(_) => return 0,
     };
@@ -555,7 +548,7 @@ fn read_port_forwards_count() -> usize {
 
 /// Read the NAT refcount without locking (for teardown checks only).
 fn read_nat_refcount() -> u32 {
-    let content = match std::fs::read_to_string(NAT_REFCOUNT_FILE) {
+    let content = match std::fs::read_to_string(crate::paths::nat_refcount_file()) {
         Ok(c) => c,
         Err(_) => return 0,
     };
@@ -585,18 +578,18 @@ fn build_prerouting_script(entries: &[(Ipv4Addr, u16, u16)]) -> String {
 
 /// Add port-forward entries to the state file and install nftables DNAT rules.
 ///
-/// Uses `flock(LOCK_EX)` on [`PORT_FORWARDS_FILE`] to serialise concurrent
+/// Uses `flock(LOCK_EX)` on [`crate::paths::port_forwards_file()`] to serialise concurrent
 /// spawns. The `remora0` table / prerouting chain are created idempotently,
 /// so this is safe whether NAT is enabled or not.
 fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::Result<()> {
-    std::fs::create_dir_all(REMORA_RUN_DIR)?;
+    std::fs::create_dir_all(crate::paths::runtime_dir())?;
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(PORT_FORWARDS_FILE)?;
+        .open(crate::paths::port_forwards_file())?;
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
@@ -634,7 +627,7 @@ fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(PORT_FORWARDS_FILE);
+        .open(crate::paths::port_forwards_file());
 
     let mut file = match file {
         Ok(f) => f,

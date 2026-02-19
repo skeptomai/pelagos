@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
+#[clap(trailing_var_arg = true)]
 pub struct RunArgs {
     /// Container name (auto-generated if omitted: remora-1, remora-2, …)
     #[clap(long)]
@@ -130,7 +131,7 @@ pub struct RunArgs {
     pub rootfs: Option<String>,
 
     /// Image reference (or command when using --rootfs): IMAGE [COMMAND [ARGS...]]
-    #[clap(multiple_values = true, allow_hyphen_values = true)]
+    #[clap(multiple_values = true)]
     pub args: Vec<String>,
 }
 

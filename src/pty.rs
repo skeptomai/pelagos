@@ -153,8 +153,8 @@ fn relay_loop(master_fd: RawFd) -> io::Result<()> {
                     break;
                 }
             }
-            // POLLHUP: slave side closed — container exited
-            if revents.contains(PollFlags::POLLHUP) {
+            // POLLHUP/POLLERR: slave side closed — container exited
+            if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
                 break;
             }
         }

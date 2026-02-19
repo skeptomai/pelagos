@@ -268,7 +268,7 @@ pub struct OciState {
 // ---------------------------------------------------------------------------
 
 pub fn state_dir(id: &str) -> PathBuf {
-    PathBuf::from(format!("/run/remora/{}", id))
+    crate::paths::oci_state_dir(id)
 }
 
 pub fn state_path(id: &str) -> PathBuf {

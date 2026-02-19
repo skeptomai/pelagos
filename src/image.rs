@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const IMAGES_DIR: &str = "/var/lib/remora/images";
-pub const LAYERS_DIR: &str = "/var/lib/remora/layers";
+// Legacy constants kept as documentation — all code now uses crate::paths::*.
+// pub const IMAGES_DIR: &str = "/var/lib/remora/images";
+// pub const LAYERS_DIR: &str = "/var/lib/remora/layers";
 
 /// Image configuration extracted from the OCI config JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,14 +50,14 @@ pub fn reference_to_dirname(reference: &str) -> String {
 
 /// Return the image metadata directory for the given reference.
 pub fn image_dir(reference: &str) -> PathBuf {
-    PathBuf::from(IMAGES_DIR).join(reference_to_dirname(reference))
+    crate::paths::images_dir().join(reference_to_dirname(reference))
 }
 
 /// Return the extracted layer directory for the given digest.
 /// Strips the `sha256:` prefix if present.
 pub fn layer_dir(digest: &str) -> PathBuf {
     let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
-    PathBuf::from(LAYERS_DIR).join(hex)
+    crate::paths::layers_dir().join(hex)
 }
 
 /// Check whether a layer has already been extracted.
@@ -72,6 +73,7 @@ pub fn layer_exists(digest: &str) -> bool {
 ///
 /// Returns the path to the extracted layer directory.
 pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
+    let rootless = crate::paths::is_rootless();
     let dest = layer_dir(digest);
     if dest.is_dir() {
         return Ok(dest);
@@ -103,17 +105,23 @@ pub fn extract_layer(digest: &str, tar_gz_path: &Path) -> io::Result<PathBuf> {
             // Opaque whiteout: mark parent as opaque for overlayfs.
             let parent = partial.join(raw_path.parent().unwrap_or(Path::new("")));
             std::fs::create_dir_all(&parent)?;
-            // Best-effort xattr; requires appropriate privileges.
-            let _ = set_opaque_xattr(&parent);
+            if rootless {
+                let _ = set_opaque_xattr_userxattr(&parent);
+            } else {
+                let _ = set_opaque_xattr(&parent);
+            }
             continue;
         }
 
         if let Some(target_name) = file_name.strip_prefix(".wh.") {
-            // Regular whiteout: create a char device (0,0) for overlayfs.
             let parent = partial.join(raw_path.parent().unwrap_or(Path::new("")));
             std::fs::create_dir_all(&parent)?;
             let whiteout_path = parent.join(target_name);
-            create_whiteout_device(&whiteout_path)?;
+            if rootless {
+                create_whiteout_userxattr(&whiteout_path)?;
+            } else {
+                create_whiteout_device(&whiteout_path)?;
+            }
             continue;
         }
 
@@ -167,6 +175,62 @@ fn set_opaque_xattr(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Rootless whiteout: create a zero-length file with `user.overlay.whiteout` xattr.
+///
+/// Used instead of `mknod(S_IFCHR, 0,0)` which requires `CAP_MKNOD`.
+/// The kernel's overlayfs `userxattr` mount option reads these xattrs.
+fn create_whiteout_userxattr(path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Create zero-length file.
+    std::fs::File::create(path)?;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("invalid path for whiteout xattr"))?;
+    let name = b"user.overlay.whiteout\0";
+    let value = b"y";
+    let ret = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            name.as_ptr() as *const libc::c_char,
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Rootless opaque xattr: set `user.overlay.opaque` on a directory.
+///
+/// Counterpart of `set_opaque_xattr()` for the `userxattr` overlay mount option.
+fn set_opaque_xattr_userxattr(dir: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("invalid path for xattr"))?;
+    let name = b"user.overlay.opaque\0";
+    let value = b"y";
+    let ret = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            name.as_ptr() as *const libc::c_char,
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Persist an image manifest to disk.
 pub fn save_image(manifest: &ImageManifest) -> io::Result<()> {
     let dir = image_dir(&manifest.reference);
@@ -185,7 +249,7 @@ pub fn load_image(reference: &str) -> io::Result<ImageManifest> {
 
 /// List all stored images.
 pub fn list_images() -> Vec<ImageManifest> {
-    let dir = PathBuf::from(IMAGES_DIR);
+    let dir = crate::paths::images_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -236,13 +300,13 @@ mod tests {
     #[test]
     fn test_layer_dir_strips_prefix() {
         let d = layer_dir("sha256:abc123def456");
-        assert_eq!(d, PathBuf::from("/var/lib/remora/layers/abc123def456"));
+        assert_eq!(d, crate::paths::layers_dir().join("abc123def456"));
     }
 
     #[test]
     fn test_layer_dir_no_prefix() {
         let d = layer_dir("abc123def456");
-        assert_eq!(d, PathBuf::from("/var/lib/remora/layers/abc123def456"));
+        assert_eq!(d, crate::paths::layers_dir().join("abc123def456"));
     }
 
     #[test]
@@ -284,7 +348,7 @@ mod tests {
         };
         let dirs = layer_dirs(&manifest);
         // Top-first for overlayfs lowerdir
-        assert_eq!(dirs[0], PathBuf::from("/var/lib/remora/layers/top"));
-        assert_eq!(dirs[1], PathBuf::from("/var/lib/remora/layers/bottom"));
+        assert_eq!(dirs[0], crate::paths::layers_dir().join("top"));
+        assert_eq!(dirs[1], crate::paths::layers_dir().join("bottom"));
     }
 }

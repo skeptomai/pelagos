@@ -122,6 +122,121 @@ static HOSTS_COUNTER: AtomicU32 = AtomicU32::new(0);
 // Re-export SeccompProfile for public API
 pub use crate::seccomp::SeccompProfile;
 
+// ── Rootless overlay helpers ────────────────────────────────────────────────
+
+/// Probe whether native overlayfs with `userxattr` is supported (kernel 5.11+).
+///
+/// Forks a child that enters a new user + mount namespace, attempts a tiny
+/// overlay mount with `,userxattr`, and exits 0 on success. The parent reads
+/// the exit code. Result is cached in a `OnceLock` so the probe runs at most
+/// once per process.
+fn native_rootless_overlay_supported() -> bool {
+    use std::sync::OnceLock;
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        let Ok(tmp) = tempfile::TempDir::new() else {
+            return false;
+        };
+        let base = tmp.path();
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        let work = base.join("work");
+        let merged = base.join("merged");
+        for d in [&lower, &upper, &work, &merged] {
+            if std::fs::create_dir(d).is_err() {
+                return false;
+            }
+        }
+
+        // Fork a child that unshares user+mount namespaces and tries the mount.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return false;
+        }
+        if pid == 0 {
+            // Child: unshare user + mount namespaces, try overlay mount.
+            let ret = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
+            if ret != 0 {
+                unsafe { libc::_exit(1) };
+            }
+            // Write uid/gid mappings — mount() requires them after unshare(NEWUSER).
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
+            let _ = std::fs::write("/proc/self/setgroups", "deny\n");
+            let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid));
+            let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid));
+            let opts = format!(
+                "lowerdir={},upperdir={},workdir={},userxattr",
+                lower.display(),
+                upper.display(),
+                work.display()
+            );
+            let opts_c = match std::ffi::CString::new(opts) {
+                Ok(c) => c,
+                Err(_) => unsafe { libc::_exit(1) },
+            };
+            let merged_c = match std::ffi::CString::new(merged.as_os_str().as_encoded_bytes()) {
+                Ok(c) => c,
+                Err(_) => unsafe { libc::_exit(1) },
+            };
+            let ov_type = c"overlay";
+            let ret = unsafe {
+                libc::mount(
+                    ov_type.as_ptr(),
+                    merged_c.as_ptr(),
+                    ov_type.as_ptr(),
+                    0,
+                    opts_c.as_ptr() as *const libc::c_void,
+                )
+            };
+            unsafe { libc::_exit(if ret == 0 { 0 } else { 1 }) };
+        }
+        // Parent: wait for child and check exit code.
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if ret < 0 {
+            return false;
+        }
+        // WIFEXITED && WEXITSTATUS == 0
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    })
+}
+
+/// Check whether `fuse-overlayfs` is available on PATH.
+fn is_fuse_overlayfs_available() -> bool {
+    std::process::Command::new("fuse-overlayfs")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Spawn a `fuse-overlayfs` subprocess to mount an overlay filesystem.
+///
+/// Returns the child process handle. The caller must unmount (via `fusermount3 -u`)
+/// and reap this child after the container exits.
+fn spawn_fuse_overlayfs(
+    lower: &str,
+    upper: &std::path::Path,
+    work: &std::path::Path,
+    merged: &std::path::Path,
+) -> io::Result<std::process::Child> {
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower,
+        upper.display(),
+        work.display()
+    );
+    std::process::Command::new("fuse-overlayfs")
+        .args(["-o", &opts])
+        .arg(merged)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+}
+
 /// Resolve a container's bridge IP by name.
 ///
 /// Searches CLI state (`/run/remora/containers/{name}/state.json`) and OCI state
@@ -129,7 +244,7 @@ pub use crate::seccomp::SeccompProfile;
 /// is running and has bridge networking, or an error otherwise.
 pub fn resolve_container_ip(name: &str) -> io::Result<String> {
     // Try CLI state first.
-    let cli_path = PathBuf::from(format!("/run/remora/containers/{}/state.json", name));
+    let cli_path = crate::paths::containers_dir().join(name).join("state.json");
     if let Ok(data) = std::fs::read_to_string(&cli_path) {
         // Parse just the fields we need with serde_json::Value to avoid
         // coupling to the CLI crate's ContainerState type.
@@ -156,7 +271,7 @@ pub fn resolve_container_ip(name: &str) -> io::Result<String> {
     }
 
     // Try OCI state.
-    let oci_path = PathBuf::from(format!("/run/remora/{}/state.json", name));
+    let oci_path = crate::paths::oci_state_dir(name).join("state.json");
     if let Ok(data) = std::fs::read_to_string(&oci_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
             if let Some(ip) = v.get("bridge_ip").and_then(|v| v.as_str()) {
@@ -384,7 +499,7 @@ pub struct Volume {
 
 impl Volume {
     fn volumes_dir() -> PathBuf {
-        PathBuf::from("/var/lib/remora/volumes")
+        crate::paths::volumes_dir()
     }
 
     /// Create a new named volume, creating the backing directory if needed.
@@ -1557,7 +1672,7 @@ impl Command {
         let overlay_merged_dir: Option<PathBuf> = if let Some(ref mut ov) = self.overlay {
             let pid = unsafe { libc::getpid() };
             let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = PathBuf::from(format!("/run/remora/overlay-{}-{}", pid, n));
+            let base = crate::paths::overlay_base(pid, n);
             let merged = base.join("merged");
             std::fs::create_dir_all(&merged).map_err(Error::Io)?;
             // Auto-create ephemeral upper/work for image-layer mode.
@@ -1608,6 +1723,48 @@ impl Command {
             _ => None,
         };
 
+        // Rootless overlay: decide between native overlay+userxattr vs fuse-overlayfs.
+        let mut fuse_overlay_child: Option<std::process::Child> = None;
+        let mut fuse_overlay_merged: Option<PathBuf> = None;
+        let use_fuse_overlay: bool;
+        if is_rootless && self.overlay.is_some() {
+            if native_rootless_overlay_supported() {
+                use_fuse_overlay = false;
+            } else if is_fuse_overlayfs_available() {
+                // Spawn fuse-overlayfs before fork.
+                if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
+                    let lower_str = if !ov.lower_dirs.is_empty() {
+                        ov.lower_dirs
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(":")
+                    } else {
+                        self.chroot_dir
+                            .as_ref()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    let child =
+                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged)
+                            .map_err(Error::Io)?;
+                    fuse_overlay_merged = Some(merged.clone());
+                    fuse_overlay_child = Some(child);
+                    // Give fuse-overlayfs a moment to mount.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                use_fuse_overlay = true;
+            } else {
+                return Err(Error::Io(io::Error::other(
+                    "rootless overlay requires kernel 5.11+ or fuse-overlayfs; \
+                     install fuse-overlayfs or run as root",
+                )));
+            }
+        } else {
+            use_fuse_overlay = false;
+        }
+
         // Collect OCI sync fds (captured by value — i32 is Copy).
         let oci_sync = self.oci_sync;
         let container_cwd = self.container_cwd.clone();
@@ -1627,7 +1784,7 @@ impl Command {
         let dns_temp_dir: Option<PathBuf> = if !self.dns_servers.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = DNS_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = PathBuf::from(format!("/run/remora/dns-{}-{}", pid, n));
+            let dir = crate::paths::dns_dir(pid, n);
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::new();
             for s in &self.dns_servers {
@@ -1662,7 +1819,7 @@ impl Command {
         let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = PathBuf::from(format!("/run/remora/hosts-{}-{}", pid, n));
+            let dir = crate::paths::hosts_dir(pid, n);
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::from("127.0.0.1\tlocalhost\n");
             for (container_name, alias) in &self.links {
@@ -1952,25 +2109,33 @@ impl Command {
                 // The merged dir becomes the effective root for chroot and bind mounts.
                 let overlay_merged: Option<&std::ffi::CString> =
                     if let Some((lower, upper, work, merged)) = &overlay_cstrings {
-                        let opts = std::ffi::CString::new(format!(
-                            "lowerdir={},upperdir={},workdir={}",
-                            lower.to_string_lossy(),
-                            upper.to_string_lossy(),
-                            work.to_string_lossy()
-                        ))
-                        .unwrap();
-                        let ov_type = c"overlay";
-                        let ret = libc::mount(
-                            ov_type.as_ptr(),
-                            merged.as_ptr(),
-                            ov_type.as_ptr(),
-                            0,
-                            opts.as_ptr() as *const libc::c_void,
-                        );
-                        if ret != 0 {
-                            return Err(io::Error::last_os_error());
+                        if use_fuse_overlay {
+                            // fuse-overlayfs already mounted by parent — skip kernel mount.
+                            Some(merged)
+                        } else {
+                            let mut opts_str = format!(
+                                "lowerdir={},upperdir={},workdir={}",
+                                lower.to_string_lossy(),
+                                upper.to_string_lossy(),
+                                work.to_string_lossy()
+                            );
+                            if is_rootless {
+                                opts_str.push_str(",userxattr");
+                            }
+                            let opts = std::ffi::CString::new(opts_str).unwrap();
+                            let ov_type = c"overlay";
+                            let ret = libc::mount(
+                                ov_type.as_ptr(),
+                                merged.as_ptr(),
+                                ov_type.as_ptr(),
+                                0,
+                                opts.as_ptr() as *const libc::c_void,
+                            );
+                            if ret != 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            Some(merged)
                         }
-                        Some(merged)
                     } else {
                         None
                     };
@@ -2498,6 +2663,8 @@ impl Command {
             overlay_merged_dir,
             dns_temp_dir,
             hosts_temp_dir,
+            fuse_overlay_child,
+            fuse_overlay_merged,
         })
     }
 
@@ -2679,7 +2846,7 @@ impl Command {
         let overlay_merged_dir: Option<PathBuf> = if let Some(ref mut ov) = self.overlay {
             let pid = unsafe { libc::getpid() };
             let n = OVERLAY_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = PathBuf::from(format!("/run/remora/overlay-{}-{}", pid, n));
+            let base = crate::paths::overlay_base(pid, n);
             let merged = base.join("merged");
             std::fs::create_dir_all(&merged).map_err(Error::Io)?;
             if ov.upper_dir.as_os_str().is_empty() {
@@ -2727,6 +2894,58 @@ impl Command {
             _ => None,
         };
 
+        // Rootless overlay: decide between native overlay+userxattr vs fuse-overlayfs.
+        // Temporarily set the PTY slave to CLOEXEC so the overlay probe fork and
+        // any fuse-overlayfs daemon don't inherit it (which would prevent POLLHUP
+        // on the master when the container exits).
+        let mut fuse_overlay_child: Option<std::process::Child> = None;
+        let mut fuse_overlay_merged: Option<PathBuf> = None;
+        let use_fuse_overlay: bool;
+        if is_rootless && self.overlay.is_some() {
+            unsafe {
+                let flags = libc::fcntl(slave_raw_fd, libc::F_GETFD);
+                libc::fcntl(slave_raw_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+            if native_rootless_overlay_supported() {
+                use_fuse_overlay = false;
+            } else if is_fuse_overlayfs_available() {
+                if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
+                    let lower_str = if !ov.lower_dirs.is_empty() {
+                        ov.lower_dirs
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(":")
+                    } else {
+                        self.chroot_dir
+                            .as_ref()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    let child =
+                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged)
+                            .map_err(Error::Io)?;
+                    fuse_overlay_merged = Some(merged.clone());
+                    fuse_overlay_child = Some(child);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                use_fuse_overlay = true;
+            } else {
+                return Err(Error::Io(io::Error::other(
+                    "rootless overlay requires kernel 5.11+ or fuse-overlayfs; \
+                     install fuse-overlayfs or run as root",
+                )));
+            }
+            // Restore slave to non-CLOEXEC so the container child inherits it.
+            unsafe {
+                let flags = libc::fcntl(slave_raw_fd, libc::F_GETFD);
+                libc::fcntl(slave_raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+        } else {
+            use_fuse_overlay = false;
+        }
+
         // Collect OCI sync fds.
         let oci_sync = self.oci_sync;
         let container_cwd = self.container_cwd.clone();
@@ -2745,7 +2964,7 @@ impl Command {
         let dns_temp_dir: Option<PathBuf> = if !self.dns_servers.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = DNS_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = PathBuf::from(format!("/run/remora/dns-{}-{}", pid, n));
+            let dir = crate::paths::dns_dir(pid, n);
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::new();
             for s in &self.dns_servers {
@@ -2779,7 +2998,7 @@ impl Command {
         let hosts_temp_dir: Option<PathBuf> = if !self.links.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = HOSTS_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = PathBuf::from(format!("/run/remora/hosts-{}-{}", pid, n));
+            let dir = crate::paths::hosts_dir(pid, n);
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::from("127.0.0.1\tlocalhost\n");
             for (container_name, alias) in &self.links {
@@ -3039,25 +3258,33 @@ impl Command {
                 // Step 3.5: Mount overlayfs (if configured).
                 let overlay_merged: Option<&std::ffi::CString> =
                     if let Some((lower, upper, work, merged)) = &overlay_cstrings {
-                        let opts = std::ffi::CString::new(format!(
-                            "lowerdir={},upperdir={},workdir={}",
-                            lower.to_string_lossy(),
-                            upper.to_string_lossy(),
-                            work.to_string_lossy()
-                        ))
-                        .unwrap();
-                        let ov_type = c"overlay";
-                        let ret = libc::mount(
-                            ov_type.as_ptr(),
-                            merged.as_ptr(),
-                            ov_type.as_ptr(),
-                            0,
-                            opts.as_ptr() as *const libc::c_void,
-                        );
-                        if ret != 0 {
-                            return Err(io::Error::last_os_error());
+                        if use_fuse_overlay {
+                            // fuse-overlayfs already mounted by parent — skip kernel mount.
+                            Some(merged)
+                        } else {
+                            let mut opts_str = format!(
+                                "lowerdir={},upperdir={},workdir={}",
+                                lower.to_string_lossy(),
+                                upper.to_string_lossy(),
+                                work.to_string_lossy()
+                            );
+                            if is_rootless {
+                                opts_str.push_str(",userxattr");
+                            }
+                            let opts = std::ffi::CString::new(opts_str).unwrap();
+                            let ov_type = c"overlay";
+                            let ret = libc::mount(
+                                ov_type.as_ptr(),
+                                merged.as_ptr(),
+                                ov_type.as_ptr(),
+                                0,
+                                opts.as_ptr() as *const libc::c_void,
+                            );
+                            if ret != 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            Some(merged)
                         }
-                        Some(merged)
                     } else {
                         None
                     };
@@ -3503,6 +3730,8 @@ impl Command {
                 overlay_merged_dir,
                 dns_temp_dir,
                 hosts_temp_dir,
+                fuse_overlay_child,
+                fuse_overlay_merged,
             },
         })
     }
@@ -3541,8 +3770,13 @@ pub struct Child {
     overlay_merged_dir: Option<PathBuf>,
     /// Per-container DNS temp dir (`/run/remora/dns-{pid}-{n}/`); removed after child exits.
     dns_temp_dir: Option<PathBuf>,
-    /// Per-container hosts temp dir (`/run/remora/hosts-{pid}-{n}/`); removed after child exits.
+    /// Per-container hosts temp dir; removed after child exits.
     hosts_temp_dir: Option<PathBuf>,
+    /// fuse-overlayfs subprocess (rootless fallback). Unmounted + reaped after child exits.
+    fuse_overlay_child: Option<std::process::Child>,
+    /// Merged dir path for fuse-overlayfs unmount (needed because overlay_merged_dir is the
+    /// parent's "merged" subdir, and we need the exact path for fusermount3).
+    fuse_overlay_merged: Option<PathBuf>,
 }
 
 impl Child {
@@ -3606,6 +3840,37 @@ impl Child {
         if let Some(ref mut p) = self.pasta {
             crate::network::teardown_pasta_network(p);
         }
+        // Unmount fuse-overlayfs before removing the overlay base dir.
+        if let Some(ref fuse_merged) = self.fuse_overlay_merged {
+            let merged_str = fuse_merged.to_string_lossy();
+            let unmounted = std::process::Command::new("fusermount3")
+                .args(["-u", &merged_str])
+                .status()
+                .is_ok_and(|s| s.success())
+                || std::process::Command::new("fusermount")
+                    .args(["-u", &merged_str])
+                    .status()
+                    .is_ok_and(|s| s.success());
+            if !unmounted {
+                log::warn!(
+                    "failed to unmount fuse-overlayfs at {}; is fusermount3 installed?",
+                    merged_str
+                );
+            }
+        }
+        if let Some(ref mut fuse_child) = self.fuse_overlay_child {
+            // A successful fusermount causes the daemon to exit on its own.
+            // If unmount failed, the daemon is still alive — kill it so we
+            // don't block forever, but log so the user knows something is wrong.
+            match fuse_child.try_wait() {
+                Ok(Some(_)) => {} // already exited
+                _ => {
+                    log::warn!("fuse-overlayfs did not exit after unmount; killing");
+                    let _ = fuse_child.kill();
+                }
+            }
+            let _ = fuse_child.wait();
+        }
         if let Some(ref merged) = self.overlay_merged_dir {
             // Remove the entire overlay base dir (merged + ephemeral upper/work).
             if let Some(parent) = merged.parent() {
@@ -3636,6 +3901,37 @@ impl Child {
         }
         if let Some(ref mut p) = self.pasta {
             crate::network::teardown_pasta_network(p);
+        }
+        // Unmount fuse-overlayfs before removing the overlay base dir.
+        if let Some(ref fuse_merged) = self.fuse_overlay_merged {
+            let merged_str = fuse_merged.to_string_lossy();
+            let unmounted = std::process::Command::new("fusermount3")
+                .args(["-u", &merged_str])
+                .status()
+                .is_ok_and(|s| s.success())
+                || std::process::Command::new("fusermount")
+                    .args(["-u", &merged_str])
+                    .status()
+                    .is_ok_and(|s| s.success());
+            if !unmounted {
+                log::warn!(
+                    "failed to unmount fuse-overlayfs at {}; is fusermount3 installed?",
+                    merged_str
+                );
+            }
+        }
+        if let Some(ref mut fuse_child) = self.fuse_overlay_child {
+            // A successful fusermount causes the daemon to exit on its own.
+            // If unmount failed, the daemon is still alive — kill it so we
+            // don't block forever, but log so the user knows something is wrong.
+            match fuse_child.try_wait() {
+                Ok(Some(_)) => {} // already exited
+                _ => {
+                    log::warn!("fuse-overlayfs did not exit after unmount; killing");
+                    let _ = fuse_child.kill();
+                }
+            }
+            let _ = fuse_child.wait();
         }
         if let Some(ref merged) = self.overlay_merged_dir {
             // Remove the entire overlay base dir (merged + ephemeral upper/work).

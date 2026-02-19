@@ -8,5 +8,6 @@ pub mod container;
 pub mod image;
 pub mod network;
 pub mod oci;
+pub mod paths;
 pub mod pty;
 pub mod seccomp;

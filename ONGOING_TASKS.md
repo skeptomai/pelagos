@@ -1,6 +1,168 @@
 # Ongoing Tasks
 
-## Current: Flip `--image` / rootfs CLI defaults — COMPLETE ✅
+## Completed: Rootless Remora — Phase A + B
+
+**Status: IMPLEMENTED** — all code changes done, `cargo build` / `cargo test --lib` / `cargo clippy -D warnings` / `cargo fmt --check` pass.
+
+## Next: Rootless Remora — Phases C-E (deferred)
+
+### Context
+
+Remora currently requires `sudo` for image pull (writes to `/var/lib/remora/`, calls `mknod` for whiteouts) and container run (kernel overlayfs needs `CAP_SYS_ADMIN`). The goal is to make `remora image pull alpine && remora run alpine /bin/sh` work without root. This is the first step toward full Podman-level rootless support.
+
+**What already works rootless:** user namespace auto-detection, pasta networking, cgroup graceful degradation, /proc /sys /dev error tolerance.
+
+**Scope:** Phase A (storage path abstraction) + Phase B (rootless whiteouts + overlay mount). Phases C-E (multi-UID mapping, minimal /dev, cgroup delegation) deferred.
+
+---
+
+### Phase A: Storage Path Abstraction
+
+**Goal:** All filesystem paths become rootless-aware. Root uses `/var/lib/remora/` + `/run/remora/`. Non-root uses `~/.local/share/remora/` + `$XDG_RUNTIME_DIR/remora/`.
+
+**New file: `src/paths.rs`** — single source of truth for all Remora paths.
+
+```rust
+pub fn is_rootless() -> bool { unsafe { libc::getuid() } != 0 }
+
+/// Root: /var/lib/remora/ | Rootless: $XDG_DATA_HOME/remora/ (~/.local/share/remora/)
+pub fn data_dir() -> PathBuf
+
+/// Root: /run/remora/ | Rootless: $XDG_RUNTIME_DIR/remora/ (fallback: /tmp/remora-$UID/ mode 0700)
+pub fn runtime_dir() -> PathBuf
+
+// All derived from data_dir() or runtime_dir():
+pub fn images_dir() -> PathBuf       // data_dir()/images
+pub fn layers_dir() -> PathBuf       // data_dir()/layers
+pub fn volumes_dir() -> PathBuf      // data_dir()/volumes
+pub fn rootfs_store_dir() -> PathBuf // data_dir()/rootfs
+pub fn counter_file() -> PathBuf     // data_dir()/container_counter
+pub fn containers_dir() -> PathBuf   // runtime_dir()/containers
+pub fn oci_state_dir(id: &str) -> PathBuf
+pub fn overlay_base(pid: i32, n: u32) -> PathBuf
+pub fn dns_dir(pid: i32, n: u32) -> PathBuf
+pub fn hosts_dir(pid: i32, n: u32) -> PathBuf
+pub fn ipam_file() -> PathBuf
+pub fn nat_refcount_file() -> PathBuf
+pub fn port_forwards_file() -> PathBuf
+```
+
+**Files that change:**
+
+| File | What changes |
+|------|-------------|
+| `src/lib.rs` | Add `pub mod paths;` |
+| `src/paths.rs` | **New** — all path functions |
+| `src/image.rs` | Replace `IMAGES_DIR`/`LAYERS_DIR` constants → `crate::paths::{images_dir,layers_dir}()` |
+| `src/cli/mod.rs` | Replace `containers_dir()`, `rootfs_store()`, `COUNTER_FILE` → delegate to `crate::paths::*` |
+| `src/cli/volume.rs` | Replace hardcoded `/var/lib/remora/volumes` |
+| `src/container.rs` | `Volume::volumes_dir()`, overlay/DNS/hosts temp dirs → `crate::paths::*` |
+| `src/network.rs` | Replace `REMORA_RUN_DIR`, `IPAM_FILE`, `NAT_REFCOUNT_FILE`, `PORT_FORWARDS_FILE` |
+| `src/oci.rs` | `state_dir()` → `crate::paths::oci_state_dir()` |
+
+**Key locations with hardcoded paths:**
+
+- `src/image.rs:9-10` — `IMAGES_DIR`, `LAYERS_DIR` constants
+- `src/cli/mod.rs:22` — `containers_dir()` returns `/run/remora/containers`
+- `src/cli/mod.rs:34` — `rootfs_store()` returns `/var/lib/remora/rootfs`
+- `src/cli/mod.rs:185,188` — `COUNTER_FILE` at `/var/lib/remora/container_counter`
+- `src/cli/volume.rs:12` — hardcoded `/var/lib/remora/volumes`
+- `src/container.rs:387` — `Volume::volumes_dir()` returns `/var/lib/remora/volumes`
+- `src/container.rs:1560,2682` — overlay merged dirs at `/run/remora/overlay-*`
+- `src/container.rs:1630,2748` — DNS dirs at `/run/remora/dns-*`
+- `src/container.rs:1665,2782` — hosts dirs at `/run/remora/hosts-*`
+- `src/network.rs:38-45` — `REMORA_RUN_DIR`, `IPAM_FILE`, `NAT_REFCOUNT_FILE`, `PORT_FORWARDS_FILE`
+- `src/oci.rs:271` — `state_dir()` returns `/run/remora/<id>`
+
+---
+
+### Phase B: Rootless Whiteouts + Overlay Mount
+
+**Goal:** `remora run alpine /bin/sh` works fully rootless (kernel 5.11+ or fuse-overlayfs).
+
+#### B1: Rootless whiteout handling (`src/image.rs`)
+
+In `extract_layer()`, branch on `crate::paths::is_rootless()`:
+
+- **Root (unchanged):** `.wh.<name>` → `mknod(S_IFCHR, makedev(0,0))`, `.wh..wh..opq` → `setxattr("trusted.overlay.opaque")`
+- **Rootless:** `.wh.<name>` → create zero-length file + `setxattr("user.overlay.whiteout", "y")`, `.wh..wh..opq` → `setxattr("user.overlay.opaque", "y")`
+
+New helpers alongside existing `create_whiteout_device()` and `set_opaque_xattr()`:
+```rust
+fn create_whiteout_userxattr(path: &Path) -> io::Result<()>
+fn set_opaque_xattr_userxattr(dir: &Path) -> io::Result<()>
+```
+
+#### B2: Overlay mount options (`src/container.rs`)
+
+In the pre_exec overlay mount — **two locations** (`spawn()` ~line 1955 and `spawn_interactive()` ~line 3042) — append `,userxattr` to mount options string when `is_rootless` is true.
+
+Current: `format!("lowerdir={},upperdir={},workdir={}", ...)`
+Rootless: `format!("lowerdir={},upperdir={},workdir={},userxattr", ...)`
+
+#### B3: fuse-overlayfs fallback
+
+If native overlay+userxattr fails (kernel < 5.11), fall back to `fuse-overlayfs`:
+
+**Before fork (parent process):**
+1. Probe once whether native overlay+userxattr works (cached in `OnceLock<bool>`)
+2. If not supported, check `fuse-overlayfs` is on PATH
+3. Spawn `fuse-overlayfs -o lowerdir=...,upperdir=...,workdir=... <merged>` as subprocess
+4. Store handle in new `Command` field
+
+**In pre_exec:** Skip `mount("overlay", ...)` when fuse-overlayfs is handling it.
+
+**In `Child::wait()` / `wait_with_output()`:** Unmount (`fusermount3 -u <merged>`) and reap subprocess. New `Child` field: `fuse_overlay_child: Option<std::process::Child>`.
+
+**Error case:** Neither native overlay nor fuse-overlayfs available → clear error: `"rootless overlay requires kernel 5.11+ or fuse-overlayfs; install fuse-overlayfs or run as root"`
+
+**Detection helpers:**
+```rust
+fn native_rootless_overlay_supported() -> bool  // cached probe
+fn is_fuse_overlayfs_available() -> bool         // checks PATH
+fn spawn_fuse_overlayfs(lower: &str, upper: &Path, work: &Path, merged: &Path) -> io::Result<std::process::Child>
+```
+
+**Files changed in Phase B:**
+
+| File | What changes |
+|------|-------------|
+| `src/image.rs` | Add `create_whiteout_userxattr()`, `set_opaque_xattr_userxattr()`; branch in `extract_layer()` |
+| `src/container.rs` | Overlay mount options (2 locations); fuse-overlayfs spawn before fork (2 locations); cleanup in `wait()`/`wait_with_output()` (2 locations); new `Child` field |
+
+---
+
+### Verification
+
+1. `cargo build` — compiles
+2. `cargo test --lib` — unit tests pass
+3. `cargo clippy -- -D warnings` — clean
+4. `cargo fmt --check` — clean
+5. Manual rootless tests (user runs without sudo):
+   - `remora image pull alpine` — layers stored in `~/.local/share/remora/layers/`
+   - `remora run alpine /bin/echo hello` — works
+   - `remora run -i --network pasta alpine /bin/sh` — interactive rootless shell with internet
+   - `remora image ls` / `remora image rm alpine` — work
+6. Root mode unchanged (user runs with sudo):
+   - `sudo remora run alpine /bin/echo hello` — still works as before
+
+### Risks / Notes
+
+- **Pre_exec duplication:** `spawn()` and `spawn_interactive()` have near-identical ~1000-line pre_exec closures — every overlay change must be applied to both.
+- **Separate layer stores:** Root and rootless stores are different paths. Image pulled as root can't be used rootless. Matches Podman behavior.
+- **XDG_RUNTIME_DIR missing:** Fallback `/tmp/remora-$UID/` created mode 0700.
+- **Kernel 5.11 for native overlay:** fuse-overlayfs covers older kernels. Both are first-class paths.
+- **fuse-overlayfs and whiteouts:** fuse-overlayfs understands OCI `.wh.*` files natively, so userxattr whiteouts are technically not needed for the fuse path. But we always use userxattr in rootless mode for consistency.
+
+### Future phases (deferred)
+
+- **Phase C:** Multi-UID mapping (`newuidmap`/`newgidmap` + `/etc/subuid` parsing)
+- **Phase D:** Minimal `/dev` setup (tmpfs + bind-mount safe devices)
+- **Phase E:** Cgroup v2 delegation (resource limits in rootless)
+
+---
+
+## Previous: Flip `--image` / rootfs CLI defaults — COMPLETE ✅
 
 Flipped the CLI so OCI images are the default path (positional arg) and local
 rootfs requires `--rootfs` flag. Before: `remora run --image alpine /bin/sh`.

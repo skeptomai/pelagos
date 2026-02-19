@@ -9,7 +9,7 @@ pub fn cmd_volume_create(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn cmd_volume_ls() -> Result<(), Box<dyn std::error::Error>> {
-    let volumes_dir = std::path::PathBuf::from("/var/lib/remora/volumes");
+    let volumes_dir = remora::paths::volumes_dir();
     let entries = match std::fs::read_dir(&volumes_dir) {
         Ok(e) => e,
         Err(_) => {
