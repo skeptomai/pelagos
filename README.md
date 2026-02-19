@@ -8,7 +8,7 @@ Remora provides a safe, ergonomic API for creating containerized processes using
 Linux namespaces, seccomp filtering, cgroups v2, and native networking — without
 a daemon, without CNI plugins, and without image management.
 
-**[User Guide](docs/USER_GUIDE.md)** — get started with the CLI and API.
+**[User Guide](docs/USER_GUIDE.md)** — full CLI reference, networking, storage, security, and more.
 
 ## Features
 
@@ -66,55 +66,6 @@ a daemon, without CNI plugins, and without image management.
 - **SIGWINCH relay:** terminal resize forwarded to container via `TIOCSWINSZ`
 - **Terminal restore:** `TerminalGuard` RAII ensures raw mode is always cleaned up
 
-## Quick Start
-
-```rust
-use remora::container::{Command, Namespace, Stdio};
-
-// Secure container with seccomp, read-only rootfs, and cgroups
-let mut child = Command::new("/bin/sh")
-    .args(&["-c", "echo hello from container"])
-    .with_chroot("/path/to/rootfs")
-    .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
-    .with_proc_mount()
-    .with_seccomp_default()
-    .with_no_new_privileges(true)
-    .with_readonly_rootfs(true)
-    .with_masked_paths_default()
-    .drop_all_capabilities()
-    .with_cgroup_memory(256 * 1024 * 1024)  // 256 MB
-    .spawn()?;
-
-child.wait()?;
-```
-
-```rust
-use remora::network::NetworkMode;
-
-// Bridge-mode container with internet access
-let child = Command::new("/bin/sh")
-    .args(&["-c", "ping -c 1 8.8.8.8"])
-    .with_chroot("/path/to/rootfs")
-    .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-    .with_proc_mount()
-    .with_network(NetworkMode::Bridge)
-    .with_nat()
-    .spawn()?;
-
-child.wait_with_output()?;
-```
-
-```rust
-// Interactive shell
-let session = Command::new("/bin/sh")
-    .with_chroot("/path/to/rootfs")
-    .with_namespaces(Namespace::UTS | Namespace::MOUNT)
-    .with_proc_mount()
-    .spawn_interactive()?;
-
-session.run()?;  // blocks; relays stdin/stdout, forwards SIGWINCH, restores terminal
-```
-
 ## Installation
 
 ```bash
@@ -139,34 +90,65 @@ sudo apt-get install -y musl-tools   # or equivalent for your distro
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-## Building a Root Filesystem
-
-Remora requires a rootfs directory. The test suite uses Alpine Linux.
+## Quick Start
 
 ```bash
-# With Docker (recommended):
-scripts/build-rootfs-docker.sh
-
-# Without Docker:
-scripts/build-rootfs-tarball.sh
-```
-
-See `docs/BUILD_ROOTFS.md` for details.
-
-## Running
-
-```bash
-# Pull an OCI image and run interactively (requires root):
+# Pull an image and run a command
 sudo remora image pull alpine
+sudo remora run --image alpine /bin/echo hello
+
+# Interactive shell (Ctrl-D to exit)
 sudo remora run -i --image alpine /bin/sh
 
-# Or import a local rootfs:
-sudo remora rootfs import alpine ./alpine-rootfs
-sudo remora run -i alpine /bin/sh
+# Detached container with networking
+sudo remora run -d --name mybox --network bridge --nat --image alpine \
+  /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
-# Seccomp demo:
-sudo -E cargo run --example seccomp_demo
+# Check on it
+remora ps
+remora logs -f mybox
+
+# Stop and clean up
+sudo remora stop mybox
+remora rm mybox
 ```
+
+See the **[User Guide](docs/USER_GUIDE.md)** for networking, storage, security,
+resource limits, rootless mode, exec, and the full flag reference.
+
+## Rust Library API
+
+Remora is also a library. Use it to embed container isolation in your own programs.
+
+```rust
+use remora::container::{Command, Namespace, Stdio};
+
+let mut child = Command::new("/bin/sh")
+    .args(&["-c", "echo hello from container"])
+    .with_chroot("/path/to/rootfs")
+    .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
+    .with_proc_mount()
+    .with_seccomp_default()
+    .drop_all_capabilities()
+    .with_cgroup_memory(256 * 1024 * 1024)
+    .spawn()?;
+
+child.wait()?;
+```
+
+```rust
+// Interactive shell
+let session = Command::new("/bin/sh")
+    .with_chroot("/path/to/rootfs")
+    .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+    .with_proc_mount()
+    .spawn_interactive()?;
+
+session.run()?;  // blocks; relays stdin/stdout, forwards SIGWINCH, restores terminal
+```
+
+See the [CLI-to-API translation table](docs/USER_GUIDE.md#cli-to-api-translation) in
+the user guide.
 
 ## Testing
 
@@ -174,10 +156,8 @@ sudo -E cargo run --example seccomp_demo
 # Unit tests (no root required):
 cargo test --lib
 
-# Integration tests (65 tests; root tests require sudo + alpine-rootfs):
+# Integration tests (require root + rootfs):
 sudo -E cargo test --test integration_tests
-# Rootless tests (run WITHOUT sudo, as a regular user):
-cargo test --test integration_tests test_rootless
 ```
 
 ## Architecture

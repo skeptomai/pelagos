@@ -33,38 +33,11 @@ Verify the installation:
 remora --help
 ```
 
-### Prepare a Root Filesystem
-
-Containers need a rootfs (the filesystem visible inside the container). You have three
-options:
-
-**Option A: Pull an OCI image** (easiest)
+### Pull an Image
 
 ```bash
 sudo remora image pull alpine
-```
-
-**Option B: Import a local rootfs directory**
-
-```bash
-# Build one from a Docker export:
-scripts/build-rootfs-docker.sh       # requires Docker + sudo
-# or from an Alpine tarball:
-scripts/build-rootfs-tarball.sh      # requires sudo
-
-# Register it with Remora:
-sudo remora rootfs import alpine ./alpine-rootfs
-```
-
-**Option C: Import a tarball directly** (the scripts above do this for you)
-
-See `docs/BUILD_ROOTFS.md` for detailed instructions.
-
-After setup, verify:
-
-```bash
-remora image ls       # if you used Option A
-remora rootfs ls      # if you used Option B
+remora image ls
 ```
 
 ---
@@ -72,17 +45,15 @@ remora rootfs ls      # if you used Option B
 ## Quick Start
 
 ```bash
-# Using an OCI image (from "image pull"):
+# Run a one-shot command
 sudo remora run --image alpine /bin/echo hello
 
 # Interactive shell (Ctrl-D to exit)
 sudo remora run -i --image alpine /bin/sh
 
-# Using an imported rootfs (from "rootfs import"):
-sudo remora run alpine /bin/echo hello
-
 # Detached (background) container
-sudo remora run -d --name mybox --image alpine /bin/sh -c 'while true; do echo tick; sleep 1; done'
+sudo remora run -d --name mybox --image alpine \
+  /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
 # Check running containers
 remora ps
@@ -190,37 +161,37 @@ By default, containers have no network (`--network none`).
 
 ```bash
 # No network (default)
-sudo remora run alpine /bin/sh
+sudo remora run --image alpine /bin/sh
 
 # Loopback only (127.0.0.1, no external access)
-sudo remora run --network loopback alpine /bin/sh
+sudo remora run --network loopback --image alpine /bin/sh
 
 # Bridge networking (veth pair + remora0 bridge, 172.19.0.x/24)
-sudo remora run --network bridge --nat alpine /bin/sh
+sudo remora run --network bridge --nat --image alpine /bin/sh
 
 # Pasta (rootless, full internet access via user-mode networking)
-remora run --network pasta alpine /bin/sh    # no sudo needed
+remora run --network pasta --image alpine /bin/sh    # no sudo needed
 ```
 
 ### NAT, Port Forwarding, and DNS
 
 ```bash
 # Enable outbound internet (MASQUERADE via nftables)
-sudo remora run --network bridge --nat alpine /bin/sh
+sudo remora run --network bridge --nat --image alpine /bin/sh
 
 # Publish ports (host:container TCP forwarding)
-sudo remora run --network bridge --nat -p 8080:80 alpine /bin/sh
+sudo remora run --network bridge --nat -p 8080:80 --image alpine /bin/sh
 
 # Custom DNS servers
-sudo remora run --network bridge --nat --dns 1.1.1.1 --dns 8.8.8.8 alpine /bin/sh
+sudo remora run --network bridge --nat --dns 1.1.1.1 --dns 8.8.8.8 --image alpine /bin/sh
 ```
 
 ### Container Linking
 
 ```bash
 # Link containers by name (injects /etc/hosts entry)
-sudo remora run -d --name db --network bridge --nat alpine /bin/sh -c 'sleep 3600'
-sudo remora run --network bridge --nat --link db alpine /bin/sh -c 'ping -c1 db'
+sudo remora run -d --name db --network bridge --nat --image alpine /bin/sh -c 'sleep 3600'
+sudo remora run --network bridge --nat --link db --image alpine /bin/sh -c 'ping -c1 db'
 ```
 
 ### Rootless Networking
@@ -230,7 +201,7 @@ For rootless containers (no sudo), use `--network pasta`. This requires
 
 ```bash
 # Full internet access without root
-remora run --network pasta -i alpine /bin/sh
+remora run --network pasta -i --image alpine /bin/sh
 ```
 
 Bridge networking requires root and is rejected in rootless mode.
@@ -252,7 +223,7 @@ sudo remora volume create mydata
 remora volume ls
 
 # Use a volume (auto-created if it doesn't exist)
-sudo remora run -v mydata:/data alpine /bin/sh
+sudo remora run -v mydata:/data --image alpine /bin/sh
 
 # Remove a volume
 sudo remora volume rm mydata
@@ -264,10 +235,10 @@ Map host directories into the container:
 
 ```bash
 # Read-write bind mount
-sudo remora run --bind /host/path:/container/path alpine /bin/sh
+sudo remora run --bind /host/path:/container/path --image alpine /bin/sh
 
 # Read-only bind mount
-sudo remora run --bind-ro /etc/hosts:/etc/hosts alpine /bin/sh
+sudo remora run --bind-ro /etc/hosts:/etc/hosts --image alpine /bin/sh
 ```
 
 ### tmpfs
@@ -275,7 +246,7 @@ sudo remora run --bind-ro /etc/hosts:/etc/hosts alpine /bin/sh
 In-memory writable directories (useful with `--read-only`):
 
 ```bash
-sudo remora run --read-only --tmpfs /tmp --tmpfs /run alpine /bin/sh
+sudo remora run --read-only --tmpfs /tmp --tmpfs /run --image alpine /bin/sh
 ```
 
 ### Overlay (with --image)
@@ -291,19 +262,19 @@ discarded when the container exits.
 ### Read-Only Rootfs
 
 ```bash
-sudo remora run --read-only alpine /bin/sh
+sudo remora run --read-only --image alpine /bin/sh
 # Combine with --tmpfs for writable scratch space
-sudo remora run --read-only --tmpfs /tmp alpine /bin/sh
+sudo remora run --read-only --tmpfs /tmp --image alpine /bin/sh
 ```
 
 ### Capabilities
 
 ```bash
 # Drop all capabilities (most restrictive)
-sudo remora run --cap-drop ALL alpine /bin/sh
+sudo remora run --cap-drop ALL --image alpine /bin/sh
 
 # Drop all, then add back specific ones
-sudo remora run --cap-drop ALL --cap-add NET_BIND_SERVICE alpine /bin/sh
+sudo remora run --cap-drop ALL --cap-add NET_BIND_SERVICE --image alpine /bin/sh
 ```
 
 Supported capabilities: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID,
@@ -313,29 +284,29 @@ NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, SYS_ADMIN, SYS_PTRACE.
 
 ```bash
 # Docker's default seccomp profile (recommended)
-sudo remora run --security-opt seccomp=default alpine /bin/sh
+sudo remora run --security-opt seccomp=default --image alpine /bin/sh
 
 # Minimal profile (tighter restrictions)
-sudo remora run --security-opt seccomp=minimal alpine /bin/sh
+sudo remora run --security-opt seccomp=minimal --image alpine /bin/sh
 
 # Disable seccomp entirely
-sudo remora run --security-opt seccomp=none alpine /bin/sh
+sudo remora run --security-opt seccomp=none --image alpine /bin/sh
 ```
 
 ### Other Security Options
 
 ```bash
 # Prevent privilege escalation via setuid/setgid binaries
-sudo remora run --security-opt no-new-privileges alpine /bin/sh
+sudo remora run --security-opt no-new-privileges --image alpine /bin/sh
 
 # Mask sensitive kernel paths
-sudo remora run --masked-path /proc/kcore --masked-path /proc/sysrq-trigger alpine /bin/sh
+sudo remora run --masked-path /proc/kcore --masked-path /proc/sysrq-trigger --image alpine /bin/sh
 
 # Set kernel parameters inside container
-sudo remora run --sysctl net.ipv4.ip_forward=1 alpine /bin/sh
+sudo remora run --sysctl net.ipv4.ip_forward=1 --image alpine /bin/sh
 
 # Run as non-root user inside container
-sudo remora run --user 1000:1000 alpine /bin/id
+sudo remora run --user 1000:1000 --image alpine /bin/id
 ```
 
 ---
@@ -346,26 +317,26 @@ sudo remora run --user 1000:1000 alpine /bin/id
 
 ```bash
 # Memory limit (supports k, m, g suffixes)
-sudo remora run --memory 256m alpine /bin/sh
+sudo remora run --memory 256m --image alpine /bin/sh
 
 # CPU quota (fractional CPUs: 0.5 = 50% of one core)
-sudo remora run --cpus 0.5 alpine /bin/sh
+sudo remora run --cpus 0.5 --image alpine /bin/sh
 
 # CPU shares/weight (relative to other containers)
-sudo remora run --cpu-shares 512 alpine /bin/sh
+sudo remora run --cpu-shares 512 --image alpine /bin/sh
 
 # Max number of processes
-sudo remora run --pids-limit 50 alpine /bin/sh
+sudo remora run --pids-limit 50 --image alpine /bin/sh
 ```
 
 ### rlimits
 
 ```bash
 # Set file descriptor limit
-sudo remora run --ulimit nofile=1024:2048 alpine /bin/sh
+sudo remora run --ulimit nofile=1024:2048 --image alpine /bin/sh
 
 # Set max processes
-sudo remora run --ulimit nproc=100:200 alpine /bin/sh
+sudo remora run --ulimit nproc=100:200 --image alpine /bin/sh
 ```
 
 Supported ulimit resources: nofile (openfiles), nproc (maxproc), as (vmem), cpu,
@@ -380,7 +351,7 @@ needed.
 
 ```bash
 # Run rootless (no sudo)
-remora run --network pasta -i alpine /bin/sh
+remora run --network pasta -i --image alpine /bin/sh
 ```
 
 **What works rootless:**
@@ -398,8 +369,8 @@ remora run --network pasta -i alpine /bin/sh
 ## Complete `run` Reference
 
 ```
-remora run [OPTIONS] [ROOTFS [COMMAND [ARGS...]]]
 remora run [OPTIONS] --image <IMAGE> [COMMAND [ARGS...]]
+remora run [OPTIONS] <ROOTFS> [COMMAND [ARGS...]]
 ```
 
 | Flag | Short | Description |
@@ -407,7 +378,7 @@ remora run [OPTIONS] --image <IMAGE> [COMMAND [ARGS...]]
 | `--name <NAME>` | | Container name (auto-generated if omitted) |
 | `--detach` | `-d` | Run in background |
 | `--interactive` | `-i` | Allocate a PTY (incompatible with `--detach`) |
-| `--image <IMAGE>` | | Use an OCI image instead of a local rootfs |
+| `--image <IMAGE>` | | Use an OCI image (from `image pull`) |
 | `--network <MODE>` | | `none` (default), `loopback`, `bridge`, `pasta` |
 | `--publish <H:C>` | `-p` | TCP port forward host:container (repeatable) |
 | `--nat` | | Enable MASQUERADE NAT (requires bridge) |
@@ -536,6 +507,34 @@ let status = session.run()?;
 
 ---
 
+## Advanced: Local Rootfs
+
+For development or testing, you can bypass OCI images and use a local rootfs directory
+directly. This is mainly useful for Remora contributors and custom rootfs builds.
+
+```bash
+# Build a rootfs from Docker:
+scripts/build-rootfs-docker.sh       # requires Docker + sudo
+# or from an Alpine tarball:
+scripts/build-rootfs-tarball.sh      # requires sudo
+
+# Register it with Remora:
+sudo remora rootfs import alpine ./alpine-rootfs
+
+# List registered rootfs entries:
+remora rootfs ls
+
+# Run with a rootfs (no --image flag):
+sudo remora run alpine /bin/echo hello
+
+# Remove a rootfs entry:
+sudo remora rootfs rm alpine
+```
+
+See `docs/BUILD_ROOTFS.md` for detailed rootfs build instructions.
+
+---
+
 ## Storage Layout
 
 ```
@@ -563,15 +562,21 @@ let status = session.run()?;
 
 ## Troubleshooting
 
-### "alpine-rootfs not found"
+### "rootfs not found"
 
-Build or import a rootfs first:
+Pull an OCI image first:
 
 ```bash
-scripts/build-rootfs-docker.sh           # build with Docker
-sudo remora rootfs import alpine ./alpine-rootfs
-# or pull an OCI image:
 sudo remora image pull alpine
+sudo remora run --image alpine /bin/sh
+```
+
+Or if using a local rootfs, import it:
+
+```bash
+scripts/build-rootfs-docker.sh
+sudo remora rootfs import alpine ./alpine-rootfs
+sudo remora run alpine /bin/sh
 ```
 
 ### Permission denied / EPERM
