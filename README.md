@@ -118,10 +118,16 @@ session.run()?;  // blocks; relays stdin/stdout, forwards SIGWINCH, restores ter
 ## Installation
 
 ```bash
+# Install to /usr/local/bin (recommended):
+scripts/install.sh
+
+# Or install to ~/.cargo/bin:
 cargo install --path .
+
+# Or install to /usr/local/bin via cargo:
+sudo cargo install --path . --root /usr/local
 ```
 
-This installs the `remora` binary to `~/.cargo/bin/`, which is on `PATH` for most Rust setups.
 You can also download a pre-built static binary from the
 [Releases](https://github.com/skeptomai/remora/releases) page.
 
