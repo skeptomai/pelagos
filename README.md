@@ -128,8 +128,16 @@ cargo install --path .
 sudo cargo install --path . --root /usr/local
 ```
 
-You can also download a pre-built static binary from the
+You can also download a pre-built binary from the
 [Releases](https://github.com/skeptomai/remora/releases) page.
+
+For a statically linked binary (e.g. for minimal containers or distroless hosts):
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install -y musl-tools   # or equivalent for your distro
+cargo build --release --target x86_64-unknown-linux-musl
+```
 
 ## Building a Root Filesystem
 

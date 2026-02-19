@@ -21,4 +21,4 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - `remora exec` to run commands in running containers
 - Container exec with namespace discovery and environment inheritance
 - CI pipeline with GitHub Actions (lint, unit tests, integration tests)
-- Static binary releases for x86_64 Linux
+- Binary releases for x86_64 Linux (musl static builds supported manually)
