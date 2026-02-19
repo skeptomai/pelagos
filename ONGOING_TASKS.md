@@ -1,22 +1,50 @@
 # Ongoing Tasks
 
-## Current: GitHub Actions CI + Release Workflow — COMPLETE ✅
+## Current: GitHub Actions CI + Release Workflow + Docs — COMPLETE ✅
 
-Added GitHub Actions CI and release workflows plus a CHANGELOG.
+Added GitHub Actions CI and release workflows, CHANGELOG, install script,
+and documentation updates. Tagged and released v0.1.0.
 
 **Files created:**
 - `.github/workflows/ci.yml` — CI on push/PR: lint (fmt + clippy), unit tests, integration tests
-- `.github/workflows/release.yml` — Static binary release on `v*` tag push (musl, x86_64)
+- `.github/workflows/release.yml` — glibc release binary on `v*` tag push, SHA256 checksum
 - `CHANGELOG.md` — Keep a Changelog format, all features under `[Unreleased]`
+- `scripts/install.sh` — Build release and install to `/usr/local/bin` (or custom path)
 
 **Files modified:**
-- `README.md` — Added CI badge, added CHANGELOG to documentation table
+- `README.md` — CI badge, user guide link, installation section, CHANGELOG in docs table,
+  rootless section updated to reflect pasta (Phase 2) completion
+- `docs/USER_GUIDE.md` — Replaced bare `cargo build` with proper install instructions
+- `src/container.rs` — Portable `RlimitResource` type alias (glibc/musl), c-string literals,
+  ioctl request casts for musl compatibility
+- `src/network.rs` — `.truncate(false)` on `OpenOptions`, ioctl casts
+- `src/oci.rs` — Redundant closure cleanup, c-string literals
+- `src/pty.rs` — ioctl request casts
+- `src/main.rs` — Box large enum variant
+- All source files — `cargo fmt` applied codebase-wide
 
 **CI details:**
-- Three parallel jobs: lint, unit-tests, integration-tests
+- Three parallel jobs: lint, unit-tests, integration-tests (all parallel)
 - Integration tests install nftables, iproute2, passt; build rootfs via tarball script
 - `--test-threads=1` for integration tests (shared network state)
-- Release builds static binary via `x86_64-unknown-linux-musl`, includes SHA256 checksum
+- `sudo -E env "PATH=$PATH"` preserves cargo on runner's PATH
+
+**Release details:**
+- Builds against glibc (same target as CI — test what you ship)
+- musl static builds supported manually and documented in README
+- `softprops/action-gh-release@v2` creates GitHub Release with binary + SHA256
+- v0.1.0 tagged and released successfully
+
+**Issues fixed during CI bringup:**
+- `cargo fmt` — never been run; applied codebase-wide (23 files)
+- `cargo clippy -D warnings` — c-string literals, redundant closures, `OpenOptions::truncate`,
+  `io::Error::other`, unused imports, large enum variant
+- `reset-test-env.sh` — `grep | while` pipeline failed under `set -o pipefail` when no
+  stale overlays existed; added `|| true`
+- `sudo -E cargo` — runner's PATH didn't include `~/.cargo/bin` for root
+- musl rlimit type — `libc::__rlimit_resource_t` is glibc-only; added cfg-gated alias
+- musl ioctl type — `ioctl(fd, request)` takes `c_ulong` on glibc, `c_int` on musl;
+  use `as _` for portable casts
 
 ---
 
