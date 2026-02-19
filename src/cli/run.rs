@@ -284,7 +284,8 @@ fn build_command(
         .args(rest)
         .with_chroot(rootfs_dir)
         .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
-        .with_proc_mount();
+        .with_proc_mount()
+        .with_dev_mount();
 
     cmd = apply_cli_options(cmd, args, port_forwards, network_mode)?;
     Ok(cmd)

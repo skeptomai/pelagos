@@ -4680,3 +4680,200 @@ mod exec {
         assert!(!root_path.exists(), "/proc/999999/root should not exist");
     }
 }
+
+mod dev {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_dev_minimal_devices() {
+        if !is_root() {
+            eprintln!("Skipping test_dev_minimal_devices: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_dev_minimal_devices: alpine-rootfs not found");
+            return;
+        };
+
+        let child = Command::new("/bin/ls")
+            .args(&["/dev/"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_dev_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("Failed to wait for child");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(status.success(), "ls /dev/ failed: {}", stdout);
+
+        // Should contain safe devices.
+        for dev in &["null", "zero", "random", "urandom", "full", "tty"] {
+            assert!(
+                stdout.contains(dev),
+                "/dev/ should contain '{}', got: {}",
+                dev,
+                stdout
+            );
+        }
+
+        // Should NOT contain host-specific devices.
+        for bad in &["sda", "nvme", "video"] {
+            assert!(
+                !stdout.contains(bad),
+                "/dev/ should NOT contain host device '{}', got: {}",
+                bad,
+                stdout
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_null_works() {
+        if !is_root() {
+            eprintln!("Skipping test_dev_null_works: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_dev_null_works: alpine-rootfs not found");
+            return;
+        };
+
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "echo ok > /dev/null && echo pass"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_dev_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("Failed to wait for child");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(status.success(), "command failed: {}", stdout);
+        assert!(
+            stdout.contains("pass"),
+            "expected 'pass' in output, got: {}",
+            stdout
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_zero_works() {
+        if !is_root() {
+            eprintln!("Skipping test_dev_zero_works: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_dev_zero_works: alpine-rootfs not found");
+            return;
+        };
+
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "head -c 4 /dev/zero | wc -c"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_dev_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("Failed to wait for child");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(status.success(), "command failed: {}", stdout);
+        assert!(
+            stdout.trim().contains('4'),
+            "expected '4' in output, got: {}",
+            stdout
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_symlinks() {
+        if !is_root() {
+            eprintln!("Skipping test_dev_symlinks: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_dev_symlinks: alpine-rootfs not found");
+            return;
+        };
+
+        let child = Command::new("/bin/ash")
+            .args(&[
+                "-c",
+                "test -L /dev/fd && test -L /dev/stdin && test -L /dev/stdout && test -L /dev/stderr && echo ok",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_dev_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("Failed to wait for child");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(status.success(), "symlink check failed: {}", stdout);
+        assert!(
+            stdout.contains("ok"),
+            "expected 'ok' in output, got: {}",
+            stdout
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_dev_pts_exists() {
+        if !is_root() {
+            eprintln!("Skipping test_dev_pts_exists: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_dev_pts_exists: alpine-rootfs not found");
+            return;
+        };
+
+        let child = Command::new("/bin/ash")
+            .args(&["-c", "test -d /dev/pts && test -d /dev/shm && echo ok"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .with_dev_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("Failed to wait for child");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(status.success(), "/dev/pts or /dev/shm missing: {}", stdout);
+        assert!(
+            stdout.contains("ok"),
+            "expected 'ok' in output, got: {}",
+            stdout
+        );
+    }
+}

@@ -1228,6 +1228,7 @@ impl Command {
         });
         self.namespaces |= Namespace::MOUNT;
         self.mount_proc = true;
+        self.mount_dev = true;
         self
     }
 
@@ -2319,6 +2320,121 @@ impl Command {
                         }
                     }
 
+                    // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
+                    if mount_dev {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let dev_host = effective_root.join("dev");
+                        std::fs::create_dir_all(&dev_host)
+                            .map_err(|e| io::Error::other(format!("mkdir /dev: {}", e)))?;
+                        let dev_host_c = CString::new(dev_host.as_os_str().as_bytes()).unwrap();
+                        let tmpfs_type = CString::new("tmpfs").unwrap();
+                        let dev_opts = CString::new("mode=755,size=65536k").unwrap();
+                        let r = libc::mount(
+                            tmpfs_type.as_ptr(),
+                            dev_host_c.as_ptr(),
+                            tmpfs_type.as_ptr(),
+                            libc::MS_NOSUID | libc::MS_STRICTATIME,
+                            dev_opts.as_ptr() as *const libc::c_void,
+                        );
+                        if r != 0 {
+                            let e = io::Error::last_os_error();
+                            if !is_rootless {
+                                return Err(io::Error::other(format!("mount tmpfs /dev: {}", e)));
+                            }
+                        } else {
+                            // Create subdirectories.
+                            let _ = std::fs::create_dir_all(dev_host.join("pts"));
+                            let _ = std::fs::create_dir_all(dev_host.join("shm"));
+                            let _ = std::fs::create_dir_all(dev_host.join("mqueue"));
+
+                            // Mount devpts at /dev/pts (tolerate failure).
+                            let devpts_path =
+                                CString::new(dev_host.join("pts").as_os_str().as_bytes()).unwrap();
+                            let devpts_type = CString::new("devpts").unwrap();
+                            let devpts_opts =
+                                CString::new("newinstance,ptmxmode=0666,mode=0620,gid=5").unwrap();
+                            let _ = libc::mount(
+                                devpts_type.as_ptr(),
+                                devpts_path.as_ptr(),
+                                devpts_type.as_ptr(),
+                                libc::MS_NOSUID | libc::MS_NOEXEC,
+                                devpts_opts.as_ptr() as *const libc::c_void,
+                            );
+
+                            // Mount tmpfs at /dev/shm.
+                            let shm_path =
+                                CString::new(dev_host.join("shm").as_os_str().as_bytes()).unwrap();
+                            let shm_opts = CString::new("mode=1777,size=65536k").unwrap();
+                            let _ = libc::mount(
+                                tmpfs_type.as_ptr(),
+                                shm_path.as_ptr(),
+                                tmpfs_type.as_ptr(),
+                                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                                shm_opts.as_ptr() as *const libc::c_void,
+                            );
+
+                            // Mount mqueue at /dev/mqueue (tolerate failure).
+                            let mqueue_path =
+                                CString::new(dev_host.join("mqueue").as_os_str().as_bytes())
+                                    .unwrap();
+                            let mqueue_type = CString::new("mqueue").unwrap();
+                            let _ = libc::mount(
+                                mqueue_type.as_ptr(),
+                                mqueue_path.as_ptr(),
+                                mqueue_type.as_ptr(),
+                                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                                ptr::null(),
+                            );
+
+                            // Bind-mount safe devices from host /dev/<name>.
+                            for dev_name in &["null", "zero", "full", "random", "urandom", "tty"] {
+                                let host_dev = CString::new(format!("/dev/{}", dev_name)).unwrap();
+                                let target = dev_host.join(dev_name);
+                                let target_c = CString::new(target.as_os_str().as_bytes()).unwrap();
+                                // Create empty target file for bind mount.
+                                let tfd = libc::open(
+                                    target_c.as_ptr(),
+                                    libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                    0o666u32,
+                                );
+                                if tfd >= 0 {
+                                    libc::close(tfd);
+                                }
+                                let r = libc::mount(
+                                    host_dev.as_ptr(),
+                                    target_c.as_ptr(),
+                                    ptr::null(),
+                                    libc::MS_BIND,
+                                    ptr::null(),
+                                );
+                                if r != 0 {
+                                    log::debug!(
+                                        "bind-mount /dev/{} failed: {}",
+                                        dev_name,
+                                        io::Error::last_os_error()
+                                    );
+                                }
+                            }
+
+                            // Symlinks (using host-side paths).
+                            let _ =
+                                std::os::unix::fs::symlink("/proc/self/fd", dev_host.join("fd"));
+                            let _ = std::os::unix::fs::symlink(
+                                "/proc/self/fd/0",
+                                dev_host.join("stdin"),
+                            );
+                            let _ = std::os::unix::fs::symlink(
+                                "/proc/self/fd/1",
+                                dev_host.join("stdout"),
+                            );
+                            let _ = std::os::unix::fs::symlink(
+                                "/proc/self/fd/2",
+                                dev_host.join("stderr"),
+                            );
+                            let _ = std::os::unix::fs::symlink("pts/ptmx", dev_host.join("ptmx"));
+                        }
+                    }
+
                     chroot(effective_root)
                         .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
 
@@ -2363,22 +2479,6 @@ impl Command {
                         ptr::null(),    // data
                     );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
-                    if result != 0 && !is_rootless {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-
-                if mount_dev {
-                    // Bind mount /dev (from host) to /dev (in container)
-                    let dev = CString::new("/dev").unwrap();
-                    let result = libc::mount(
-                        dev.as_ptr(),                 // source
-                        dev.as_ptr(),                 // target
-                        ptr::null(),                  // fstype (NULL for bind mount)
-                        libc::MS_BIND | libc::MS_REC, // recursive bind
-                        ptr::null(),                  // data
-                    );
-                    // Rootless: /dev bind may fail on locked mounts; inherited /dev is still usable.
                     if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }
@@ -3446,6 +3546,114 @@ impl Command {
                         }
                     }
 
+                    // Minimal /dev setup BEFORE chroot — host /dev paths still accessible.
+                    if mount_dev {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        let dev_host = effective_root.join("dev");
+                        std::fs::create_dir_all(&dev_host)
+                            .map_err(|e| io::Error::other(format!("mkdir /dev: {}", e)))?;
+                        let dev_host_c = CString::new(dev_host.as_os_str().as_bytes()).unwrap();
+                        let tmpfs_type = CString::new("tmpfs").unwrap();
+                        let dev_opts = CString::new("mode=755,size=65536k").unwrap();
+                        let r = libc::mount(
+                            tmpfs_type.as_ptr(),
+                            dev_host_c.as_ptr(),
+                            tmpfs_type.as_ptr(),
+                            libc::MS_NOSUID | libc::MS_STRICTATIME,
+                            dev_opts.as_ptr() as *const libc::c_void,
+                        );
+                        if r != 0 {
+                            let e = io::Error::last_os_error();
+                            if !is_rootless {
+                                return Err(io::Error::other(format!("mount tmpfs /dev: {}", e)));
+                            }
+                        } else {
+                            let _ = std::fs::create_dir_all(dev_host.join("pts"));
+                            let _ = std::fs::create_dir_all(dev_host.join("shm"));
+                            let _ = std::fs::create_dir_all(dev_host.join("mqueue"));
+
+                            let devpts_path =
+                                CString::new(dev_host.join("pts").as_os_str().as_bytes()).unwrap();
+                            let devpts_type = CString::new("devpts").unwrap();
+                            let devpts_opts =
+                                CString::new("newinstance,ptmxmode=0666,mode=0620,gid=5").unwrap();
+                            let _ = libc::mount(
+                                devpts_type.as_ptr(),
+                                devpts_path.as_ptr(),
+                                devpts_type.as_ptr(),
+                                libc::MS_NOSUID | libc::MS_NOEXEC,
+                                devpts_opts.as_ptr() as *const libc::c_void,
+                            );
+
+                            let shm_path =
+                                CString::new(dev_host.join("shm").as_os_str().as_bytes()).unwrap();
+                            let shm_opts = CString::new("mode=1777,size=65536k").unwrap();
+                            let _ = libc::mount(
+                                tmpfs_type.as_ptr(),
+                                shm_path.as_ptr(),
+                                tmpfs_type.as_ptr(),
+                                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                                shm_opts.as_ptr() as *const libc::c_void,
+                            );
+
+                            let mqueue_path =
+                                CString::new(dev_host.join("mqueue").as_os_str().as_bytes())
+                                    .unwrap();
+                            let mqueue_type = CString::new("mqueue").unwrap();
+                            let _ = libc::mount(
+                                mqueue_type.as_ptr(),
+                                mqueue_path.as_ptr(),
+                                mqueue_type.as_ptr(),
+                                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                                ptr::null(),
+                            );
+
+                            for dev_name in &["null", "zero", "full", "random", "urandom", "tty"] {
+                                let host_dev = CString::new(format!("/dev/{}", dev_name)).unwrap();
+                                let target = dev_host.join(dev_name);
+                                let target_c = CString::new(target.as_os_str().as_bytes()).unwrap();
+                                let tfd = libc::open(
+                                    target_c.as_ptr(),
+                                    libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                                    0o666u32,
+                                );
+                                if tfd >= 0 {
+                                    libc::close(tfd);
+                                }
+                                let r = libc::mount(
+                                    host_dev.as_ptr(),
+                                    target_c.as_ptr(),
+                                    ptr::null(),
+                                    libc::MS_BIND,
+                                    ptr::null(),
+                                );
+                                if r != 0 {
+                                    log::debug!(
+                                        "bind-mount /dev/{} failed: {}",
+                                        dev_name,
+                                        io::Error::last_os_error()
+                                    );
+                                }
+                            }
+
+                            let _ =
+                                std::os::unix::fs::symlink("/proc/self/fd", dev_host.join("fd"));
+                            let _ = std::os::unix::fs::symlink(
+                                "/proc/self/fd/0",
+                                dev_host.join("stdin"),
+                            );
+                            let _ = std::os::unix::fs::symlink(
+                                "/proc/self/fd/1",
+                                dev_host.join("stdout"),
+                            );
+                            let _ = std::os::unix::fs::symlink(
+                                "/proc/self/fd/2",
+                                dev_host.join("stderr"),
+                            );
+                            let _ = std::os::unix::fs::symlink("pts/ptmx", dev_host.join("ptmx"));
+                        }
+                    }
+
                     chroot(effective_root)
                         .map_err(|e| io::Error::other(format!("chroot error: {}", e)))?;
                     let cwd = container_cwd
@@ -3476,21 +3684,6 @@ impl Command {
                         ptr::null(),
                     );
                     // Rootless: /sys bind may fail on locked mounts; inherited /sys is still usable.
-                    if result != 0 && !is_rootless {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-
-                if mount_dev {
-                    let dev = CString::new("/dev").unwrap();
-                    let result = libc::mount(
-                        dev.as_ptr(),
-                        dev.as_ptr(),
-                        ptr::null(),
-                        libc::MS_BIND | libc::MS_REC,
-                        ptr::null(),
-                    );
-                    // Rootless: /dev bind may fail on locked mounts; inherited /dev is still usable.
                     if result != 0 && !is_rootless {
                         return Err(io::Error::last_os_error());
                     }

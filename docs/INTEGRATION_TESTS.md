@@ -907,3 +907,52 @@ Verifies that `kill(999999, 0)` returns false (PID not alive) and
 uses to reject exec into stopped containers.
 
 Failure indicates a kernel or procfs anomaly where dead PIDs still appear alive.
+
+---
+
+## Minimal /dev Tests (`dev` module)
+
+### `test_dev_minimal_devices`
+**Requires:** root + rootfs
+
+Spawns a container with `with_dev_mount()` and lists `/dev/`. Asserts that safe
+devices (`null`, `zero`, `random`, `urandom`, `full`, `tty`) are present, and
+host-specific devices (`sda`, `nvme`, `video`) are absent.
+
+Failure indicates the minimal /dev setup is not populating safe devices, or that
+host device nodes are leaking into the container.
+
+### `test_dev_null_works`
+**Requires:** root + rootfs
+
+Runs `echo ok > /dev/null && echo pass` inside a container with `with_dev_mount()`.
+Asserts that the output contains "pass", confirming `/dev/null` is a functional
+device (accepts writes without error).
+
+Failure indicates `/dev/null` is not properly bind-mounted from the host.
+
+### `test_dev_zero_works`
+**Requires:** root + rootfs
+
+Runs `head -c 4 /dev/zero | wc -c` inside a container with `with_dev_mount()`.
+Asserts that output contains "4", confirming `/dev/zero` produces zero bytes.
+
+Failure indicates `/dev/zero` is not properly bind-mounted from the host.
+
+### `test_dev_symlinks`
+**Requires:** root + rootfs
+
+Checks that `/dev/fd`, `/dev/stdin`, `/dev/stdout`, and `/dev/stderr` are
+symlinks inside a container with `with_dev_mount()`.
+
+Failure indicates the minimal /dev setup is not creating the standard symlinks
+that many programs depend on.
+
+### `test_dev_pts_exists`
+**Requires:** root + rootfs
+
+Checks that `/dev/pts` and `/dev/shm` directories exist inside a container
+with `with_dev_mount()`.
+
+Failure indicates the minimal /dev setup is not creating the required
+subdirectories for PTY allocation and shared memory.
