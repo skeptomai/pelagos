@@ -93,6 +93,13 @@
 use bitflags::bitflags;
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::chroot;
+
+/// Portable type for rlimit resource constants.
+/// glibc defines `__rlimit_resource_t` (c_uint), musl uses plain `c_int`.
+#[cfg(target_env = "gnu")]
+pub type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+pub type RlimitResource = libc::c_int;
 pub use seccompiler::BpfProgram;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -833,7 +840,7 @@ impl Command {
     /// ```
     pub fn with_rlimit(
         mut self,
-        resource: libc::__rlimit_resource_t,
+        resource: RlimitResource,
         soft: libc::rlim_t,
         hard: libc::rlim_t,
     ) -> Self {

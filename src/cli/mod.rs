@@ -255,7 +255,14 @@ pub fn parse_user(s: &str) -> Result<(u32, Option<u32>), String> {
 /// Returns the libc resource constant.
 pub fn parse_ulimit(
     s: &str,
-) -> Result<(libc::__rlimit_resource_t, libc::rlim_t, libc::rlim_t), String> {
+) -> Result<
+    (
+        remora::container::RlimitResource,
+        libc::rlim_t,
+        libc::rlim_t,
+    ),
+    String,
+> {
     let (name, limits) = s
         .split_once('=')
         .ok_or_else(|| format!("invalid --ulimit '{}': expected RESOURCE=SOFT:HARD", s))?;
