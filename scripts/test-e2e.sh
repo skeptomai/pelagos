@@ -7,7 +7,7 @@
 #
 # Must run as root (use -E to preserve rustup/cargo environment):
 #   sudo -E scripts/test-e2e.sh
-set -euo pipefail
+set -uo pipefail
 
 PASS=0
 FAIL=0

@@ -7,7 +7,7 @@
 #
 # Must run as root (use -E to preserve rustup/cargo environment):
 #   sudo -E scripts/test-stress.sh
-set -euo pipefail
+set -uo pipefail
 
 PASS=0
 FAIL=0
@@ -104,16 +104,19 @@ for i in $(seq 1 5); do
     run_detach run --name "$NAME" --detach --network bridge alpine /bin/sleep 120 >/dev/null &
 done
 
-# Wait for all launches to complete
-wait
+# Wait for all launches to complete (tolerate individual failures)
+wait 2>/dev/null || true
 sleep 2
 
 echo "--- Collecting bridge IPs ---"
+# Wait a moment for watcher processes to update state with bridge_ip
+sleep 3
 IPS=()
 for NAME in "${BRIDGE_NAMES[@]}"; do
     STATE_FILE="/run/remora/containers/$NAME/state.json"
     if [ -f "$STATE_FILE" ]; then
-        IP=$(grep -o '"bridge_ip":"[^"]*"' "$STATE_FILE" 2>/dev/null | head -1 | cut -d'"' -f4)
+        # serde_json may serialize with or without spaces around colon
+        IP=$(grep -oE '"bridge_ip"\s*:\s*"[0-9.]+"' "$STATE_FILE" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
         if [ -n "$IP" ]; then
             IPS+=("$IP")
         fi
@@ -265,10 +268,10 @@ pass "foreground exit cleanup (merged dirs: $MERGED_COUNT)"
 $BINARY rm -f stress-overlay 2>/dev/null || true
 
 echo "--- Test: bridge container exit → no leaked veth ---"
-VETH_BEFORE=$(ip link show 2>/dev/null | grep -c 'veth' || echo 0)
+VETH_BEFORE=$(ip link show 2>/dev/null | grep 'veth' | wc -l)
 $BINARY run --network bridge alpine /bin/true 2>/dev/null || true
 sleep 1
-VETH_AFTER=$(ip link show 2>/dev/null | grep -c 'veth' || echo 0)
+VETH_AFTER=$(ip link show 2>/dev/null | grep 'veth' | wc -l)
 if [ "$VETH_AFTER" -le "$VETH_BEFORE" ]; then
     pass "no leaked veth interfaces ($VETH_BEFORE → $VETH_AFTER)"
 else
@@ -326,10 +329,14 @@ OCIJSON
 
     $BINARY create stress-oci-orphan "$OCI_BUNDLE" 2>/dev/null || true
     sleep 1
+    # The created container's process is alive (blocked on accept waiting for
+    # "start"). Kill it first, then delete — OCI spec requires stop before delete.
+    $BINARY kill stress-oci-orphan SIGKILL 2>/dev/null || true
+    sleep 1
     if $BINARY delete stress-oci-orphan 2>/dev/null; then
-        pass "create without start → delete succeeds"
+        pass "create → kill → delete succeeds"
     else
-        fail "create without start → delete succeeds"
+        fail "create → kill → delete succeeds"
     fi
 
     echo "--- Test: kill on started container ---"
