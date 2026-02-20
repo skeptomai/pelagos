@@ -399,6 +399,14 @@ User must run with: `sudo -E cargo test --test integration_tests`
 ### Permission denied
 Many features require root or CAP_SYS_ADMIN
 
+### Alpine binary paths
+Alpine uses `/usr/bin/` for many utilities, NOT `/bin/`. Busybox core applets
+(sh, ash, cat, cp, echo, ls, etc.) are symlinked in `/bin/`, but utilities like
+`id`, `env`, `wc`, `sort`, `tr` live in `/usr/bin/`. When writing tests or
+examples that run inside Alpine containers, use bare command names (e.g. `id`)
+to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
+`/bin/id` exists.**
+
 ## Comparison to Docker/runc
 
 | Feature | Remora | Docker |

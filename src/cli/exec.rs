@@ -70,6 +70,9 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Capture workdir for use in the pre_exec callback.
+    let exec_workdir = args.workdir.clone();
+
     if has_mount_ns {
         // Open both fds in the parent (before fork) — inherited across fork.
         let mnt_ns_path = format!("/proc/{}/ns/mnt", pid);
@@ -101,8 +104,10 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if libc::chroot(dot.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                let slash = std::ffi::CString::new("/").unwrap();
-                if libc::chdir(slash.as_ptr()) != 0 {
+                // chdir to the requested workdir (or "/" if none).
+                let target = exec_workdir.as_deref().unwrap_or("/");
+                let target_c = std::ffi::CString::new(target).unwrap();
+                if libc::chdir(target_c.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -111,6 +116,10 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // No mount namespace to join — access rootfs via procfs.
         cmd = cmd.with_chroot(format!("/proc/{}/root", pid));
+        // For non-mount-ns exec, use the normal with_cwd mechanism.
+        if let Some(ref w) = exec_workdir {
+            cmd = cmd.with_cwd(w);
+        }
     }
 
     // Apply container environment as base
@@ -125,11 +134,6 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         } else if let Ok(v) = std::env::var(e) {
             cmd = cmd.env(e, v);
         }
-    }
-
-    // Working directory
-    if let Some(ref w) = args.workdir {
-        cmd = cmd.with_cwd(w);
     }
 
     // User

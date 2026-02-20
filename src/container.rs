@@ -1732,11 +1732,19 @@ impl Command {
             let merged = base.join("merged");
             std::fs::create_dir_all(&merged).map_err(Error::Io)?;
             // Auto-create ephemeral upper/work for image-layer mode.
+            // Directories are 0755 so that after setuid() to a non-root UID
+            // the overlay merged view remains accessible (the kernel checks
+            // upper/work dir permissions against the caller's fsuid).
             if ov.upper_dir.as_os_str().is_empty() {
                 let upper = base.join("upper");
                 let work = base.join("work");
                 std::fs::create_dir_all(&upper).map_err(Error::Io)?;
                 std::fs::create_dir_all(&work).map_err(Error::Io)?;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755));
+                let _ = std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o755));
+                let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755));
+                let _ = std::fs::set_permissions(&merged, std::fs::Permissions::from_mode(0o755));
                 ov.upper_dir = upper;
                 ov.work_dir = work;
             }
@@ -2167,26 +2175,6 @@ impl Command {
                     }
                 }
 
-                // Step 3: Set UID/GID if specified
-                if let Some(gid_val) = gid {
-                    let result = libc::setgid(gid_val);
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setgid: {}",
-                            io::Error::last_os_error()
-                        )));
-                    }
-                }
-                if let Some(uid_val) = uid {
-                    let result = libc::setuid(uid_val);
-                    if result != 0 {
-                        return Err(io::Error::other(format!(
-                            "setuid: {}",
-                            io::Error::last_os_error()
-                        )));
-                    }
-                }
-
                 // Step 3.5: Mount overlayfs (if configured).
                 // The merged dir becomes the effective root for chroot and bind mounts.
                 let overlay_merged: Option<&std::ffi::CString> =
@@ -2525,16 +2513,18 @@ impl Command {
                         .map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
                 }
 
-                // Step 4.5: Perform automatic mounts if requested
+                // Step 4.5: Perform automatic mounts if requested.
+                // IMPORTANT: Use absolute paths for mount targets — cwd may not
+                // be "/" if the caller used with_cwd().
                 if mount_proc {
-                    // Mount new proc filesystem at /proc
-                    let proc = CString::new("proc").unwrap();
+                    let proc_src = CString::new("proc").unwrap();
+                    let proc_tgt = CString::new("/proc").unwrap();
                     let result = libc::mount(
-                        proc.as_ptr(), // source
-                        proc.as_ptr(), // target (/proc)
-                        proc.as_ptr(), // fstype (proc)
-                        0,             // flags
-                        ptr::null(),   // data
+                        proc_src.as_ptr(), // source
+                        proc_tgt.as_ptr(), // target
+                        proc_src.as_ptr(), // fstype (proc)
+                        0,                 // flags
+                        ptr::null(),       // data
                     );
                     // In rootless mode OR with a USER namespace, proc mount fails (EPERM or
                     // EINVAL) because the PID namespace is not owned by our user namespace.
@@ -2747,6 +2737,8 @@ impl Command {
                 }
 
                 // Step 5: Run user-provided pre_exec callback
+                // MUST run before setuid — exec's callback does setns(CLONE_NEWNS)
+                // which requires CAP_SYS_ADMIN.
                 if let Some(ref callback) = user_pre_exec {
                     callback()?;
                 }
@@ -2757,6 +2749,29 @@ impl Command {
                     let result = libc::setns(*fd, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 6.1: Set UID/GID if specified.
+                // MUST come after all privileged operations (overlay mount, chroot,
+                // /proc, /dev, bind mounts, capabilities, user callback, ns joins)
+                // because those need root.
+                if let Some(gid_val) = gid {
+                    let result = libc::setgid(gid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setgid: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+                if let Some(uid_val) = uid {
+                    let result = libc::setuid(uid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setuid: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
@@ -3550,20 +3565,6 @@ impl Command {
                     }
                 }
 
-                // Step 3: Set UID/GID if specified.
-                if let Some(gid_val) = gid {
-                    let result = libc::setgid(gid_val);
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                if let Some(uid_val) = uid {
-                    let result = libc::setuid(uid_val);
-                    if result != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-
                 // Step 3.5: Mount overlayfs (if configured).
                 let overlay_merged: Option<&std::ffi::CString> =
                     if let Some((lower, upper, work, merged)) = &overlay_cstrings {
@@ -3868,9 +3869,15 @@ impl Command {
                 }
 
                 if mount_proc {
-                    let proc = CString::new("proc").unwrap();
-                    let result =
-                        libc::mount(proc.as_ptr(), proc.as_ptr(), proc.as_ptr(), 0, ptr::null());
+                    let proc_src = CString::new("proc").unwrap();
+                    let proc_tgt = CString::new("/proc").unwrap();
+                    let result = libc::mount(
+                        proc_src.as_ptr(),
+                        proc_tgt.as_ptr(),
+                        proc_src.as_ptr(),
+                        0,
+                        ptr::null(),
+                    );
                     // In rootless mode, proc mount fails without an owned PID namespace.
                     // With USER+PID (auto-added by spawn()), proc succeeds. Only skip in rootless.
                     if result != 0 && !is_rootless {
@@ -4045,6 +4052,8 @@ impl Command {
                     }
                 }
 
+                // User callback BEFORE setuid — exec's callback does setns
+                // which requires CAP_SYS_ADMIN.
                 if let Some(cb) = &user_pre_exec {
                     cb()?;
                 }
@@ -4053,6 +4062,26 @@ impl Command {
                     let result = libc::setns(*fd, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Set UID/GID after all privileged operations (user callback, ns joins).
+                if let Some(gid_val) = gid {
+                    let result = libc::setgid(gid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setgid: {}",
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+                if let Some(uid_val) = uid {
+                    let result = libc::setuid(uid_val);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "setuid: {}",
+                            io::Error::last_os_error()
+                        )));
                     }
                 }
 
