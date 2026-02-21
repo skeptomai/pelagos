@@ -16,6 +16,10 @@ pub struct BuildArgs {
     #[clap(long, default_value = "auto")]
     pub network: String,
 
+    /// Disable build cache (re-run all steps)
+    #[clap(long)]
+    pub no_cache: bool,
+
     /// Build context directory (default: current directory)
     #[clap(default_value = ".")]
     pub context: String,
@@ -68,7 +72,13 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Building {} from {}", args.tag, remfile_path.display());
 
-    let manifest = build::execute_build(&instructions, &context_dir, &args.tag, network_mode)?;
+    let manifest = build::execute_build(
+        &instructions,
+        &context_dir,
+        &args.tag,
+        network_mode,
+        !args.no_cache,
+    )?;
 
     eprintln!(
         "Successfully built {} ({} layers)",

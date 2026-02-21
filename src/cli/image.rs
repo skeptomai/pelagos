@@ -204,11 +204,22 @@ fn parse_image_config(config_json: &str) -> Result<ImageConfig, Box<dyn std::err
         .unwrap_or("")
         .to_string();
 
+    let labels = container_config
+        .and_then(|c| c.get("Labels"))
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(ImageConfig {
         env,
         cmd,
         entrypoint,
         working_dir,
         user,
+        labels,
     })
 }

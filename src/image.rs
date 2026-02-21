@@ -3,6 +3,7 @@
 //! This module is purely synchronous. Networking (registry pulls) lives in `cli::image`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -25,9 +26,12 @@ pub struct ImageConfig {
     /// Working directory inside the container, e.g. `"/app"`.
     #[serde(default)]
     pub working_dir: String,
-    /// User string, e.g. `"1000"` or `"nobody"`.
+    /// User string, e.g. `"1000"` or `"1000:1000"`.
     #[serde(default)]
     pub user: String,
+    /// Key-value labels (Docker `LABEL`).
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 /// Persisted metadata for a pulled image.
@@ -323,6 +327,7 @@ mod tests {
                 entrypoint: Vec::new(),
                 working_dir: String::new(),
                 user: String::new(),
+                labels: HashMap::new(),
             },
         };
         let json = serde_json::to_string(&manifest).unwrap();
@@ -344,6 +349,7 @@ mod tests {
                 entrypoint: Vec::new(),
                 working_dir: String::new(),
                 user: String::new(),
+                labels: HashMap::new(),
             },
         };
         let dirs = layer_dirs(&manifest);

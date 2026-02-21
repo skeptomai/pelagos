@@ -42,10 +42,11 @@
 //! (`ip netns del`).
 
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::process::Command as SysCmd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Bridge name used by all Remora containers.
 pub const BRIDGE_NAME: &str = "remora0";
@@ -85,7 +86,6 @@ pub struct NetworkConfig {
 }
 
 /// Runtime state from setting up bridge networking; needed for teardown.
-#[derive(Debug)]
 pub struct NetworkSetup {
     /// Name of the host-side veth interface (e.g. `vh-a1b2c3d4`).
     pub veth_host: String,
@@ -97,6 +97,21 @@ pub struct NetworkSetup {
     pub nat_enabled: bool,
     /// Port forwards configured for this container: `(host_port, container_port)`.
     pub port_forwards: Vec<(u16, u16)>,
+    /// Userspace TCP proxy stop flag — set to `true` to stop all proxy threads.
+    proxy_stop: Option<Arc<AtomicBool>>,
+}
+
+impl std::fmt::Debug for NetworkSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkSetup")
+            .field("veth_host", &self.veth_host)
+            .field("ns_name", &self.ns_name)
+            .field("container_ip", &self.container_ip)
+            .field("nat_enabled", &self.nat_enabled)
+            .field("port_forwards", &self.port_forwards)
+            .field("proxy_active", &self.proxy_stop.is_some())
+            .finish()
+    }
 }
 
 /// Runtime state for a pasta-backed container; holds the pasta process for teardown.
@@ -332,12 +347,21 @@ pub fn setup_bridge_network(
         enable_port_forwards(container_ip, &port_forwards)?;
     }
 
+    // 9. Start userspace TCP proxy for port forwards (handles localhost traffic
+    //    that nftables DNAT in PREROUTING cannot intercept).
+    let proxy_stop = if !port_forwards.is_empty() {
+        Some(start_port_proxies(container_ip, &port_forwards))
+    } else {
+        None
+    };
+
     Ok(NetworkSetup {
         veth_host,
         ns_name: ns_name.to_string(),
         container_ip,
         nat_enabled: nat,
         port_forwards,
+        proxy_stop,
     })
 }
 
@@ -351,6 +375,11 @@ pub fn setup_bridge_network(
 ///
 /// Errors are non-fatal (logged via `log::warn!`).
 pub fn teardown_network(setup: &NetworkSetup) {
+    // Stop userspace TCP proxies first so they don't try to connect to a
+    // vanishing container IP after the veth is deleted.
+    if let Some(ref stop) = setup.proxy_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
     if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
         log::warn!("network teardown veth (non-fatal): {}", e);
     }
@@ -702,6 +731,134 @@ fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
             log::warn!("nft rebuild prerouting (non-fatal): {}", e);
         }
     }
+}
+
+// ── Userspace TCP port proxy ─────────────────────────────────────────────────
+
+/// Start background TCP proxy threads for each port mapping.
+///
+/// nftables DNAT rules in the PREROUTING chain handle traffic from external
+/// hosts, but traffic originating from localhost bypasses PREROUTING entirely
+/// (it goes through OUTPUT). Docker solves this with `docker-proxy` — a
+/// userspace TCP relay. This is Remora's equivalent.
+///
+/// Each port mapping gets a `TcpListener` on `0.0.0.0:{host_port}`. Accepted
+/// connections are relayed bidirectionally to `{container_ip}:{container_port}`.
+/// Returns a stop flag that must be set to `true` on teardown.
+fn start_port_proxies(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+
+    for &(host_port, container_port) in forwards {
+        let stop = Arc::clone(&stop);
+        let target = SocketAddr::from((container_ip, container_port));
+
+        std::thread::spawn(move || {
+            let listener = match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], host_port))) {
+                Ok(l) => l,
+                Err(e) => {
+                    log::warn!(
+                        "port proxy: cannot bind 0.0.0.0:{}: {} (nftables DNAT still active)",
+                        host_port,
+                        e
+                    );
+                    return;
+                }
+            };
+            // Non-blocking accept so we can check the stop flag periodically.
+            listener
+                .set_nonblocking(true)
+                .expect("set_nonblocking failed");
+
+            log::debug!("port proxy: 0.0.0.0:{} -> {}", host_port, target);
+
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((client, _addr)) => {
+                        let target = target;
+                        let stop = Arc::clone(&stop);
+                        std::thread::spawn(move || {
+                            proxy_relay(client, target, &stop);
+                        });
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        if !stop.load(Ordering::Relaxed) {
+                            log::warn!("port proxy accept error on port {}: {}", host_port, e);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    stop
+}
+
+/// Bidirectional TCP relay between a client socket and a container target.
+///
+/// Uses two threads (one per direction). Terminates when either side closes
+/// or the stop flag is set.
+fn proxy_relay(client: TcpStream, target: SocketAddr, stop: &AtomicBool) {
+    let upstream = match TcpStream::connect_timeout(&target, std::time::Duration::from_secs(5)) {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("port proxy: cannot connect to {}: {}", target, e);
+            return;
+        }
+    };
+
+    // Set read timeouts so threads check the stop flag periodically.
+    let timeout = Some(std::time::Duration::from_millis(200));
+    let _ = client.set_read_timeout(timeout);
+    let _ = upstream.set_read_timeout(timeout);
+
+    let client_r = client;
+    let upstream_r = upstream;
+    let client_w = match client_r.try_clone() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let upstream_w = match upstream_r.try_clone() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let stop_flag = stop as *const AtomicBool as usize; // share across threads
+    let t1 = std::thread::spawn(move || {
+        let stop = unsafe { &*(stop_flag as *const AtomicBool) };
+        copy_until_done(client_r, upstream_w, stop);
+    });
+    let t2 = std::thread::spawn(move || {
+        let stop = unsafe { &*(stop_flag as *const AtomicBool) };
+        copy_until_done(upstream_r, client_w, stop);
+    });
+
+    let _ = t1.join();
+    let _ = t2.join();
+}
+
+/// Copy bytes from `reader` to `writer` until EOF, error, or stop flag.
+fn copy_until_done(mut reader: TcpStream, mut writer: TcpStream, stop: &AtomicBool) {
+    let mut buf = [0u8; 8192];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                if std::io::Write::write_all(&mut writer, &buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = writer.shutdown(std::net::Shutdown::Write);
 }
 
 // ── N5: pasta user-mode networking ───────────────────────────────────────────

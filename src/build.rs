@@ -44,9 +44,12 @@ pub enum Instruction {
     Run(String),
     Copy { src: String, dest: String },
     Cmd(Vec<String>),
+    Entrypoint(Vec<String>),
     Env { key: String, value: String },
     Workdir(String),
     Expose(u16),
+    Label { key: String, value: String },
+    User(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +137,13 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                 }
                 instructions.push(Instruction::Workdir(rest.to_string()));
             }
+            "ENTRYPOINT" => {
+                let ep = parse_cmd_value(rest).map_err(|msg| BuildError::Parse {
+                    line: line_num,
+                    message: msg,
+                })?;
+                instructions.push(Instruction::Entrypoint(ep));
+            }
             "EXPOSE" => {
                 let port: u16 = rest
                     .split('/')
@@ -145,6 +155,22 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                         message: format!("invalid port number: {}", rest),
                     })?;
                 instructions.push(Instruction::Expose(port));
+            }
+            "LABEL" => {
+                let (key, value) = parse_label_value(rest).ok_or_else(|| BuildError::Parse {
+                    line: line_num,
+                    message: "LABEL requires KEY=VALUE".to_string(),
+                })?;
+                instructions.push(Instruction::Label { key, value });
+            }
+            "USER" => {
+                if rest.is_empty() {
+                    return Err(BuildError::Parse {
+                        line: line_num,
+                        message: "USER requires a user spec (e.g. 1000 or 1000:1000)".to_string(),
+                    });
+                }
+                instructions.push(Instruction::User(rest.to_string()));
             }
             other => {
                 return Err(BuildError::Parse {
@@ -190,6 +216,25 @@ fn parse_cmd_value(rest: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// Parse LABEL: supports `KEY=VALUE` or `KEY="quoted value"`.
+fn parse_label_value(rest: &str) -> Option<(String, String)> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (k, v) = trimmed.split_once('=')?;
+    let k = k.trim();
+    let v = v.trim();
+    // Strip surrounding quotes if present.
+    let v =
+        if (v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')) {
+            &v[1..v.len() - 1]
+        } else {
+            v
+        };
+    Some((k.to_string(), v.to_string()))
+}
+
 /// Parse ENV: supports `KEY=VALUE` or `KEY VALUE`.
 fn parse_env_value(rest: &str) -> Option<(String, String)> {
     let trimmed = rest.trim();
@@ -214,11 +259,15 @@ fn parse_env_value(rest: &str) -> Option<(String, String)> {
 /// `context_dir` is the directory context for COPY instructions.
 /// `tag` is the image reference (e.g. `"myapp:latest"`).
 /// `network_mode` is the network for RUN steps (bridge for root, pasta for rootless).
+/// `use_cache` enables layer caching: if a RUN instruction's cache key matches
+/// a previously built layer, that layer is reused without re-executing the command.
+/// A cache miss invalidates all subsequent steps (same as Docker).
 pub fn execute_build(
     instructions: &[Instruction],
     context_dir: &Path,
     tag: &str,
     network_mode: NetworkMode,
+    use_cache: bool,
 ) -> Result<ImageManifest, BuildError> {
     if instructions.is_empty() {
         return Err(BuildError::MissingFrom);
@@ -239,6 +288,8 @@ pub fn execute_build(
     let mut layers: Vec<String> = base_manifest.layers.clone();
     let mut config = base_manifest.config.clone();
     let total = instructions.len();
+    // Once a cache miss occurs, all subsequent steps run uncached.
+    let mut cache_active = use_cache;
 
     for (idx, instr) in instructions.iter().enumerate() {
         let step = idx + 1;
@@ -247,13 +298,33 @@ pub fn execute_build(
                 eprintln!("Step {}/{}: FROM {}", step, total, r);
             }
             Instruction::Run(ref cmd_text) => {
+                // Build cache: hash(parent_layer_digest + instruction) → cached layer.
+                let cache_key = if cache_active {
+                    Some(compute_cache_key(&layers, &format!("RUN {}", cmd_text)))
+                } else {
+                    None
+                };
+                if let Some(ref key) = cache_key {
+                    if let Some(cached_digest) = cache_lookup(key) {
+                        eprintln!("Step {}/{}: RUN {} (cached)", step, total, cmd_text);
+                        layers.push(cached_digest);
+                        continue;
+                    }
+                }
+                // Cache miss — invalidate for all subsequent steps.
+                cache_active = false;
                 eprintln!("Step {}/{}: RUN {}", step, total, cmd_text);
                 let new_digest = execute_run(cmd_text, &layers, &config, network_mode.clone())?;
-                if let Some(digest) = new_digest {
-                    layers.push(digest);
+                if let Some(ref digest) = new_digest {
+                    if let Some(ref key) = cache_key {
+                        cache_store(key, digest);
+                    }
+                    layers.push(digest.clone());
                 }
             }
             Instruction::Copy { ref src, ref dest } => {
+                // COPY always invalidates cache (context content may have changed).
+                cache_active = false;
                 eprintln!("Step {}/{}: COPY {} {}", step, total, src, dest);
                 let digest = execute_copy(src, dest, context_dir)?;
                 layers.push(digest);
@@ -272,9 +343,21 @@ pub fn execute_build(
                 eprintln!("Step {}/{}: WORKDIR {}", step, total, path);
                 config.working_dir = path.clone();
             }
+            Instruction::Entrypoint(ref args) => {
+                eprintln!("Step {}/{}: ENTRYPOINT {:?}", step, total, args);
+                config.entrypoint = args.clone();
+            }
             Instruction::Expose(port) => {
                 eprintln!("Step {}/{}: EXPOSE {}", step, total, port);
                 // Metadata only — no layer created.
+            }
+            Instruction::Label { ref key, ref value } => {
+                eprintln!("Step {}/{}: LABEL {}={}", step, total, key, value);
+                config.labels.insert(key.clone(), value.clone());
+            }
+            Instruction::User(ref user) => {
+                eprintln!("Step {}/{}: USER {}", step, total, user);
+                config.user = user.clone();
             }
         }
     }
@@ -549,6 +632,50 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Build cache
+// ---------------------------------------------------------------------------
+
+/// Compute a cache key from the current layer stack and instruction text.
+///
+/// Key = sha256(last_layer_digest + "\n" + instruction_text).
+/// Using only the top layer (not all layers) is sufficient because the top layer
+/// digest already transitively depends on everything below it.
+fn compute_cache_key(layers: &[String], instruction: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    if let Some(top) = layers.last() {
+        hasher.update(top.as_bytes());
+    }
+    hasher.update(b"\n");
+    hasher.update(instruction.as_bytes());
+    let hash = hasher.finalize();
+    format!("{:x}", hash)
+}
+
+/// Look up a cached layer digest by cache key.
+fn cache_lookup(key: &str) -> Option<String> {
+    let path = crate::paths::build_cache_dir().join(key);
+    let digest = std::fs::read_to_string(&path).ok()?;
+    let digest = digest.trim().to_string();
+    // Verify the layer still exists on disk.
+    if image::layer_exists(&digest) {
+        Some(digest)
+    } else {
+        // Stale cache entry — layer was removed.
+        let _ = std::fs::remove_file(&path);
+        None
+    }
+}
+
+/// Store a cache entry mapping key → layer digest.
+fn cache_store(key: &str, digest: &str) {
+    let dir = crate::paths::build_cache_dir();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(key), digest);
+    }
+}
+
 /// Compute a deterministic digest from the ordered layer list.
 fn compute_manifest_digest(layers: &[String]) -> String {
     use sha2::{Digest, Sha256};
@@ -771,5 +898,109 @@ CMD ["/bin/sh", "-c", "echo hello"]"#;
         let content = "";
         let instructions = parse_remfile(content).unwrap();
         assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_entrypoint_json_form() {
+        let content = r#"FROM alpine
+ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Entrypoint(vec![
+                "/usr/bin/python3".into(),
+                "-m".into(),
+                "http.server".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_entrypoint_shell_form() {
+        let content = "FROM alpine\nENTRYPOINT /usr/bin/myapp";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Entrypoint(vec!["/bin/sh".into(), "-c".into(), "/usr/bin/myapp".into()])
+        );
+    }
+
+    #[test]
+    fn test_parse_label() {
+        let content = "FROM alpine\nLABEL maintainer=\"John Doe\"";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Label {
+                key: "maintainer".into(),
+                value: "John Doe".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_label_unquoted() {
+        let content = "FROM alpine\nLABEL version=1.0";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Label {
+                key: "version".into(),
+                value: "1.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_user() {
+        let content = "FROM alpine\nUSER 1000:1000";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(instructions[1], Instruction::User("1000:1000".into()));
+    }
+
+    #[test]
+    fn test_parse_user_name() {
+        let content = "FROM alpine\nUSER nobody";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(instructions[1], Instruction::User("nobody".into()));
+    }
+
+    #[test]
+    fn test_parse_error_empty_user() {
+        let content = "FROM alpine\nUSER";
+        let err = parse_remfile(content).unwrap_err();
+        assert!(err.to_string().contains("USER requires"));
+    }
+
+    #[test]
+    fn test_parse_error_empty_label() {
+        let content = "FROM alpine\nLABEL";
+        let err = parse_remfile(content).unwrap_err();
+        assert!(err.to_string().contains("LABEL requires"));
+    }
+
+    #[test]
+    fn test_cache_key_deterministic() {
+        let layers = vec!["sha256:aaa".to_string()];
+        let k1 = compute_cache_key(&layers, "RUN echo hello");
+        let k2 = compute_cache_key(&layers, "RUN echo hello");
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_instruction() {
+        let layers = vec!["sha256:aaa".to_string()];
+        let k1 = compute_cache_key(&layers, "RUN echo hello");
+        let k2 = compute_cache_key(&layers, "RUN echo world");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_layers() {
+        let l1 = vec!["sha256:aaa".to_string()];
+        let l2 = vec!["sha256:bbb".to_string()];
+        let k1 = compute_cache_key(&l1, "RUN echo hello");
+        let k2 = compute_cache_key(&l2, "RUN echo hello");
+        assert_ne!(k1, k2);
     }
 }

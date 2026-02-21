@@ -127,16 +127,17 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **N1 Loopback**: `with_network(NetworkMode::Loopback)` — isolated NET namespace, lo brought up via ioctl (127.0.0.1 active)
 - **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via `/run/remora/next_ip`
 - **N3 NAT**: `with_nat()` — nftables MASQUERADE, reference-counted via `/run/remora/nat_refcount`
-- **N4 Port mapping**: `with_port_forward(host_port, container_port)` — TCP DNAT via nftables prerouting
+- **N4 Port mapping**: `with_port_forward(host_port, container_port)` — TCP DNAT via nftables prerouting + userspace TCP proxy for localhost access
 - **N5 DNS**: `with_dns(&[...])` — writes to `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it into the container; shared rootfs is never modified; requires `Namespace::MOUNT` + `with_chroot`
 - **N6 Pasta**: `with_network(NetworkMode::Pasta)` — user-mode networking via `pasta`; rootless-compatible full internet access; attaches to container netns via `/proc/{pid}/ns/net` after exec
 - **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay cleaned up in `wait()` / `wait_with_output()`
-- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`
+- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`, `start_port_proxies()`, `proxy_relay()`
 
 **Image Build (COMPLETE ✅):**
 - **`remora build -t <tag> [--file <path>] [--network bridge|pasta] [context]`**: build images from Remfiles
-- **Remfile parser**: FROM, RUN, COPY, CMD (JSON + shell form), ENV, WORKDIR, EXPOSE
+- **Remfile parser**: FROM, RUN, COPY, CMD, ENTRYPOINT (JSON + shell form), ENV, WORKDIR, EXPOSE, LABEL, USER
 - **Build engine**: overlay snapshot per RUN step, context COPY as layers, config-only instructions
+- **Build cache**: sha256(parent_layer + instruction) keyed layer cache; `--no-cache` flag to bypass
 - **Layer creation**: tar+gzip for sha256 digest, extracted dir stored in layer store (dedup)
 - **Path traversal protection**: COPY rejects sources outside the build context
 - **`wait_preserve_overlay()`**: Child method that skips overlay cleanup for build engine

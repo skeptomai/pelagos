@@ -254,6 +254,15 @@ fn build_image_run(
         cmd = cmd.with_cwd(&manifest.config.working_dir);
     }
 
+    // Apply image config user as default (CLI --user overrides).
+    if args.user.is_none() && !manifest.config.user.is_empty() {
+        let (uid, gid) = parse_user(&manifest.config.user)?;
+        cmd = cmd.with_uid(uid);
+        if let Some(g) = gid {
+            cmd = cmd.with_gid(g);
+        }
+    }
+
     // Apply shared CLI options (network, volumes, security, etc.)
     cmd = apply_cli_options(cmd, args, port_forwards, network_mode)?;
 

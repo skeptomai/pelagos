@@ -87,6 +87,11 @@ pub fn counter_file() -> PathBuf {
     data_dir().join("container_counter")
 }
 
+/// Build cache directory: `<data>/build-cache/`.
+pub fn build_cache_dir() -> PathBuf {
+    data_dir().join("build-cache")
+}
+
 // ── Derived from runtime_dir() ──────────────────────────────────────────────
 
 /// Per-container state directories: `<runtime>/containers/`.
