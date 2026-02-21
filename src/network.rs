@@ -41,6 +41,7 @@
 //! Teardown removes the host-side veth (`ip link del`) and the named netns
 //! (`ip netns del`).
 
+use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
@@ -48,14 +49,206 @@ use std::process::Command as SysCmd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Bridge name used by all Remora containers.
+// ── Ipv4Net ──────────────────────────────────────────────────────────────────
+
+/// A compact IPv4 network (address + prefix length), e.g. `10.88.1.0/24`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ipv4Net {
+    pub addr: Ipv4Addr,
+    pub prefix_len: u8,
+}
+
+impl Ipv4Net {
+    /// Parse a CIDR string like `"10.88.1.0/24"`.
+    pub fn from_cidr(s: &str) -> Result<Self, String> {
+        let (addr_s, len_s) = s
+            .split_once('/')
+            .ok_or_else(|| format!("invalid CIDR '{}': expected ADDR/LEN", s))?;
+        let addr: Ipv4Addr = addr_s
+            .parse()
+            .map_err(|e| format!("invalid IP in '{}': {}", s, e))?;
+        let prefix_len: u8 = len_s
+            .parse()
+            .map_err(|e| format!("invalid prefix in '{}': {}", s, e))?;
+        if prefix_len > 32 {
+            return Err(format!("prefix length {} > 32", prefix_len));
+        }
+        Ok(Ipv4Net { addr, prefix_len })
+    }
+
+    fn mask(&self) -> u32 {
+        if self.prefix_len == 0 {
+            0
+        } else {
+            !0u32 << (32 - self.prefix_len)
+        }
+    }
+
+    /// Network address (e.g. `10.88.1.0` for `10.88.1.5/24`).
+    pub fn network(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.addr) & self.mask())
+    }
+
+    /// Broadcast address (e.g. `10.88.1.255` for `10.88.1.0/24`).
+    pub fn broadcast(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.addr) | !self.mask())
+    }
+
+    /// Gateway — conventionally `.1` in the subnet.
+    pub fn gateway(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network()) + 1)
+    }
+
+    /// First usable host IP (gateway + 1, i.e. `.2`).
+    pub fn host_min(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network()) + 2)
+    }
+
+    /// Last usable host IP (broadcast - 1).
+    pub fn host_max(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.broadcast()) - 1)
+    }
+
+    /// Whether this subnet contains the given IP.
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        (u32::from(ip) & self.mask()) == (u32::from(self.addr) & self.mask())
+    }
+
+    /// Whether two subnets overlap.
+    pub fn overlaps(&self, other: &Ipv4Net) -> bool {
+        // Two networks overlap iff either contains the other's network address.
+        let smaller_prefix = self.prefix_len.min(other.prefix_len);
+        let mask = if smaller_prefix == 0 {
+            0
+        } else {
+            !0u32 << (32 - smaller_prefix)
+        };
+        (u32::from(self.addr) & mask) == (u32::from(other.addr) & mask)
+    }
+
+    /// CIDR string for the network (e.g. `"10.88.1.0/24"`).
+    pub fn cidr_string(&self) -> String {
+        format!("{}/{}", self.network(), self.prefix_len)
+    }
+
+    /// Gateway with prefix for `ip addr add` (e.g. `"10.88.1.1/24"`).
+    pub fn gateway_cidr(&self) -> String {
+        format!("{}/{}", self.gateway(), self.prefix_len)
+    }
+}
+
+impl std::fmt::Display for Ipv4Net {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix_len)
+    }
+}
+
+// ── NetworkDef ───────────────────────────────────────────────────────────────
+
+/// Persistent definition of a named network (stored in config dir).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkDef {
+    pub name: String,
+    pub subnet: Ipv4Net,
+    pub gateway: Ipv4Addr,
+    pub bridge_name: String,
+}
+
+impl NetworkDef {
+    /// Load a network definition from `<data>/networks/<name>/config.json`.
+    pub fn load(name: &str) -> io::Result<Self> {
+        let path = crate::paths::network_config_dir(name).join("config.json");
+        let data = std::fs::read_to_string(&path).map_err(|e| {
+            io::Error::other(format!(
+                "network '{}' not found ({}): {}",
+                name,
+                path.display(),
+                e
+            ))
+        })?;
+        serde_json::from_str(&data).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    /// Save this network definition to `<data>/networks/<name>/config.json`.
+    pub fn save(&self) -> io::Result<()> {
+        let dir = crate::paths::network_config_dir(&self.name);
+        std::fs::create_dir_all(&dir)?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| io::Error::other(e.to_string()))?;
+        std::fs::write(dir.join("config.json"), json)
+    }
+
+    /// nftables table name for this network (e.g. `"remora-frontend"`).
+    pub fn nft_table_name(&self) -> String {
+        format!("remora-{}", self.name)
+    }
+}
+
+/// Bootstrap or load the default `remora0` network definition.
+///
+/// If a config file exists on disk, loads it. Otherwise creates the default
+/// definition (`172.19.0.0/24`, bridge `remora0`) and persists it.
+/// Also migrates old global state files to per-network directories if they exist.
+pub fn bootstrap_default_network() -> io::Result<NetworkDef> {
+    let config_path = crate::paths::network_config_dir("remora0").join("config.json");
+    if config_path.exists() {
+        return NetworkDef::load("remora0");
+    }
+
+    let net = NetworkDef {
+        name: "remora0".to_string(),
+        subnet: Ipv4Net {
+            addr: Ipv4Addr::new(172, 19, 0, 0),
+            prefix_len: 24,
+        },
+        gateway: Ipv4Addr::new(172, 19, 0, 1),
+        bridge_name: "remora0".to_string(),
+    };
+    net.save()?;
+
+    // Migrate old global IPAM file to per-network dir if it exists.
+    // Only next_ip is migrated — nat_refcount and port_forwards tracked
+    // state for the old `ip remora` nft table which no longer exists
+    // (now `ip remora-remora0`), so stale values would poison refcounts.
+    let rt = crate::paths::runtime_dir();
+    let net_rt = crate::paths::network_runtime_dir("remora0");
+    let old_ipam = rt.join("next_ip");
+    let new_ipam = net_rt.join("next_ip");
+    if old_ipam.exists() && !new_ipam.exists() {
+        std::fs::create_dir_all(&net_rt)?;
+        if let Err(e) = std::fs::rename(&old_ipam, &new_ipam) {
+            log::warn!(
+                "migrate {} → {}: {}",
+                old_ipam.display(),
+                new_ipam.display(),
+                e
+            );
+        }
+    }
+    // Remove stale old-format files (they reference the old nft table name).
+    let _ = std::fs::remove_file(rt.join("nat_refcount"));
+    let _ = std::fs::remove_file(rt.join("port_forwards"));
+
+    Ok(net)
+}
+
+/// Load a network definition by name.
+///
+/// For `"remora0"`, calls [`bootstrap_default_network`] to ensure it exists.
+/// For other names, loads from config dir.
+pub fn load_network_def(name: &str) -> io::Result<NetworkDef> {
+    if name == "remora0" {
+        bootstrap_default_network()
+    } else {
+        NetworkDef::load(name)
+    }
+}
+
+// Legacy constants — kept for reference but internal code now uses NetworkDef.
+/// Bridge name for the default network.
 pub const BRIDGE_NAME: &str = "remora0";
-/// Gateway IP assigned to the bridge (also the default route for containers).
+/// Gateway IP for the default network.
 pub const BRIDGE_GW: &str = "172.19.0.1";
-/// CIDR for the bridge subnet.
-const BRIDGE_CIDR: &str = "172.19.0.1/24";
-// Network state files are resolved via crate::paths (rootless-aware).
-// Legacy constants removed — use crate::paths::{runtime_dir,ipam_file,...}().
 
 /// Monotonically increasing counter for generating unique netns/veth names.
 static NS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -66,17 +259,40 @@ static NS_COUNTER: AtomicU32 = AtomicU32::new(0);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
     /// Share the host's network stack (default — no changes).
-    None = 0,
+    None,
     /// Isolated network namespace with loopback only.
-    Loopback = 1,
-    /// Full connectivity via the `remora0` bridge (172.19.0.x/24).
-    Bridge = 2,
+    Loopback,
+    /// Full connectivity via the default `remora0` bridge (172.19.0.x/24).
+    ///
+    /// Normalized to `BridgeNamed("remora0")` internally by `with_network()`.
+    Bridge,
+    /// Full connectivity via a named bridge network.
+    ///
+    /// The string is the network name (e.g. `"frontend"`). The corresponding
+    /// `NetworkDef` is loaded at spawn time via [`load_network_def`].
+    BridgeNamed(String),
     /// User-mode networking via `pasta` — rootless-compatible, full internet access.
     ///
     /// pasta creates a TAP interface inside the container's network namespace and
     /// relays packets to/from the host using ordinary userspace sockets, requiring
     /// no kernel privileges. Works for both root and rootless containers.
-    Pasta = 3,
+    Pasta,
+}
+
+impl NetworkMode {
+    /// Returns `true` for any bridge-based mode (Bridge or BridgeNamed).
+    pub fn is_bridge(&self) -> bool {
+        matches!(self, NetworkMode::Bridge | NetworkMode::BridgeNamed(_))
+    }
+
+    /// Extract the network name for bridge modes. Returns `None` for non-bridge modes.
+    pub fn bridge_network_name(&self) -> Option<&str> {
+        match self {
+            NetworkMode::Bridge => Some("remora0"),
+            NetworkMode::BridgeNamed(name) => Some(name),
+            _ => None,
+        }
+    }
 }
 
 /// Network configuration for a container.
@@ -91,7 +307,7 @@ pub struct NetworkSetup {
     pub veth_host: String,
     /// Name of the named network namespace (e.g. `rem-12345-0`).
     pub ns_name: String,
-    /// IP assigned to the container inside `remora0`'s subnet.
+    /// IP assigned to the container inside the bridge subnet.
     pub container_ip: Ipv4Addr,
     /// Whether NAT (MASQUERADE) was enabled for this container.
     pub nat_enabled: bool,
@@ -99,6 +315,8 @@ pub struct NetworkSetup {
     pub port_forwards: Vec<(u16, u16)>,
     /// Userspace TCP proxy stop flag — set to `true` to stop all proxy threads.
     proxy_stop: Option<Arc<AtomicBool>>,
+    /// Name of the network this setup belongs to (e.g. `"remora0"`, `"frontend"`).
+    pub network_name: String,
 }
 
 impl std::fmt::Debug for NetworkSetup {
@@ -110,6 +328,7 @@ impl std::fmt::Debug for NetworkSetup {
             .field("nat_enabled", &self.nat_enabled)
             .field("port_forwards", &self.port_forwards)
             .field("proxy_active", &self.proxy_stop.is_some())
+            .field("network_name", &self.network_name)
             .finish()
     }
 }
@@ -193,39 +412,43 @@ pub fn bring_up_loopback() -> io::Result<()> {
 
 // ── N2: Bridge + veth ────────────────────────────────────────────────────────
 
-/// Ensure the `remora0` bridge exists, has its IP, and is up.
+/// Ensure the bridge for a network exists, has its IP, and is up.
 ///
 /// Idempotent — safe to call for every container spawn.
-fn ensure_bridge() -> io::Result<()> {
+fn ensure_bridge(net: &NetworkDef) -> io::Result<()> {
     // Create bridge (ignore error if it already exists)
     let _ = SysCmd::new("ip")
-        .args(["link", "add", BRIDGE_NAME, "type", "bridge"])
+        .args(["link", "add", &net.bridge_name, "type", "bridge"])
         .stderr(std::process::Stdio::null())
         .status();
 
     // Assign gateway IP (ignore error if already assigned)
+    let gw_cidr = net.subnet.gateway_cidr();
     let _ = SysCmd::new("ip")
-        .args(["addr", "add", BRIDGE_CIDR, "dev", BRIDGE_NAME])
+        .args(["addr", "add", &gw_cidr, "dev", &net.bridge_name])
         .stderr(std::process::Stdio::null())
         .status();
 
     // Bring up (idempotent)
-    run("ip", &["link", "set", BRIDGE_NAME, "up"])
+    run("ip", &["link", "set", &net.bridge_name, "up"])
 }
 
-/// Allocate the next IP from the 172.19.0.x/24 pool.
+/// Allocate the next IP from the network's subnet pool.
 ///
-/// Uses `flock(LOCK_EX)` on `/run/remora/next_ip` to serialize concurrent
-/// spawns. Wraps at 254 (skipping 0=network, 1=gateway, 255=broadcast).
-fn allocate_ip() -> io::Result<Ipv4Addr> {
-    std::fs::create_dir_all(crate::paths::runtime_dir())?;
+/// Uses `flock(LOCK_EX)` on the per-network IPAM file to serialize concurrent
+/// spawns. Stores/reads full IP strings to support arbitrary subnets.
+fn allocate_ip(net: &NetworkDef) -> io::Result<Ipv4Addr> {
+    let ipam_path = crate::paths::network_ipam_file(&net.name);
+    if let Some(parent) = ipam_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(crate::paths::ipam_file())?;
+        .open(&ipam_path)?;
 
     // Exclusive lock — blocks until other spawns release their lock.
     unsafe {
@@ -235,13 +458,27 @@ fn allocate_ip() -> io::Result<Ipv4Addr> {
     let mut content = String::new();
     file.read_to_string(&mut content)?;
 
-    let current: u8 = content.trim().parse().unwrap_or(2);
-    let ip = Ipv4Addr::new(172, 19, 0, current);
+    let host_min = u32::from(net.subnet.host_min());
+    let host_max = u32::from(net.subnet.host_max());
 
-    // Advance, wrapping around. Skip 0, 1 (network/gateway), 255 (broadcast).
-    let next = match current.wrapping_add(1) {
-        0 | 1 | 255 => 2,
-        n => n,
+    // Parse current IP (full string like "10.88.1.2"), default to host_min.
+    let current: Ipv4Addr = content.trim().parse().unwrap_or(net.subnet.host_min());
+    let current_u32 = u32::from(current);
+
+    // Clamp to valid range.
+    let ip_u32 = if current_u32 < host_min || current_u32 > host_max {
+        host_min
+    } else {
+        current_u32
+    };
+    let ip = Ipv4Addr::from(ip_u32);
+
+    // Advance, wrapping around within the subnet's host range.
+    let next_u32 = ip_u32 + 1;
+    let next = if next_u32 > host_max {
+        Ipv4Addr::from(host_min)
+    } else {
+        Ipv4Addr::from(next_u32)
     };
 
     file.seek(SeekFrom::Start(0))?;
@@ -273,14 +510,14 @@ fn veth_names_for(ns_name: &str) -> (String, String) {
 ///
 /// ## What this does
 ///
-/// 1. Ensures the `remora0` bridge exists (172.19.0.1/24) — idempotent.
-/// 2. Allocates a container IP via file-locked IPAM.
+/// 1. Loads the [`NetworkDef`] for `network_name` and ensures its bridge exists.
+/// 2. Allocates a container IP via file-locked per-network IPAM.
 /// 3. Creates a named netns: `ip netns add {ns_name}` → `/run/netns/{ns_name}`.
 /// 4. Brings up loopback inside the named netns.
 /// 5. Creates a `vh-{hash}` / `vp-{hash}` veth pair in the host netns.
 /// 6. Moves `vp-{hash}` into the named netns and renames it `eth0`.
 /// 7. Assigns the allocated IP and default route to `eth0`.
-/// 8. Attaches `vh-{hash}` to `remora0` and brings it up.
+/// 8. Attaches `vh-{hash}` to the network's bridge and brings it up.
 /// 9. If `nat` is true, enables IP forwarding and installs an nftables MASQUERADE rule.
 /// 10. If `port_forwards` is non-empty, installs nftables DNAT rules.
 ///
@@ -291,12 +528,14 @@ fn veth_names_for(ns_name: &str) -> (String, String) {
 /// after the container exits.
 pub fn setup_bridge_network(
     ns_name: &str,
+    network_name: &str,
     nat: bool,
     port_forwards: Vec<(u16, u16)>,
 ) -> io::Result<NetworkSetup> {
-    ensure_bridge()?;
+    let net_def = load_network_def(network_name)?;
+    ensure_bridge(&net_def)?;
 
-    let container_ip = allocate_ip()?;
+    let container_ip = allocate_ip(&net_def)?;
     let (veth_host, veth_peer) = veth_names_for(ns_name);
 
     // 1. Create the named netns — this creates /run/netns/{ns_name}
@@ -316,7 +555,8 @@ pub fn setup_bridge_network(
     // 4. Move the peer into the named netns
     run("ip", &["link", "set", &veth_peer, "netns", ns_name])?;
 
-    let ip_cidr = format!("{}/24", container_ip);
+    let ip_cidr = format!("{}/{}", container_ip, net_def.subnet.prefix_len);
+    let gw_str = net_def.gateway.to_string();
 
     // 5. Configure eth0 inside the named netns (rename, assign IP, bring up, add route)
     run(
@@ -330,21 +570,24 @@ pub fn setup_bridge_network(
     run("ip", &["-n", ns_name, "link", "set", "eth0", "up"])?;
     run(
         "ip",
-        &["-n", ns_name, "route", "add", "default", "via", BRIDGE_GW],
+        &["-n", ns_name, "route", "add", "default", "via", &gw_str],
     )?;
 
     // 6. Attach host-side veth to bridge and bring it up
-    run("ip", &["link", "set", &veth_host, "master", BRIDGE_NAME])?;
+    run(
+        "ip",
+        &["link", "set", &veth_host, "master", &net_def.bridge_name],
+    )?;
     run("ip", &["link", "set", &veth_host, "up"])?;
 
     // 7. Optionally enable NAT (MASQUERADE) for internet access.
     if nat {
-        enable_nat()?;
+        enable_nat(&net_def)?;
     }
 
     // 8. Optionally install port-forward (DNAT) rules.
     if !port_forwards.is_empty() {
-        enable_port_forwards(container_ip, &port_forwards)?;
+        enable_port_forwards(&net_def, container_ip, &port_forwards)?;
     }
 
     // 9. Start userspace TCP proxy for port forwards (handles localhost traffic
@@ -362,6 +605,7 @@ pub fn setup_bridge_network(
         nat_enabled: nat,
         port_forwards,
         proxy_stop,
+        network_name: network_name.to_string(),
     })
 }
 
@@ -386,17 +630,28 @@ pub fn teardown_network(setup: &NetworkSetup) {
     if let Err(e) = run("ip", &["netns", "del", &setup.ns_name]) {
         log::warn!("network teardown netns (non-fatal): {}", e);
     }
+    let net_def = match load_network_def(&setup.network_name) {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!(
+                "network teardown: cannot load network '{}': {}",
+                setup.network_name,
+                e
+            );
+            return;
+        }
+    };
     if !setup.port_forwards.is_empty() {
-        disable_port_forwards(setup.container_ip, &setup.port_forwards);
+        disable_port_forwards(&net_def, setup.container_ip, &setup.port_forwards);
     }
     if setup.nat_enabled {
-        disable_nat();
+        disable_nat(&net_def);
     }
 }
 
 // ── N3: NAT / MASQUERADE ─────────────────────────────────────────────────────
 
-/// nftables script that installs MASQUERADE + FORWARD rules for the remora subnet.
+/// Build the nftables script that installs MASQUERADE + FORWARD rules for a network.
 ///
 /// Uses `add` so the commands are idempotent if the table already exists
 /// (e.g. if a previous run crashed with the refcount > 0).
@@ -404,14 +659,19 @@ pub fn teardown_network(setup: &NetworkSetup) {
 /// The forward chain is required because the host's default FORWARD policy may
 /// be DROP (common on systems with a firewall). Without it, ICMP (ping) may
 /// work but TCP/UDP traffic is silently dropped.
-const NFT_ADD_SCRIPT: &str = "\
-add table ip remora
-add chain ip remora postrouting { type nat hook postrouting priority 100; }
-add rule ip remora postrouting ip saddr 172.19.0.0/24 oifname != \"remora0\" masquerade
-add chain ip remora forward { type filter hook forward priority 0; }
-add rule ip remora forward ip saddr 172.19.0.0/24 accept
-add rule ip remora forward ip daddr 172.19.0.0/24 accept
-";
+fn build_nat_script(net: &NetworkDef) -> String {
+    let table = net.nft_table_name();
+    let cidr = net.subnet.cidr_string();
+    let bridge = &net.bridge_name;
+    format!(
+        "add table ip {table}\n\
+         add chain ip {table} postrouting {{ type nat hook postrouting priority 100; }}\n\
+         add rule ip {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade\n\
+         add chain ip {table} forward {{ type filter hook forward priority 0; }}\n\
+         add rule ip {table} forward ip saddr {cidr} accept\n\
+         add rule ip {table} forward ip daddr {cidr} accept\n"
+    )
+}
 
 /// Pipe an nft script to `nft -f -`, returning an error on non-zero exit.
 fn run_nft(script: &str) -> io::Result<()> {
@@ -435,20 +695,45 @@ fn run_nft(script: &str) -> io::Result<()> {
     }
 }
 
+/// Like [`run_nft`] but suppresses stderr (for best-effort / migration commands).
+fn run_nft_quiet(script: &str) -> io::Result<()> {
+    use std::io::Write as IoWriteLocal;
+    use std::process::Stdio as ProcStdio;
+
+    let mut child = SysCmd::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(ProcStdio::piped())
+        .stdout(ProcStdio::null())
+        .stderr(ProcStdio::null())
+        .spawn()?;
+
+    child.stdin.as_mut().unwrap().write_all(script.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("nft -f - exited with {}", status)))
+    }
+}
+
 /// Increment the NAT refcount; install nftables rules when going 0 → 1.
 ///
-/// Uses `flock(LOCK_EX)` on [`crate::paths::nat_refcount_file()`] to serialise concurrent
-/// spawns. IP forwarding is written to `/proc/sys/net/ipv4/ip_forward`
+/// Uses `flock(LOCK_EX)` on the per-network NAT refcount file to serialise
+/// concurrent spawns. IP forwarding is written to `/proc/sys/net/ipv4/ip_forward`
 /// once (never disabled on teardown — other software may rely on it).
-fn enable_nat() -> io::Result<()> {
-    std::fs::create_dir_all(crate::paths::runtime_dir())?;
+fn enable_nat(net: &NetworkDef) -> io::Result<()> {
+    let refcount_path = crate::paths::network_nat_refcount_file(&net.name);
+    if let Some(parent) = refcount_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(crate::paths::nat_refcount_file())?;
+        .open(&refcount_path)?;
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
@@ -459,21 +744,28 @@ fn enable_nat() -> io::Result<()> {
     if count == 0 {
         // Enable IP forwarding.
         std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
+
+        // Migration: if this is the default network, remove the old global
+        // `ip remora` table that previous versions created.
+        if net.name == "remora0" {
+            let _ = run_nft_quiet("delete table ip remora\n");
+        }
+
         // Install the nftables MASQUERADE rule set.
-        run_nft(NFT_ADD_SCRIPT)?;
+        let script = build_nat_script(net);
+        run_nft(&script)?;
+
         // Also insert iptables FORWARD rules for compatibility with hosts
         // running UFW, Docker, or other iptables-based firewalls that set
-        // the FORWARD chain policy to DROP. Without these, TCP/UDP packets
-        // from the remora subnet are silently dropped even though nftables
-        // MASQUERADE is in place (ICMP/ping may still work via conntrack).
-        let _ = run(
-            "iptables",
-            &["-I", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"],
-        );
-        let _ = run(
-            "iptables",
-            &["-I", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"],
-        );
+        // the FORWARD chain policy to DROP.
+        //
+        // Purge any stale duplicates first (from previous crashes where the
+        // refcount was lost but the kernel rules survived).
+        let cidr = net.subnet.cidr_string();
+        while run_quiet("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]).is_ok() {}
+        while run_quiet("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]).is_ok() {}
+        let _ = run("iptables", &["-I", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
+        let _ = run("iptables", &["-I", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
     }
 
     file.seek(SeekFrom::Start(0))?;
@@ -491,13 +783,14 @@ fn enable_nat() -> io::Result<()> {
 /// are empty.
 ///
 /// Errors are non-fatal (logged via `log::warn!`).
-fn disable_nat() {
+fn disable_nat(net: &NetworkDef) {
+    let refcount_path = crate::paths::network_nat_refcount_file(&net.name);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(crate::paths::nat_refcount_file());
+        .open(&refcount_path);
 
     let mut file = match file {
         Ok(f) => f,
@@ -516,6 +809,9 @@ fn disable_nat() {
     }
     let count: u32 = content.trim().parse().unwrap_or(0);
 
+    let table = net.nft_table_name();
+    let cidr = net.subnet.cidr_string();
+
     if count <= 1 {
         if let Err(e) = file
             .seek(SeekFrom::Start(0))
@@ -531,23 +827,17 @@ fn disable_nat() {
         drop(file);
 
         // Remove the iptables FORWARD rules added by enable_nat().
-        let _ = run(
-            "iptables",
-            &["-D", "FORWARD", "-s", "172.19.0.0/24", "-j", "ACCEPT"],
-        );
-        let _ = run(
-            "iptables",
-            &["-D", "FORWARD", "-d", "172.19.0.0/24", "-j", "ACCEPT"],
-        );
+        let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
+        let _ = run("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
 
-        if read_port_forwards_count() == 0 {
+        if read_port_forwards_count(&net.name) == 0 {
             // No active port forwards either — remove the entire table.
-            if let Err(e) = run_nft("delete table ip remora\n") {
-                log::warn!("nft delete table ip remora (non-fatal): {}", e);
+            if let Err(e) = run_nft(&format!("delete table ip {}\n", table)) {
+                log::warn!("nft delete table {} (non-fatal): {}", table, e);
             }
         } else {
             // Port forwards still active — remove MASQUERADE but keep the table.
-            let _ = run_nft("flush chain ip remora postrouting\n");
+            let _ = run_nft(&format!("flush chain ip {} postrouting\n", table));
         }
     } else if let Err(e) = file
         .seek(SeekFrom::Start(0))
@@ -586,20 +876,22 @@ fn read_port_forwards_locked(file: &mut std::fs::File) -> io::Result<Vec<(Ipv4Ad
 }
 
 /// Count active port-forward entries (reads without locking — for teardown checks only).
-fn read_port_forwards_count() -> usize {
-    let content = match std::fs::read_to_string(crate::paths::port_forwards_file()) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
+fn read_port_forwards_count(network_name: &str) -> usize {
+    let content =
+        match std::fs::read_to_string(crate::paths::network_port_forwards_file(network_name)) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
     content.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
 /// Read the NAT refcount without locking (for teardown checks only).
-fn read_nat_refcount() -> u32 {
-    let content = match std::fs::read_to_string(crate::paths::nat_refcount_file()) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
+fn read_nat_refcount(network_name: &str) -> u32 {
+    let content =
+        match std::fs::read_to_string(crate::paths::network_nat_refcount_file(network_name)) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
     content.trim().parse().unwrap_or(0)
 }
 
@@ -609,16 +901,17 @@ fn read_nat_refcount() -> u32 {
 /// when the table already exists (e.g. because NAT/MASQUERADE is active).
 /// `flush chain prerouting` wipes the old rules before rewriting — this is
 /// the flush-and-rebuild strategy that avoids needing to track rule handles.
-fn build_prerouting_script(entries: &[(Ipv4Addr, u16, u16)]) -> String {
-    let mut s = String::from(
-        "add table ip remora\n\
-         add chain ip remora prerouting { type nat hook prerouting priority -100; }\n\
-         flush chain ip remora prerouting\n",
+fn build_prerouting_script(net: &NetworkDef, entries: &[(Ipv4Addr, u16, u16)]) -> String {
+    let table = net.nft_table_name();
+    let mut s = format!(
+        "add table ip {table}\n\
+         add chain ip {table} prerouting {{ type nat hook prerouting priority -100; }}\n\
+         flush chain ip {table} prerouting\n",
     );
     for (ip, host_port, container_port) in entries {
         s.push_str(&format!(
-            "add rule ip remora prerouting tcp dport {} dnat to {}:{}\n",
-            host_port, ip, container_port
+            "add rule ip {} prerouting tcp dport {} dnat to {}:{}\n",
+            table, host_port, ip, container_port
         ));
     }
     s
@@ -626,18 +919,25 @@ fn build_prerouting_script(entries: &[(Ipv4Addr, u16, u16)]) -> String {
 
 /// Add port-forward entries to the state file and install nftables DNAT rules.
 ///
-/// Uses `flock(LOCK_EX)` on [`crate::paths::port_forwards_file()`] to serialise concurrent
-/// spawns. The `remora0` table / prerouting chain are created idempotently,
-/// so this is safe whether NAT is enabled or not.
-fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::Result<()> {
-    std::fs::create_dir_all(crate::paths::runtime_dir())?;
+/// Uses `flock(LOCK_EX)` on the per-network port-forwards file to serialise
+/// concurrent spawns. The network's nft table / prerouting chain are created
+/// idempotently, so this is safe whether NAT is enabled or not.
+fn enable_port_forwards(
+    net: &NetworkDef,
+    container_ip: Ipv4Addr,
+    forwards: &[(u16, u16)],
+) -> io::Result<()> {
+    let pf_path = crate::paths::network_port_forwards_file(&net.name);
+    if let Some(parent) = pf_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(crate::paths::port_forwards_file())?;
+        .open(&pf_path)?;
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
@@ -655,7 +955,7 @@ fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::
     }
 
     // Install nftables DNAT rules.
-    let script = build_prerouting_script(&entries);
+    let script = build_prerouting_script(net, &entries);
     run_nft(&script)?;
 
     // flock released when `file` is dropped.
@@ -669,13 +969,14 @@ fn enable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> io::
 /// - If entries remain, rebuilds the prerouting chain from the survivors.
 ///
 /// Errors are non-fatal (logged via `log::warn!`).
-fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
+fn disable_port_forwards(net: &NetworkDef, container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
+    let pf_path = crate::paths::network_port_forwards_file(&net.name);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(crate::paths::port_forwards_file());
+        .open(&pf_path);
 
     let mut file = match file {
         Ok(f) => f,
@@ -713,20 +1014,21 @@ fn disable_port_forwards(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
     // flock released; now update nftables.
     drop(file);
 
+    let table = net.nft_table_name();
     if remaining.is_empty() {
         // No more port forwards — check if NAT is also gone.
-        if read_nat_refcount() == 0 {
+        if read_nat_refcount(&net.name) == 0 {
             // Nothing using the table — remove it entirely.
-            if let Err(e) = run_nft("delete table ip remora\n") {
-                log::warn!("nft delete table (non-fatal): {}", e);
+            if let Err(e) = run_nft(&format!("delete table ip {}\n", table)) {
+                log::warn!("nft delete table {} (non-fatal): {}", table, e);
             }
         } else {
             // NAT still active — flush prerouting chain only.
-            let _ = run_nft("flush chain ip remora prerouting\n");
+            let _ = run_nft(&format!("flush chain ip {} prerouting\n", table));
         }
     } else {
         // Rebuild prerouting chain from the surviving entries.
-        let script = build_prerouting_script(&remaining);
+        let script = build_prerouting_script(net, &remaining);
         if let Err(e) = run_nft(&script) {
             log::warn!("nft rebuild prerouting (non-fatal): {}", e);
         }
@@ -941,5 +1243,156 @@ fn run(cmd: &str, args: &[&str]) -> io::Result<()> {
             args.join(" "),
             status
         )))
+    }
+}
+
+/// Like `run` but suppresses stderr (for best-effort cleanup loops).
+fn run_quiet(cmd: &str, args: &[&str]) -> io::Result<()> {
+    use std::process::Stdio as ProcStdio;
+    let status = SysCmd::new(cmd)
+        .args(args)
+        .stderr(ProcStdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "`{} {}` exited with {}",
+            cmd,
+            args.join(" "),
+            status
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Ipv4Net tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ipv4net_parse_valid() {
+        let net = Ipv4Net::from_cidr("10.88.1.0/24").unwrap();
+        assert_eq!(net.addr, Ipv4Addr::new(10, 88, 1, 0));
+        assert_eq!(net.prefix_len, 24);
+    }
+
+    #[test]
+    fn test_ipv4net_parse_invalid() {
+        assert!(Ipv4Net::from_cidr("not-a-cidr").is_err());
+        assert!(Ipv4Net::from_cidr("10.0.0.0/33").is_err());
+        assert!(Ipv4Net::from_cidr("10.0.0.0").is_err());
+        assert!(Ipv4Net::from_cidr("999.0.0.0/24").is_err());
+    }
+
+    #[test]
+    fn test_ipv4net_network_broadcast() {
+        let net = Ipv4Net::from_cidr("10.88.1.0/24").unwrap();
+        assert_eq!(net.network(), Ipv4Addr::new(10, 88, 1, 0));
+        assert_eq!(net.broadcast(), Ipv4Addr::new(10, 88, 1, 255));
+    }
+
+    #[test]
+    fn test_ipv4net_gateway_hosts() {
+        let net = Ipv4Net::from_cidr("172.19.0.0/24").unwrap();
+        assert_eq!(net.gateway(), Ipv4Addr::new(172, 19, 0, 1));
+        assert_eq!(net.host_min(), Ipv4Addr::new(172, 19, 0, 2));
+        assert_eq!(net.host_max(), Ipv4Addr::new(172, 19, 0, 254));
+    }
+
+    #[test]
+    fn test_ipv4net_contains() {
+        let net = Ipv4Net::from_cidr("10.88.1.0/24").unwrap();
+        assert!(net.contains(Ipv4Addr::new(10, 88, 1, 5)));
+        assert!(net.contains(Ipv4Addr::new(10, 88, 1, 254)));
+        assert!(!net.contains(Ipv4Addr::new(10, 88, 2, 1)));
+        assert!(!net.contains(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn test_ipv4net_overlaps() {
+        let a = Ipv4Net::from_cidr("10.88.0.0/16").unwrap();
+        let b = Ipv4Net::from_cidr("10.88.1.0/24").unwrap();
+        assert!(a.overlaps(&b));
+        assert!(b.overlaps(&a));
+
+        let c = Ipv4Net::from_cidr("10.89.0.0/16").unwrap();
+        assert!(!a.overlaps(&c));
+    }
+
+    #[test]
+    fn test_ipv4net_no_overlap_disjoint() {
+        let a = Ipv4Net::from_cidr("10.0.0.0/24").unwrap();
+        let b = Ipv4Net::from_cidr("10.0.1.0/24").unwrap();
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn test_ipv4net_cidr_string() {
+        let net = Ipv4Net::from_cidr("10.88.1.0/24").unwrap();
+        assert_eq!(net.cidr_string(), "10.88.1.0/24");
+        assert_eq!(net.gateway_cidr(), "10.88.1.1/24");
+    }
+
+    #[test]
+    fn test_ipv4net_slash16() {
+        let net = Ipv4Net::from_cidr("10.0.0.0/16").unwrap();
+        assert_eq!(net.network(), Ipv4Addr::new(10, 0, 0, 0));
+        assert_eq!(net.broadcast(), Ipv4Addr::new(10, 0, 255, 255));
+        assert_eq!(net.gateway(), Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(net.host_min(), Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(net.host_max(), Ipv4Addr::new(10, 0, 255, 254));
+    }
+
+    // ── NetworkDef tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_network_def_serde_roundtrip() {
+        let net = NetworkDef {
+            name: "frontend".to_string(),
+            subnet: Ipv4Net::from_cidr("10.88.1.0/24").unwrap(),
+            gateway: Ipv4Addr::new(10, 88, 1, 1),
+            bridge_name: "rm-frontend".to_string(),
+        };
+        let json = serde_json::to_string(&net).unwrap();
+        let parsed: NetworkDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "frontend");
+        assert_eq!(parsed.subnet, net.subnet);
+        assert_eq!(parsed.gateway, net.gateway);
+        assert_eq!(parsed.bridge_name, "rm-frontend");
+    }
+
+    #[test]
+    fn test_network_def_nft_table_name() {
+        let net = NetworkDef {
+            name: "frontend".to_string(),
+            subnet: Ipv4Net::from_cidr("10.88.1.0/24").unwrap(),
+            gateway: Ipv4Addr::new(10, 88, 1, 1),
+            bridge_name: "rm-frontend".to_string(),
+        };
+        assert_eq!(net.nft_table_name(), "remora-frontend");
+    }
+
+    // ── NetworkMode tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_network_mode_is_bridge() {
+        assert!(!NetworkMode::None.is_bridge());
+        assert!(!NetworkMode::Loopback.is_bridge());
+        assert!(NetworkMode::Bridge.is_bridge());
+        assert!(NetworkMode::BridgeNamed("frontend".into()).is_bridge());
+        assert!(!NetworkMode::Pasta.is_bridge());
+    }
+
+    #[test]
+    fn test_network_mode_bridge_network_name() {
+        assert_eq!(NetworkMode::Bridge.bridge_network_name(), Some("remora0"));
+        assert_eq!(
+            NetworkMode::BridgeNamed("test".into()).bridge_network_name(),
+            Some("test")
+        );
+        assert_eq!(NetworkMode::None.bridge_network_name(), None);
+        assert_eq!(NetworkMode::Loopback.bridge_network_name(), None);
     }
 }

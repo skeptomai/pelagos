@@ -8,6 +8,7 @@ pub mod build;
 pub mod exec;
 pub mod image;
 pub mod logs;
+pub mod network;
 pub mod ps;
 pub mod rm;
 pub mod rootfs;

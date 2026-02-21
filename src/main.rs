@@ -127,6 +127,13 @@ pub(crate) enum CliCommand {
         cmd: ImageCmd,
     },
 
+    // ── Network management ──────────────────────────────────────────────
+    /// Manage named networks
+    Network {
+        #[clap(subcommand)]
+        cmd: NetworkCmd,
+    },
+
     // ── Container management ─────────────────────────────────────────────
     /// Manage containers
     Container {
@@ -255,6 +262,34 @@ pub(crate) enum ImageCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub(crate) enum NetworkCmd {
+    /// Create a named network with a subnet
+    Create {
+        /// Network name (alphanumeric + hyphen, max 12 chars)
+        name: String,
+        /// Subnet in CIDR notation (e.g. 10.88.1.0/24)
+        #[clap(long)]
+        subnet: String,
+    },
+    /// List networks
+    Ls {
+        /// Output format: table or json
+        #[clap(long, default_value = "table")]
+        format: OutputFormat,
+    },
+    /// Remove a network
+    Rm {
+        /// Network name
+        name: String,
+    },
+    /// Show detailed information about a network (JSON)
+    Inspect {
+        /// Network name
+        name: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -302,6 +337,14 @@ fn main() {
             ImageCmd::Pull { reference } => cli::image::cmd_image_pull(&reference),
             ImageCmd::Ls { format } => cli::image::cmd_image_ls(format == OutputFormat::Json),
             ImageCmd::Rm { reference } => cli::image::cmd_image_rm(&reference),
+        },
+
+        // Network
+        CliCommand::Network { cmd } => match cmd {
+            NetworkCmd::Create { name, subnet } => cli::network::cmd_network_create(&name, &subnet),
+            NetworkCmd::Ls { format } => cli::network::cmd_network_ls(format == OutputFormat::Json),
+            NetworkCmd::Rm { name } => cli::network::cmd_network_rm(&name),
+            NetworkCmd::Inspect { name } => cli::network::cmd_network_inspect(&name),
         },
 
         // OCI lifecycle

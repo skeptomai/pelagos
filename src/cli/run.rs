@@ -496,11 +496,20 @@ fn parse_network_mode(s: &str) -> Result<NetworkMode, Box<dyn std::error::Error>
         "loopback" => Ok(NetworkMode::Loopback),
         "bridge" => Ok(NetworkMode::Bridge),
         "pasta" => Ok(NetworkMode::Pasta),
-        other => Err(format!(
-            "unknown network mode '{}' (use: none, loopback, bridge, pasta)",
-            other
-        )
-        .into()),
+        name => {
+            // Check if it's a named network.
+            let config = remora::paths::network_config_dir(name).join("config.json");
+            if config.exists() {
+                Ok(NetworkMode::BridgeNamed(name.to_string()))
+            } else {
+                Err(format!(
+                    "unknown network '{}' — use a mode (none, loopback, bridge, pasta) \
+                     or create it first: remora network create {} --subnet CIDR",
+                    name, name
+                )
+                .into())
+            }
+        }
     }
 }
 

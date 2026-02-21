@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Current Task: None
+## Current Task: Multi-Network Support — COMPLETE
 
 All three v0.3.3 quick wins completed:
 
@@ -156,11 +156,11 @@ read-only rootfs, tmpfs /tmp, resource limits, seccomp + cap-drop ALL
 - Intel RDT (very niche, low priority)
 - PID namespace in CLI foreground mode (needs shim or double-fork)
 
-### 6. Multi-Network Support
+### ~~6. Multi-Network Support~~ — DONE
 
 User-defined bridge networks with per-network subnets, IPAM, NAT, and isolation.
-`remora network create/ls/rm` CLI, `--network <name>` on run, parameterized
-nftables rules. Full design plan: **[docs/MULTI_NETWORK.md](docs/MULTI_NETWORK.md)**.
+`remora network create/ls/rm/inspect` CLI, `--network <name>` on run, parameterized
+nftables rules. 6 integration tests + 13 unit tests.
 
 ### 7. Other Improvements
 

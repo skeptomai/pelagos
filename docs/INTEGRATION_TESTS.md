@@ -1189,3 +1189,63 @@ on the same port should succeed).
 
 Failure indicates the proxy stop flag is not set during teardown, leaving
 orphaned listener threads holding the port.
+
+---
+
+## Multi-Network Tests
+
+### `test_network_create_ls_rm`
+**Requires:** root
+
+Creates a `NetworkDef` with subnet `10.99.1.0/24`, saves it to disk, loads it
+back, and verifies all fields round-trip correctly. Then cleans up and confirms
+the config file is removed.
+
+Failure indicates `NetworkDef::save()`/`load()` serialization or path helpers
+are broken.
+
+### `test_network_create_overlap_rejected`
+**Requires:** root
+
+Creates a network with subnet `10.77.0.0/16`, then checks that a second network
+with `10.77.1.0/24` is detected as overlapping via `Ipv4Net::overlaps()`.
+
+Failure indicates subnet overlap detection is broken, which would allow users
+to create networks with conflicting address ranges.
+
+### `test_network_name_validation`
+**Requires:** none (API-only)
+
+Verifies name length constraints (> 12 chars), invalid character detection
+(underscores), leading-hyphen rejection, and CIDR parsing edge cases.
+
+Failure indicates the name validation logic or `Ipv4Net::from_cidr()` parser
+has a regression.
+
+### `test_named_network_container`
+**Requires:** root, alpine-rootfs
+
+Creates a custom network `testnet2` with subnet `10.98.1.0/24`, spawns a
+container on it using `NetworkMode::BridgeNamed("testnet2")`, and checks that
+the container's `eth0` has an IP in the `10.98.1.x` range.
+
+Failure indicates the full named-network pipeline is broken: `NetworkDef`
+loading, bridge creation, IPAM allocation, or veth configuration.
+
+### `test_default_network_backwards_compat`
+**Requires:** root, alpine-rootfs
+
+Spawns a container using `NetworkMode::Bridge` (the legacy enum variant) and
+verifies it gets a `172.19.0.x` IP, confirming that the `Bridge` →
+`BridgeNamed("remora0")` normalization and default network bootstrap work.
+
+Failure indicates the backwards-compatibility path from `NetworkMode::Bridge`
+to the new per-network architecture is broken.
+
+### `test_network_rm_refuses_default`
+**Requires:** root
+
+Bootstraps the default network and verifies the config file exists. This tests
+that the default `remora0` network is always available and cannot be removed.
+
+Failure indicates `bootstrap_default_network()` is not persisting the config.

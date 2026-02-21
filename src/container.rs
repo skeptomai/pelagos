@@ -1073,6 +1073,14 @@ impl Command {
     /// Command::new("/bin/sh").with_network(NetworkMode::Bridge).spawn()?;
     /// ```
     pub fn with_network(mut self, mode: crate::network::NetworkMode) -> Self {
+        // Normalize Bridge → BridgeNamed("remora0") so internal code only
+        // needs to match BridgeNamed(_).
+        let mode = match mode {
+            crate::network::NetworkMode::Bridge => {
+                crate::network::NetworkMode::BridgeNamed("remora0".into())
+            }
+            other => other,
+        };
         // Loopback requires a new NET namespace (unshare in pre_exec).
         // Bridge does NOT unshare NET — the child joins a pre-configured named
         // netns via setns() in pre_exec instead.
@@ -1633,7 +1641,7 @@ impl Command {
             if self
                 .network_config
                 .as_ref()
-                .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge)
+                .is_some_and(|c| c.mode.is_bridge())
             {
                 return Err(Error::Io(io::Error::other(
                     "NetworkMode::Bridge requires root; use NetworkMode::Pasta for rootless internet access",
@@ -1685,26 +1693,27 @@ impl Command {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
         });
-        let is_bridge = self
+        let bridge_network_name: Option<String> = self
             .network_config
             .as_ref()
-            .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge);
-
+            .and_then(|c| c.mode.bridge_network_name().map(|s| s.to_owned()));
         // Bridge mode: create and fully configure the named netns BEFORE fork.
         // The child's pre_exec will join it via setns — no race whatsoever.
-        let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
-            let ns_name = crate::network::generate_ns_name();
-            Some(
-                crate::network::setup_bridge_network(
-                    &ns_name,
-                    self.nat,
-                    self.port_forwards.clone(),
+        let bridge_network: Option<crate::network::NetworkSetup> =
+            if let Some(ref net_name) = bridge_network_name {
+                let ns_name = crate::network::generate_ns_name();
+                Some(
+                    crate::network::setup_bridge_network(
+                        &ns_name,
+                        net_name,
+                        self.nat,
+                        self.port_forwards.clone(),
+                    )
+                    .map_err(Error::Io)?,
                 )
-                .map_err(Error::Io)?,
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         // Pre-allocate the netns path CString so pre_exec can open it without allocating.
         let bridge_ns_path: Option<std::ffi::CString> = bridge_network
             .as_ref()
@@ -3059,7 +3068,7 @@ impl Command {
             if self
                 .network_config
                 .as_ref()
-                .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge)
+                .is_some_and(|c| c.mode.is_bridge())
             {
                 return Err(Error::Io(io::Error::other(
                     "NetworkMode::Bridge requires root; use NetworkMode::Pasta for rootless internet access",
@@ -3108,25 +3117,28 @@ impl Command {
             c.mode == crate::network::NetworkMode::Loopback
                 || c.mode == crate::network::NetworkMode::Pasta
         });
-        let is_bridge = self
+        let bridge_network_name: Option<String> = self
             .network_config
             .as_ref()
-            .is_some_and(|c| c.mode == crate::network::NetworkMode::Bridge);
+            .and_then(|c| c.mode.bridge_network_name().map(|s| s.to_owned()));
+        let _is_bridge = bridge_network_name.is_some();
 
         // Bridge mode: create and fully configure the named netns BEFORE fork.
-        let bridge_network: Option<crate::network::NetworkSetup> = if is_bridge {
-            let ns_name = crate::network::generate_ns_name();
-            Some(
-                crate::network::setup_bridge_network(
-                    &ns_name,
-                    self.nat,
-                    self.port_forwards.clone(),
+        let bridge_network: Option<crate::network::NetworkSetup> =
+            if let Some(ref net_name) = bridge_network_name {
+                let ns_name = crate::network::generate_ns_name();
+                Some(
+                    crate::network::setup_bridge_network(
+                        &ns_name,
+                        net_name,
+                        self.nat,
+                        self.port_forwards.clone(),
+                    )
+                    .map_err(Error::Io)?,
                 )
-                .map_err(Error::Io)?,
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let bridge_ns_path: Option<std::ffi::CString> = bridge_network
             .as_ref()
             .map(|n| std::ffi::CString::new(format!("/run/netns/{}", n.ns_name)).unwrap());

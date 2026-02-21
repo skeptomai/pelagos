@@ -132,13 +132,16 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 
 **Networking (Phase 6 COMPLETE ✅):**
 - **N1 Loopback**: `with_network(NetworkMode::Loopback)` — isolated NET namespace, lo brought up via ioctl (127.0.0.1 active)
-- **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via `/run/remora/next_ip`
-- **N3 NAT**: `with_nat()` — nftables MASQUERADE, reference-counted via `/run/remora/nat_refcount`
+- **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via per-network state files
+- **N2b Named Networks**: `with_network(NetworkMode::BridgeNamed("frontend"))` — user-defined bridge networks with custom subnets
+- **N3 NAT**: `with_nat()` — nftables MASQUERADE per-network, reference-counted via per-network state files
 - **N4 Port mapping**: `with_port_forward(host_port, container_port)` — TCP DNAT via nftables prerouting + userspace TCP proxy for localhost access
 - **N5 DNS**: `with_dns(&[...])` — writes to `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it into the container; shared rootfs is never modified; requires `Namespace::MOUNT` + `with_chroot`
 - **N6 Pasta**: `with_network(NetworkMode::Pasta)` — user-mode networking via `pasta`; rootless-compatible full internet access; attaches to container netns via `/proc/{pid}/ns/net` after exec
+- **Multi-network**: `remora network create/ls/rm/inspect` — per-network `Ipv4Net` subnets, `NetworkDef` config, IPAM, NAT, nftables tables (`remora-<name>`); `--network <name>` on run/build
 - **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay cleaned up in `wait()` / `wait_with_output()`
-- **`src/network.rs`**: `NetworkMode`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `enable_nat()`, `disable_nat()`, `enable_port_forwards()`, `disable_port_forwards()`, `start_port_proxies()`, `proxy_relay()`
+- **`src/network.rs`**: `NetworkMode`, `Ipv4Net`, `NetworkDef`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `bootstrap_default_network()`, `load_network_def()`
+- **`src/cli/network.rs`**: `cmd_network_create()`, `cmd_network_ls()`, `cmd_network_rm()`, `cmd_network_inspect()`
 
 **Image Build (COMPLETE ✅):**
 - **`remora build -t <tag> [--file <path>] [--network bridge|pasta] [context]`**: build images from Remfiles
@@ -184,7 +187,7 @@ src/
   container.rs            # Main API (~2270 lines)
   oci.rs                  # OCI Runtime Spec implementation
   cgroup.rs               # Cgroups v2 resource management
-  network.rs              # Native networking (N1 loopback, N2 bridge)
+  network.rs              # Native networking (N1-N6 + multi-network)
   seccomp.rs              # Seccomp-BPF filtering (~400 lines)
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
   image.rs                # OCI image store: layer extraction, manifest persistence
@@ -197,12 +200,13 @@ src/
     stop.rs               # remora stop — SIGTERM a container
     rm.rs                 # remora rm — remove a container
     logs.rs               # remora logs [--follow] — view container output
+    network.rs            # remora network create/ls/rm/inspect
     rootfs.rs             # remora rootfs import/ls/rm
     volume.rs             # remora volume create/ls/rm
     image.rs              # remora image pull/ls/rm — OCI registry pulls
 
 tests/
-  integration_tests.rs    # 72 integration tests (require root)
+  integration_tests.rs    # 78 integration tests (require root)
 
 examples/
   seccomp_demo.rs         # Seccomp demonstration
@@ -440,7 +444,7 @@ to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
 | tmpfs mounts | ✅ | ✅ |
 | Named volumes | ✅ | ✅ |
 | Overlay filesystem | ✅ CoW layered rootfs | ✅ |
-| Networking | ✅ N1–N5 + pasta (Loopback/Bridge/NAT/Ports/DNS/Pasta) | ✅ Native libnetwork |
+| Networking | ✅ N1–N6 + multi-network (Loopback/Bridge/NAT/Ports/DNS/Pasta/Named) | ✅ Native libnetwork |
 | Rootless networking | ✅ pasta (full internet, no root) | ✅ |
 | OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
 | Image build | ✅ `remora build` (Remfile) | ✅ Dockerfile |

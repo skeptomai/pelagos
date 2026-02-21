@@ -67,7 +67,20 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
                 NetworkMode::Bridge
             }
         }
-        other => return Err(format!("unknown network mode: {}", other).into()),
+        name => {
+            // Check if it's a named network.
+            let config = remora::paths::network_config_dir(name).join("config.json");
+            if config.exists() {
+                NetworkMode::BridgeNamed(name.to_string())
+            } else {
+                return Err(format!(
+                    "unknown network '{}' — use a mode (none, bridge, pasta, auto) \
+                     or create it first: remora network create {} --subnet CIDR",
+                    name, name
+                )
+                .into());
+            }
+        }
     };
 
     eprintln!("Building {} from {}", args.tag, remfile_path.display());

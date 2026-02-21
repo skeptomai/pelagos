@@ -134,6 +134,38 @@ pub fn port_forwards_file() -> PathBuf {
     runtime_dir().join("port_forwards")
 }
 
+// ── Per-network directories ─────────────────────────────────────────────────
+
+/// Persistent config directory for all named networks: `<data>/networks/`.
+pub fn networks_config_dir() -> PathBuf {
+    data_dir().join("networks")
+}
+
+/// Config directory for a specific network: `<data>/networks/<name>/`.
+pub fn network_config_dir(name: &str) -> PathBuf {
+    networks_config_dir().join(name)
+}
+
+/// Runtime state directory for a specific network: `<runtime>/networks/<name>/`.
+pub fn network_runtime_dir(name: &str) -> PathBuf {
+    runtime_dir().join("networks").join(name)
+}
+
+/// Per-network IPAM next-IP file: `<runtime>/networks/<name>/next_ip`.
+pub fn network_ipam_file(name: &str) -> PathBuf {
+    network_runtime_dir(name).join("next_ip")
+}
+
+/// Per-network NAT refcount file: `<runtime>/networks/<name>/nat_refcount`.
+pub fn network_nat_refcount_file(name: &str) -> PathBuf {
+    network_runtime_dir(name).join("nat_refcount")
+}
+
+/// Per-network port-forward entries file: `<runtime>/networks/<name>/port_forwards`.
+pub fn network_port_forwards_file(name: &str) -> PathBuf {
+    network_runtime_dir(name).join("port_forwards")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +207,25 @@ mod tests {
         assert!(ipam_file().starts_with(&rt));
         assert!(nat_refcount_file().starts_with(&rt));
         assert!(port_forwards_file().starts_with(&rt));
+    }
+
+    #[test]
+    fn test_network_config_paths_under_data_dir() {
+        let data = data_dir();
+        assert!(networks_config_dir().starts_with(&data));
+        assert!(network_config_dir("frontend").starts_with(&data));
+        assert_eq!(
+            network_config_dir("frontend"),
+            networks_config_dir().join("frontend")
+        );
+    }
+
+    #[test]
+    fn test_network_runtime_paths_under_runtime_dir() {
+        let rt = runtime_dir();
+        assert!(network_runtime_dir("frontend").starts_with(&rt));
+        assert!(network_ipam_file("frontend").starts_with(&rt));
+        assert!(network_nat_refcount_file("frontend").starts_with(&rt));
+        assert!(network_port_forwards_file("frontend").starts_with(&rt));
     }
 }

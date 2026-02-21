@@ -423,7 +423,7 @@ fn execute_run(
     // Bridge mode needs NAT (MASQUERADE) for outbound internet and DNS for
     // hostname resolution.  Pasta provides both natively.
     cmd = cmd.with_network(network_mode.clone());
-    if matches!(network_mode, NetworkMode::Bridge) {
+    if network_mode.is_bridge() {
         cmd = cmd.with_nat().with_dns(&["8.8.8.8", "1.1.1.1"]);
     }
 
