@@ -174,12 +174,25 @@ the user guide.
 ## Testing
 
 ```bash
-# Unit tests (no root required):
+# Unit tests + lint (no root required):
 cargo test --lib
+cargo clippy -- -D warnings
+cargo fmt -- --check
 
-# Integration tests (require root + rootfs):
+# Integration tests (require root):
 sudo -E cargo test --test integration_tests
+
+# E2E, build, and stress test suites (require root):
+sudo -E ./scripts/test-e2e.sh
+sudo -E ./scripts/test-build.sh
+sudo -E ./scripts/test-stress.sh
+
+# Web stack example (require root + release build):
+cargo build --release
+sudo PATH=$PWD/target/release:$PATH ./examples/web-stack/run.sh
 ```
+
+See the [User Guide testing section](docs/USER_GUIDE.md#testing) for details on each suite.
 
 ## Architecture
 

@@ -754,6 +754,97 @@ $XDG_RUNTIME_DIR/remora/     (fallback: /tmp/remora-$UID/)
 
 ---
 
+## Testing
+
+Remora has several layers of tests. Unit tests and lint run without root; everything
+else requires `sudo -E` to preserve the rustup/cargo environment.
+
+### 1. Unit Tests + Lint (no root)
+
+```bash
+cargo test --lib
+cargo clippy -- -D warnings
+cargo fmt -- --check
+```
+
+53 unit tests covering parsers, builders, seccomp filter compilation, cgroup path
+parsing, image manifest handling, and namespace flags.
+
+### 2. Integration Tests (root)
+
+```bash
+sudo -E cargo test --test integration_tests
+```
+
+72 integration tests that exercise the full container lifecycle: spawn, namespaces,
+mounts, seccomp, capabilities, cgroups, networking, overlay, exec, OCI lifecycle,
+and rootless mode. Requires an Alpine rootfs (pulled automatically or via
+`scripts/build-rootfs-docker.sh`).
+
+### 3. E2E Test Suite (root)
+
+```bash
+sudo -E ./scripts/test-e2e.sh
+```
+
+End-to-end CLI tests covering `remora run`, `ps`, `stop`, `rm`, `logs`, `exec`,
+detached mode, environment variables, bind mounts, volumes, bridge networking,
+port forwarding, DNS, container linking, and security options. Builds the binary
+and runs real containers.
+
+### 4. Build E2E (root)
+
+```bash
+sudo -E ./scripts/test-build.sh
+```
+
+Tests `remora build` end-to-end: Remfile parsing, RUN steps with networking,
+COPY, ENV, WORKDIR, CMD (JSON and shell form), multi-step builds, and image
+tagging. Verifies that built images can be run.
+
+### 5. Stress Tests (root)
+
+```bash
+sudo -E ./scripts/test-stress.sh
+```
+
+18 stress tests across 7 categories: rapid lifecycle, parallel containers,
+resource-constrained containers, overlay filesystem stress, network stress,
+OCI lifecycle stress, and edge cases.
+
+### 6. Web Stack Example (root)
+
+```bash
+cargo build --release
+sudo PATH=$PWD/target/release:$PATH ./examples/web-stack/run.sh
+```
+
+Builds and runs a 3-container blog stack (nginx → Bottle API → Redis) on bridge
+networking with container linking. Runs 5 HTTP verification tests. Unlike the
+other scripts, this one doesn't call `cargo build` internally — it expects
+`remora` in your PATH, so pass the release binary path via `PATH` instead of `-E`.
+
+### Full Pre-Release Checklist
+
+```bash
+# 1. Lint + unit tests (no root)
+cargo test --lib && cargo clippy -- -D warnings && cargo fmt -- --check
+
+# 2. Integration tests (root)
+sudo -E cargo test --test integration_tests
+
+# 3. E2E suites (root)
+sudo -E ./scripts/test-e2e.sh
+sudo -E ./scripts/test-build.sh
+sudo -E ./scripts/test-stress.sh
+
+# 4. Example app (root, release build)
+cargo build --release
+sudo PATH=$PWD/target/release:$PATH ./examples/web-stack/run.sh
+```
+
+---
+
 ## Troubleshooting
 
 ### "rootfs not found"
