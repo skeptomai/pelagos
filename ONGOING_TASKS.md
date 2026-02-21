@@ -79,7 +79,13 @@ read-only rootfs, tmpfs /tmp, resource limits, seccomp + cap-drop ALL
 - Intel RDT (very niche, low priority)
 - PID namespace in CLI foreground mode (needs shim or double-fork)
 
-### 6. Other Improvements
+### 6. Multi-Network Support
+
+User-defined bridge networks with per-network subnets, IPAM, NAT, and isolation.
+`remora network create/ls/rm` CLI, `--network <name>` on run, parameterized
+nftables rules. Full design plan: **[docs/MULTI_NETWORK.md](docs/MULTI_NETWORK.md)**.
+
+### 7. Other Improvements
 
 - Authenticated registry pulls (Docker Hub private repos)
 - `remora build` rootless mode

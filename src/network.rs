@@ -13,11 +13,30 @@
 //!
 //! ### Why named netns (not /proc/{pid}/ns/net)?
 //!
-//! Opening `/proc/{pid}/ns/net` after `spawn()` races with fast-exiting
-//! containers (`exit 0`). A sync pipe in `pre_exec` deadlocks because
-//! `std::process::Command::spawn()` blocks until the child `exec()`s via an
-//! internal CLOEXEC fail-pipe, and blocking in `pre_exec` prevents `exec()`.
-//! Named netns are created *before* fork — no race, no deadlock.
+//! The primary reason is **debuggability**: named netns are visible via
+//! `ip netns list` and inspectable with `ip netns exec remora-foo ip addr`
+//! from the host. Anonymous namespaces via `/proc/{pid}/ns/net` offer none
+//! of that visibility.
+//!
+//! There are also two practical problems with `/proc/{pid}/ns/net` given
+//! our current use of `std::process::Command`, though neither is fundamental:
+//!
+//! 1. **Race with fast exit**: if the container runs e.g. `exit 0`, the
+//!    child can terminate before the parent opens `/proc/{pid}/ns/net`.
+//!    This isn't truly fatal — a dead container doesn't need networking —
+//!    but it does require the parent to handle "PID gone" gracefully
+//!    rather than treating it as an error.
+//!
+//! 2. **CLOEXEC deadlock**: adding a sync pipe so the child blocks in
+//!    `pre_exec` while the parent configures networking deadlocks because
+//!    `std::process::Command::spawn()` itself blocks on an internal
+//!    CLOEXEC fail-pipe until `exec()`. The child can't `exec()` while
+//!    blocked on our pipe, and the parent can't signal our pipe until
+//!    `spawn()` returns. This is a Rust stdlib limitation — a raw
+//!    `fork()`/`exec()` implementation could synchronize freely.
+//!
+//! Named netns sidestep both issues (created before fork, no coordination
+//! needed) and give us host-side observability for free.
 //!
 //! Teardown removes the host-side veth (`ip link del`) and the named netns
 //! (`ip netns del`).
@@ -46,17 +65,17 @@ static NS_COUNTER: AtomicU32 = AtomicU32::new(0);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
     /// Share the host's network stack (default — no changes).
-    None,
+    None = 0,
     /// Isolated network namespace with loopback only.
-    Loopback,
+    Loopback = 1,
     /// Full connectivity via the `remora0` bridge (172.19.0.x/24).
-    Bridge,
+    Bridge = 2,
     /// User-mode networking via `pasta` — rootless-compatible, full internet access.
     ///
     /// pasta creates a TAP interface inside the container's network namespace and
     /// relays packets to/from the host using ordinary userspace sockets, requiring
     /// no kernel privileges. Works for both root and rootless containers.
-    Pasta,
+    Pasta = 3,
 }
 
 /// Network configuration for a container.

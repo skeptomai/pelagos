@@ -2,9 +2,9 @@
 
 mod cli;
 
-use clap::{Parser, Subcommand};
-use log::{error, info};
-use std::fmt;
+pub(crate) use clap::{Parser, Subcommand};
+pub(crate) use log::error;
+pub(crate) use std::fmt;
 
 // ---------------------------------------------------------------------------
 // Output format enum (shared by all list commands)
@@ -12,8 +12,8 @@ use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OutputFormat {
-    Table,
-    Json,
+    Table = 0,
+    Json = 1,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -30,11 +30,15 @@ impl std::str::FromStr for OutputFormat {
     }
 }
 
-impl fmt::Display for OutputFormat {
+impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OutputFormat::Table => write!(f, "table"),
-            OutputFormat::Json => write!(f, "json"),
+            OutputFormat::Table => {
+                write!(f, "table")
+            }
+            OutputFormat::Json => {
+                write!(f, "json")
+            }
         }
     }
 }
@@ -56,7 +60,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
-enum CliCommand {
+pub(crate) enum CliCommand {
     // ── Container lifecycle ────────────────────────────────────────────────
     /// Create and start a container
     Run(Box<cli::run::RunArgs>),
@@ -151,7 +155,7 @@ enum CliCommand {
 }
 
 #[derive(Subcommand, Debug)]
-enum ContainerCmd {
+pub(crate) enum ContainerCmd {
     /// List containers
     Ls {
         /// Show all containers (default: only running)
@@ -190,7 +194,7 @@ enum ContainerCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum RootfsCmd {
+pub(crate) enum RootfsCmd {
     /// Import a local directory as a named rootfs image
     Import {
         /// Name for the rootfs image
@@ -212,7 +216,7 @@ enum RootfsCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum VolumeCmd {
+pub(crate) enum VolumeCmd {
     /// Create a named volume
     Create {
         /// Volume name
@@ -232,7 +236,7 @@ enum VolumeCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum ImageCmd {
+pub(crate) enum ImageCmd {
     /// Pull an image from an OCI registry
     Pull {
         /// Image reference (e.g. alpine, alpine:3.19, docker.io/library/alpine:latest)
