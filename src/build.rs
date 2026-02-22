@@ -421,6 +421,9 @@ pub fn execute_build(
         _ => return Err(BuildError::MissingFrom),
     };
 
+    // Load .remignore patterns (if present) for COPY filtering.
+    let remignore = load_remignore(context_dir);
+
     // Load base image.
     let normalised = normalise_image_reference(&base_ref);
     let base_manifest =
@@ -482,7 +485,7 @@ pub fn execute_build(
                 // COPY always invalidates cache (context content may have changed).
                 cache_active = false;
                 eprintln!("Step {}/{}: COPY {} {}", step, total, src, dest);
-                let digest = execute_copy(src, dest, context_dir)?;
+                let digest = execute_copy(src, dest, context_dir, remignore.as_ref())?;
                 layers.push(digest);
             }
             Instruction::Cmd(ref args) => {
@@ -618,7 +621,13 @@ fn execute_run(
 }
 
 /// Execute a COPY instruction: create a layer from context files.
-fn execute_copy(src: &str, dest: &str, context_dir: &Path) -> Result<String, BuildError> {
+/// When `remignore` is `Some`, directory copies skip matched entries.
+fn execute_copy(
+    src: &str,
+    dest: &str,
+    context_dir: &Path,
+    remignore: Option<&ignore::gitignore::Gitignore>,
+) -> Result<String, BuildError> {
     let src_path = context_dir.join(src);
     if !src_path.exists() {
         return Err(BuildError::Io(io::Error::new(
@@ -652,8 +661,22 @@ fn execute_copy(src: &str, dest: &str, context_dir: &Path) -> Result<String, Bui
     }
 
     if src_path.is_dir() {
-        copy_dir_recursive(&src_path, &dest_in_tmp)?;
+        if let Some(gi) = remignore {
+            copy_dir_filtered(&src_path, &dest_in_tmp, gi, &src_path)?;
+        } else {
+            copy_dir_recursive(&src_path, &dest_in_tmp)?;
+        }
     } else {
+        // For single files, check remignore before copying.
+        if let Some(gi) = remignore {
+            let rel = src_path.strip_prefix(context_dir).unwrap_or(&src_path);
+            if gi.matched(rel, false).is_ignore() {
+                log::debug!("remignore: skipping single file {}", rel.display());
+                // Return an empty layer.
+                let digest = create_layer_from_dir(tmp.path())?;
+                return Ok(digest);
+            }
+        }
         std::fs::copy(&src_path, &dest_in_tmp)?;
     }
 
@@ -785,6 +808,65 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), io::Error> {
             std::os::unix::fs::symlink(target, &dest_path)?;
         } else {
             std::fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// .remignore support
+// ---------------------------------------------------------------------------
+
+/// Load `.remignore` patterns from the build context root, if the file exists.
+fn load_remignore(context_dir: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let path = context_dir.join(".remignore");
+    if !path.is_file() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(context_dir);
+    builder.add(path);
+    match builder.build() {
+        Ok(gi) => Some(gi),
+        Err(e) => {
+            log::warn!("failed to parse .remignore: {}", e);
+            None
+        }
+    }
+}
+
+/// Recursively copy a directory tree, skipping entries matched by the ignore
+/// patterns. `src_root` is the top-level source directory used to compute
+/// relative paths for pattern matching.
+fn copy_dir_filtered(
+    src: &Path,
+    dst: &Path,
+    gi: &ignore::gitignore::Gitignore,
+    src_root: &Path,
+) -> Result<(), io::Error> {
+    if !dst.exists() {
+        std::fs::create_dir_all(dst)?;
+    }
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+
+        // Compute relative path from src_root for pattern matching.
+        let rel = path.strip_prefix(src_root).unwrap_or(&path);
+        if gi.matched(rel, file_type.is_dir()).is_ignore() {
+            log::debug!("remignore: skipping {}", rel.display());
+            continue;
+        }
+
+        if file_type.is_dir() {
+            copy_dir_filtered(&path, &dest_path, gi, src_root)?;
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(&path)?;
+            let _ = std::fs::remove_file(&dest_path);
+            std::os::unix::fs::symlink(target, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path)?;
         }
     }
     Ok(())
@@ -1240,5 +1322,54 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         vars.insert("A".to_string(), "1".to_string());
         vars.insert("B".to_string(), "2".to_string());
         assert_eq!(substitute_vars("$A-${B}-$$", &vars), "1-2-$");
+    }
+
+    // -- .remignore tests --
+
+    #[test]
+    fn test_copy_dir_filtered_excludes() {
+        let tmp_src = tempfile::tempdir().unwrap();
+        let tmp_dst = tempfile::tempdir().unwrap();
+
+        // Create source files.
+        std::fs::write(tmp_src.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(tmp_src.path().join("skip.log"), "skip").unwrap();
+        std::fs::create_dir(tmp_src.path().join("subdir")).unwrap();
+        std::fs::write(tmp_src.path().join("subdir/data.txt"), "data").unwrap();
+        std::fs::write(tmp_src.path().join("subdir/debug.log"), "debug").unwrap();
+
+        // Build gitignore that excludes *.log.
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(tmp_src.path());
+        builder.add_line(None, "*.log").unwrap();
+        let gi = builder.build().unwrap();
+
+        copy_dir_filtered(tmp_src.path(), tmp_dst.path(), &gi, tmp_src.path()).unwrap();
+
+        assert!(tmp_dst.path().join("keep.txt").exists());
+        assert!(!tmp_dst.path().join("skip.log").exists());
+        assert!(tmp_dst.path().join("subdir/data.txt").exists());
+        assert!(!tmp_dst.path().join("subdir/debug.log").exists());
+    }
+
+    #[test]
+    fn test_remignore_negation_pattern() {
+        let tmp_src = tempfile::tempdir().unwrap();
+        let tmp_dst = tempfile::tempdir().unwrap();
+
+        std::fs::write(tmp_src.path().join("a.log"), "a").unwrap();
+        std::fs::write(tmp_src.path().join("important.log"), "keep").unwrap();
+        std::fs::write(tmp_src.path().join("b.txt"), "b").unwrap();
+
+        // Exclude *.log but negate important.log.
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(tmp_src.path());
+        builder.add_line(None, "*.log").unwrap();
+        builder.add_line(None, "!important.log").unwrap();
+        let gi = builder.build().unwrap();
+
+        copy_dir_filtered(tmp_src.path(), tmp_dst.path(), &gi, tmp_src.path()).unwrap();
+
+        assert!(!tmp_dst.path().join("a.log").exists());
+        assert!(tmp_dst.path().join("important.log").exists());
+        assert!(tmp_dst.path().join("b.txt").exists());
     }
 }

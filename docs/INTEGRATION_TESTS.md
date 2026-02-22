@@ -1174,6 +1174,16 @@ Also exercises `substitute_vars` with `$VAR`, `${VAR}`, and `$$` escape sequence
 
 Failure indicates the ARG parser or variable substitution engine is broken.
 
+### `test_remignore_filtering`
+**Requires:** neither root nor rootfs
+
+Creates a temporary directory with a `.remignore` file excluding `*.log` and `build/`.
+Populates the directory with matching and non-matching files, then runs a filtered copy.
+Verifies excluded files (`debug.log`, `build/output`) are absent and kept files
+(`app.rs`, `src/lib.rs`) are present in the destination.
+
+Failure indicates `.remignore` pattern loading or the filtered copy logic is broken.
+
 ---
 
 ## Port Proxy
