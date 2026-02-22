@@ -6,6 +6,7 @@
 use crate::container::{Command, Namespace, Stdio};
 use crate::image::{self, ImageConfig, ImageManifest};
 use crate::network::NetworkMode;
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
@@ -42,14 +43,27 @@ pub enum BuildError {
 pub enum Instruction {
     From(String),
     Run(String),
-    Copy { src: String, dest: String },
+    Copy {
+        src: String,
+        dest: String,
+    },
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
-    Env { key: String, value: String },
+    Env {
+        key: String,
+        value: String,
+    },
     Workdir(String),
     Expose(u16),
-    Label { key: String, value: String },
+    Label {
+        key: String,
+        value: String,
+    },
     User(String),
+    Arg {
+        name: String,
+        default: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +186,20 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                 }
                 instructions.push(Instruction::User(rest.to_string()));
             }
+            "ARG" => {
+                if rest.is_empty() {
+                    return Err(BuildError::Parse {
+                        line: line_num,
+                        message: "ARG requires a variable name".to_string(),
+                    });
+                }
+                let (name, default) = if let Some((n, v)) = rest.split_once('=') {
+                    (n.to_string(), Some(v.to_string()))
+                } else {
+                    (rest.to_string(), None)
+                };
+                instructions.push(Instruction::Arg { name, default });
+            }
             other => {
                 return Err(BuildError::Parse {
                     line: line_num,
@@ -251,6 +279,94 @@ fn parse_env_value(rest: &str) -> Option<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Variable substitution (ARG / ENV)
+// ---------------------------------------------------------------------------
+
+/// Replace `$VAR`, `${VAR}`, and `$$` (literal `$`) in `text`.
+/// Unknown variables expand to the empty string.
+pub fn substitute_vars(text: &str, vars: &HashMap<String, String>) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'$' {
+            if i + 1 < len && bytes[i + 1] == b'$' {
+                // Escaped dollar: $$ → $
+                out.push('$');
+                i += 2;
+            } else if i + 1 < len && bytes[i + 1] == b'{' {
+                // ${VAR} form
+                if let Some(close) = text[i + 2..].find('}') {
+                    let name = &text[i + 2..i + 2 + close];
+                    if let Some(val) = vars.get(name) {
+                        out.push_str(val);
+                    }
+                    i = i + 2 + close + 1;
+                } else {
+                    // Unterminated ${...}, copy literally
+                    out.push('$');
+                    i += 1;
+                }
+            } else if i + 1 < len && (bytes[i + 1].is_ascii_alphanumeric() || bytes[i + 1] == b'_')
+            {
+                // $VAR form
+                let start = i + 1;
+                let mut end = start;
+                while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                    end += 1;
+                }
+                let name = &text[start..end];
+                if let Some(val) = vars.get(name) {
+                    out.push_str(val);
+                }
+                i = end;
+            } else {
+                out.push('$');
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Clone an instruction with all string fields substituted.
+fn substitute_instruction(instr: &Instruction, vars: &HashMap<String, String>) -> Instruction {
+    match instr {
+        Instruction::From(r) => Instruction::From(substitute_vars(r, vars)),
+        Instruction::Run(cmd) => Instruction::Run(substitute_vars(cmd, vars)),
+        Instruction::Copy { src, dest } => Instruction::Copy {
+            src: substitute_vars(src, vars),
+            dest: substitute_vars(dest, vars),
+        },
+        Instruction::Cmd(args) => {
+            Instruction::Cmd(args.iter().map(|a| substitute_vars(a, vars)).collect())
+        }
+        Instruction::Entrypoint(args) => {
+            Instruction::Entrypoint(args.iter().map(|a| substitute_vars(a, vars)).collect())
+        }
+        Instruction::Env { key, value } => Instruction::Env {
+            key: substitute_vars(key, vars),
+            value: substitute_vars(value, vars),
+        },
+        Instruction::Workdir(path) => Instruction::Workdir(substitute_vars(path, vars)),
+        Instruction::Expose(port) => Instruction::Expose(*port),
+        Instruction::Label { key, value } => Instruction::Label {
+            key: substitute_vars(key, vars),
+            value: substitute_vars(value, vars),
+        },
+        Instruction::User(user) => Instruction::User(substitute_vars(user, vars)),
+        Instruction::Arg { name, default } => Instruction::Arg {
+            name: name.clone(),
+            default: default.as_ref().map(|d| substitute_vars(d, vars)),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Build execution
 // ---------------------------------------------------------------------------
 
@@ -268,13 +384,39 @@ pub fn execute_build(
     tag: &str,
     network_mode: NetworkMode,
     use_cache: bool,
+    build_args: &HashMap<String, String>,
 ) -> Result<ImageManifest, BuildError> {
     if instructions.is_empty() {
         return Err(BuildError::MissingFrom);
     }
 
-    // First instruction must be FROM.
-    let base_ref = match &instructions[0] {
+    // ARG substitution state: seeded from CLI --build-arg values.
+    let mut args_map: HashMap<String, String> = build_args.clone();
+
+    // Find the first non-ARG instruction — it must be FROM.
+    // ARG instructions before FROM are allowed (Docker compat) and seed the
+    // substitution context for the FROM line itself.
+    let first_non_arg = instructions
+        .iter()
+        .position(|i| !matches!(i, Instruction::Arg { .. }))
+        .ok_or(BuildError::MissingFrom)?;
+
+    // Process pre-FROM ARGs.
+    for instr in &instructions[..first_non_arg] {
+        if let Instruction::Arg { name, default } = instr {
+            args_map
+                .entry(name.clone())
+                .or_insert_with(|| default.clone().unwrap_or_default());
+        }
+    }
+
+    // Build substitution context: ARG values override ENV on conflict.
+    let mut sub_vars: HashMap<String, String> = HashMap::new();
+    // (ENV vars will be added as we encounter them; ARG values are already in args_map)
+    sub_vars.extend(args_map.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    let from_instr = substitute_instruction(&instructions[first_non_arg], &sub_vars);
+    let base_ref = match &from_instr {
         Instruction::From(r) => r.clone(),
         _ => return Err(BuildError::MissingFrom),
     };
@@ -291,11 +433,25 @@ pub fn execute_build(
     // Once a cache miss occurs, all subsequent steps run uncached.
     let mut cache_active = use_cache;
 
-    for (idx, instr) in instructions.iter().enumerate() {
+    for (idx, raw_instr) in instructions.iter().enumerate() {
+        // Apply variable substitution (ARG + ENV values) to every instruction.
+        let instr = substitute_instruction(raw_instr, &sub_vars);
         let step = idx + 1;
-        match instr {
+        match &instr {
             Instruction::From(ref r) => {
                 eprintln!("Step {}/{}: FROM {}", step, total, r);
+            }
+            Instruction::Arg {
+                ref name,
+                ref default,
+            } => {
+                // Set ARG value: CLI override > default > empty.
+                let value = args_map
+                    .entry(name.clone())
+                    .or_insert_with(|| default.clone().unwrap_or_default())
+                    .clone();
+                sub_vars.insert(name.clone(), value.clone());
+                eprintln!("Step {}/{}: ARG {}={}", step, total, name, value);
             }
             Instruction::Run(ref cmd_text) => {
                 // Build cache: hash(parent_layer_digest + instruction) → cached layer.
@@ -338,6 +494,8 @@ pub fn execute_build(
                 // Remove any existing entry for this key, then add.
                 config.env.retain(|e| !e.starts_with(&format!("{}=", key)));
                 config.env.push(format!("{}={}", key, value));
+                // Add ENV to substitution context (ARG overrides on conflict).
+                sub_vars.entry(key.clone()).or_insert_with(|| value.clone());
             }
             Instruction::Workdir(ref path) => {
                 eprintln!("Step {}/{}: WORKDIR {}", step, total, path);
@@ -1002,5 +1160,85 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         let k1 = compute_cache_key(&l1, "RUN echo hello");
         let k2 = compute_cache_key(&l2, "RUN echo hello");
         assert_ne!(k1, k2);
+    }
+
+    // -- ARG parsing tests --
+
+    #[test]
+    fn test_parse_arg_with_default() {
+        let content = "FROM alpine\nARG VERSION=1.0";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Arg {
+                name: "VERSION".into(),
+                default: Some("1.0".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_arg_no_default() {
+        let content = "FROM alpine\nARG MY_VAR";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Arg {
+                name: "MY_VAR".into(),
+                default: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_arg_before_from() {
+        let content = "ARG BASE=alpine\nFROM $BASE\nRUN echo hi";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(instructions.len(), 3);
+        assert!(matches!(instructions[0], Instruction::Arg { .. }));
+        assert!(matches!(instructions[1], Instruction::From(_)));
+    }
+
+    #[test]
+    fn test_parse_arg_error_empty() {
+        let content = "FROM alpine\nARG";
+        let err = parse_remfile(content).unwrap_err();
+        assert!(err.to_string().contains("ARG requires"));
+    }
+
+    // -- Variable substitution tests --
+
+    #[test]
+    fn test_substitute_vars_dollar() {
+        let mut vars = HashMap::new();
+        vars.insert("NAME".to_string(), "world".to_string());
+        assert_eq!(substitute_vars("hello $NAME", &vars), "hello world");
+    }
+
+    #[test]
+    fn test_substitute_vars_braces() {
+        let mut vars = HashMap::new();
+        vars.insert("VER".to_string(), "3.19".to_string());
+        assert_eq!(substitute_vars("alpine:${VER}", &vars), "alpine:3.19");
+    }
+
+    #[test]
+    fn test_substitute_vars_escape_dollar() {
+        let vars = HashMap::new();
+        assert_eq!(substitute_vars("cost is $$5", &vars), "cost is $5");
+    }
+
+    #[test]
+    fn test_substitute_vars_unknown() {
+        let vars = HashMap::new();
+        assert_eq!(substitute_vars("hello $NOBODY", &vars), "hello ");
+    }
+
+    #[test]
+    fn test_substitute_vars_mixed() {
+        let mut vars = HashMap::new();
+        vars.insert("A".to_string(), "1".to_string());
+        vars.insert("B".to_string(), "2".to_string());
+        assert_eq!(substitute_vars("$A-${B}-$$", &vars), "1-2-$");
     }
 }

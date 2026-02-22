@@ -1,5 +1,6 @@
 //! `remora build` — build an image from a Remfile.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
@@ -23,6 +24,10 @@ pub struct BuildArgs {
     /// DNS backend: builtin (default) or dnsmasq
     #[clap(long = "dns-backend", value_name = "BACKEND")]
     pub dns_backend: Option<String>,
+
+    /// Set build-time variables (e.g. --build-arg VERSION=1.0)
+    #[clap(long = "build-arg")]
+    pub build_arg: Vec<String>,
 
     /// Build context directory (default: current directory)
     #[clap(default_value = ".")]
@@ -93,6 +98,17 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Parse --build-arg KEY=VALUE pairs into a map.
+    let mut build_args_map = HashMap::new();
+    for arg in &args.build_arg {
+        if let Some((k, v)) = arg.split_once('=') {
+            build_args_map.insert(k.to_string(), v.to_string());
+        } else {
+            // Bare name with no value — use empty string (matches Docker behaviour).
+            build_args_map.insert(arg.clone(), String::new());
+        }
+    }
+
     eprintln!("Building {} from {}", args.tag, remfile_path.display());
 
     let manifest = build::execute_build(
@@ -101,6 +117,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         &args.tag,
         network_mode,
         !args.no_cache,
+        &build_args_map,
     )?;
 
     eprintln!(

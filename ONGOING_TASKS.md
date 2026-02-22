@@ -1,26 +1,48 @@
 # Ongoing Tasks
 
-## Completed: `remora compose` — S-Expression Multi-Service Orchestration
+## Current: Image Build Enhancements (ARG, .remignore, ADD, Multi-stage)
 
-### Summary
+### Context
 
-Added `remora compose up/down/ps/logs` with S-expression compose files. Includes
-a zero-dependency recursive descent parser, typed compose model with validation
-and topological sort, and a full CLI orchestrator with supervisor process,
-TCP readiness polling, scoped naming, DNS registration, and log relay.
+The build engine (`src/build.rs`) supports FROM, RUN, COPY, CMD, ENTRYPOINT, ENV, WORKDIR, EXPOSE, LABEL, USER with a working build cache. Four features remain: ARG, ADD, multi-stage builds, and `.remignore`.
 
-### Changes Made
+### Commit 1: ARG instruction + variable substitution
 
-1. **`src/sexpr.rs`** (NEW): Zero-dependency S-expression parser — `SExpr::Atom`/`List`, `parse()`, full test suite (atoms, quoted strings, nested lists, comments, errors)
-2. **`src/compose.rs`** (NEW): Compose model — `ComposeFile`, `ServiceSpec`, `NetworkSpec`, `Dependency`, `VolumeMount`, `PortMapping`; `parse_compose()` AST-to-struct; `validate()` cross-references; `topo_sort()` Kahn's algorithm with cycle detection
-3. **`src/cli/compose.rs`** (NEW): CLI orchestrator — `compose up` (parse, create scoped networks/volumes, supervisor, topo-order start, TCP readiness, DNS, log relay, monitor); `compose down` (reverse-order SIGTERM/SIGKILL, network/volume/state cleanup); `compose ps` (status table); `compose logs` (prefixed output)
-4. **`src/paths.rs`**: Added `compose_dir()`, `compose_project_dir()`, `compose_state_file()` + tests
-5. **`src/lib.rs`**: Added `pub mod sexpr` and `pub mod compose`
-6. **`src/cli/mod.rs`**: Added `pub mod compose`
-7. **`src/main.rs`**: Added `Compose` subcommand variant + dispatch
-8. **`tests/integration_tests.rs`**: 5 no-root parser/model tests + 1 root test
-9. **`docs/INTEGRATION_TESTS.md`**: Documented all 6 new tests
+- Add `Arg { name, default }` variant to `Instruction`
+- Parser: `ARG NAME=default` or bare `NAME`; allowed before FROM
+- `substitute_vars(text, vars) -> String`: replace `$VAR` / `${VAR}`, `$$` → literal `$`
+- `substitute_instruction(instr, vars) -> Instruction`: clone with substitution
+- Build state: `args_map: HashMap<String, String>` seeded from CLI `--build-arg`
+- `execute_build()` signature: add `build_args: &HashMap<String, String>`
+- CLI: `--build-arg KEY=VALUE` flag
+- Tests: unit + integration
 
-## Next Task
+### Commit 2: .remignore support
 
-(No next task planned — awaiting user direction.)
+- Add `ignore = "0.4"` dependency
+- `load_remignore(context_dir) -> Option<Gitignore>`
+- `copy_dir_filtered(src, dst, ignore, src_root)` — skip matching entries
+- Wire into `execute_copy()` with optional ignore param
+- Tests: unit + integration
+
+### Commit 3: ADD instruction
+
+- Add `ureq`, `bzip2`, `xz2` dependencies
+- `Add { src, dest }` variant
+- URL download, archive extraction (.tar, .tar.gz, .tar.bz2, .tar.xz)
+- `execute_add()` dispatch: URL → download, archive → extract, else → copy
+- Tests: unit + integration
+
+### Commit 4: Multi-stage builds
+
+- `From { image, alias }` and `Copy { src, dest, from_stage }` variants
+- FROM: parse `AS alias`; COPY: parse `--from=name`
+- `split_into_stages()`, `execute_stage()`
+- COPY --from: walk stage layers to find source file
+- Update all pattern matches (~15+ locations)
+- Tests: unit + integration
+
+### Verification
+
+After each commit: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --lib`
+After all 4: user runs `sudo -E cargo test --test integration_tests`

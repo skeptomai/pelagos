@@ -1165,6 +1165,15 @@ instruction list has 10 entries of the correct variant types.
 
 Failure indicates a regression in any instruction parser.
 
+### `test_parse_arg_instruction`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses a Remfile containing ARG before FROM (Docker compat) and ARG after FROM,
+verifying both produce correct `Instruction::Arg` variants with names and defaults.
+Also exercises `substitute_vars` with `$VAR`, `${VAR}`, and `$$` escape sequences.
+
+Failure indicates the ARG parser or variable substitution engine is broken.
+
 ---
 
 ## Port Proxy

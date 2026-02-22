@@ -5830,6 +5830,51 @@ EXPOSE 8080
         assert!(matches!(instructions[8], build::Instruction::Cmd(_)));
         assert!(matches!(instructions[9], build::Instruction::Expose(_)));
     }
+
+    /// test_parse_arg_instruction
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses a Remfile with ARG before and after FROM, verifying the parser
+    /// accepts both positions and produces the expected Instruction::Arg variants
+    /// with correct names and defaults. Also checks that variable substitution
+    /// via `substitute_vars` resolves `$VAR` and `${VAR}` references.
+    ///
+    /// Failure indicates the ARG parser or variable substitution is broken.
+    #[test]
+    fn test_parse_arg_instruction() {
+        // ARG before FROM (Docker compat)
+        let content = "ARG BASE=alpine\nFROM $BASE\nARG VERSION\nRUN echo $VERSION";
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(
+            instructions[0],
+            build::Instruction::Arg {
+                name: "BASE".into(),
+                default: Some("alpine".into())
+            }
+        );
+        assert_eq!(
+            instructions[2],
+            build::Instruction::Arg {
+                name: "VERSION".into(),
+                default: None,
+            }
+        );
+
+        // Variable substitution
+        let mut vars = HashMap::new();
+        vars.insert("BASE".to_string(), "alpine:3.19".to_string());
+        assert_eq!(
+            build::substitute_vars("img=${BASE}", &vars),
+            "img=alpine:3.19"
+        );
+        assert_eq!(
+            build::substitute_vars("$BASE/path", &vars),
+            "alpine:3.19/path"
+        );
+        assert_eq!(build::substitute_vars("$$literal", &vars), "$literal");
+    }
 }
 
 // ── Port proxy tests ────────────────────────────────────────────────────────
