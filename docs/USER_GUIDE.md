@@ -149,15 +149,92 @@ EXPOSE 8080
 
 | Instruction | Syntax | Effect |
 |-------------|--------|--------|
-| `FROM` | `FROM <image>[:<tag>]` | Load base image (must be pulled locally first) |
+| `FROM` | `FROM <image>[:<tag>] [AS <alias>]` | Load base image; optional alias for multi-stage builds |
 | `RUN` | `RUN <command>` | Execute in a container; filesystem changes become a new layer |
-| `COPY` | `COPY <src> <dest>` | Copy file/directory from build context into image as a new layer |
+| `COPY` | `COPY [--from=<stage>] <src> <dest>` | Copy from build context (or from a named stage) into image as a new layer |
+| `ADD` | `ADD <src> <dest>` | Like COPY, but auto-extracts archives (.tar, .tar.gz, .tar.bz2, .tar.xz) and downloads URLs |
 | `CMD` | `CMD ["arg1", "arg2"]` or `CMD command args` | Set default command (JSON array or shell form) |
+| `ENTRYPOINT` | `ENTRYPOINT ["cmd"]` or `ENTRYPOINT cmd` | Set the container entrypoint (JSON array or shell form) |
 | `ENV` | `ENV KEY=VALUE` or `ENV KEY VALUE` | Set an environment variable |
+| `ARG` | `ARG <NAME>[=<default>]` | Declare a build-time variable; override with `--build-arg` |
 | `WORKDIR` | `WORKDIR /path` | Set working directory for subsequent RUN and the final image |
 | `EXPOSE` | `EXPOSE <port>[/protocol]` | Documentation only (no runtime effect) |
+| `LABEL` | `LABEL key=value` | Add metadata label to the image |
+| `USER` | `USER <uid>[:<gid>]` | Set the default user for RUN and the final image |
 
 Comments (`#`) and blank lines are ignored. Continuation lines (trailing `\`) are supported.
+
+### ARG and Build Arguments
+
+Use `ARG` to declare build-time variables that can be overridden from the command line:
+
+```
+ARG VERSION=1.0
+ARG BASE_IMAGE=alpine
+
+FROM ${BASE_IMAGE}:latest
+RUN echo "Building version $VERSION"
+COPY app-${VERSION}.tar.gz /tmp/
+```
+
+- `$VAR` and `${VAR}` are substituted in all instructions after the `ARG` declaration
+- Use `$$` to produce a literal `$` (escape)
+- Override defaults with `--build-arg`: `remora build -t app --build-arg VERSION=2.0 .`
+- `ARG` before `FROM` is valid and allows parameterizing the base image (Docker-compatible)
+
+### ADD vs COPY
+
+Both `ADD` and `COPY` bring files from the build context into the image. Use `COPY` for
+plain file copies — it's simpler and more predictable. Use `ADD` when you need:
+
+- **Archive auto-extraction**: `.tar`, `.tar.gz`, `.tar.bz2`, and `.tar.xz` sources are
+  automatically extracted into the destination directory
+- **URL downloads**: `ADD https://example.com/file.txt /opt/` downloads the URL into the image
+
+```
+COPY config.json /etc/myapp/config.json
+ADD https://example.com/data.tar.gz /opt/data/
+```
+
+### Multi-Stage Builds
+
+Multi-stage builds let you use one stage for building and another for the final image,
+keeping the output small. Each `FROM` instruction starts a new stage:
+
+```
+FROM alpine AS builder
+RUN apk add --no-cache gcc musl-dev
+COPY hello.c /src/hello.c
+RUN gcc -static -o /src/hello /src/hello.c
+
+FROM alpine
+COPY --from=builder /src/hello /usr/local/bin/hello
+CMD ["/usr/local/bin/hello"]
+```
+
+Only the **final stage** produces the output image. Intermediate stages are discarded,
+so build tools and source code don't bloat the result. Use `COPY --from=<stage>` to
+cherry-pick artifacts from earlier stages.
+
+### `.remignore`
+
+Place a `.remignore` file in the build context root to exclude files from `COPY` and `ADD`
+instructions. The syntax is identical to `.gitignore`:
+
+```
+# Ignore build artifacts
+target/
+*.o
+
+# Ignore version control
+.git/
+
+# But include this specific file
+!important.o
+```
+
+This keeps the build context lean and prevents large or sensitive files from being copied
+into the image.
 
 ### Building
 
@@ -215,6 +292,30 @@ sudo remora build -t myapp:latest .
 sudo remora run myapp:latest
 ```
 
+### Multi-Stage Build Example
+
+```bash
+cat > Remfile <<'EOF'
+ARG PROFILE=release
+
+FROM alpine AS builder
+RUN apk add --no-cache rust cargo musl-dev
+COPY . /src
+WORKDIR /src
+RUN cargo build --$PROFILE
+
+FROM alpine
+COPY --from=builder /src/target/release/myapp /usr/local/bin/myapp
+CMD ["/usr/local/bin/myapp"]
+EOF
+
+sudo remora image pull alpine
+sudo remora build -t myapp:latest .
+sudo remora build -t myapp:debug --build-arg PROFILE=debug .
+```
+
+See `examples/multi-stage/` for a complete working example.
+
 ### `build` Reference
 
 ```
@@ -226,6 +327,8 @@ remora build [OPTIONS] [CONTEXT]
 | `--tag <TAG>` | `-t` | Image tag (required), e.g. `myapp:latest` |
 | `--file <PATH>` | `-f` | Path to Remfile (default: `<context>/Remfile`) |
 | `--network <MODE>` | | Network for RUN steps: `bridge`, `pasta`, `none`, `auto` (default) |
+| `--build-arg <KEY=VALUE>` | | Set a build-time variable (can be repeated) |
+| `--no-cache` | | Disable build cache; re-run all steps |
 | `CONTEXT` | | Build context directory (default: `.`) |
 
 `--network auto` selects `bridge` when running as root, `pasta` when rootless.
