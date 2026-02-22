@@ -134,6 +134,23 @@ pub fn port_forwards_file() -> PathBuf {
     runtime_dir().join("port_forwards")
 }
 
+// ── DNS daemon paths ─────────────────────────────────────────────────────────
+
+/// DNS daemon config directory: `<runtime>/dns/`.
+pub fn dns_config_dir() -> PathBuf {
+    runtime_dir().join("dns")
+}
+
+/// DNS daemon PID file: `<runtime>/dns/pid`.
+pub fn dns_pid_file() -> PathBuf {
+    dns_config_dir().join("pid")
+}
+
+/// Per-network DNS config file: `<runtime>/dns/<network_name>`.
+pub fn dns_network_file(name: &str) -> PathBuf {
+    dns_config_dir().join(name)
+}
+
 // ── Per-network directories ─────────────────────────────────────────────────
 
 /// Persistent config directory for all named networks: `<data>/networks/`.
@@ -227,5 +244,17 @@ mod tests {
         assert!(network_ipam_file("frontend").starts_with(&rt));
         assert!(network_nat_refcount_file("frontend").starts_with(&rt));
         assert!(network_port_forwards_file("frontend").starts_with(&rt));
+    }
+
+    #[test]
+    fn test_dns_paths_under_runtime_dir() {
+        let rt = runtime_dir();
+        assert!(dns_config_dir().starts_with(&rt));
+        assert!(dns_pid_file().starts_with(&rt));
+        assert!(dns_network_file("remora0").starts_with(&rt));
+        assert_eq!(
+            dns_network_file("frontend"),
+            dns_config_dir().join("frontend")
+        );
     }
 }

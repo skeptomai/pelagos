@@ -1291,3 +1291,50 @@ not its net1 IP.
 
 Failure indicates `resolve_container_ip_on_shared_network()` is not correctly
 matching networks, causing links to resolve to IPs on unreachable networks.
+
+---
+
+## DNS Service Discovery
+
+### `test_dns_resolves_container_name`
+**Requires:** root, rootfs
+
+Spawns container A (sleep) on a bridge network, registers it with DNS, then
+spawns container B on the same network and runs `nslookup`. Verifies the
+resolved IP matches A's bridge IP.
+
+Failure means the embedded DNS daemon isn't resolving container names correctly.
+
+### `test_dns_upstream_forward`
+**Requires:** root, rootfs
+
+Registers a dummy DNS entry to start the daemon, then resolves `example.com`
+via the gateway DNS. Verifies upstream forwarding works.
+
+Failure means the daemon can't forward queries to upstream DNS servers.
+
+### `test_dns_network_isolation`
+**Requires:** root, rootfs
+
+Registers "alpha" on net1 and "beta" on net2. Container on net2 tries to
+resolve "alpha" — should get NXDOMAIN. Verifies DNS respects network
+boundaries.
+
+Failure means DNS is leaking names across networks.
+
+### `test_dns_multi_network`
+**Requires:** root, rootfs
+
+Container A on net1+net2, registers on both. Container B on net2 resolves A —
+should get A's net2 IP, not net1 IP.
+
+Failure means DNS is returning the wrong IP for multi-network containers.
+
+### `test_dns_daemon_lifecycle`
+**Requires:** root + rootfs
+
+Spawns a holder container to create the bridge, then adds a DNS entry — daemon
+should start (PID file appears, process alive). Removes the entry — daemon
+should auto-exit.
+
+Failure means the daemon lifecycle management is broken.

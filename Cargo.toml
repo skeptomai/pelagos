@@ -24,6 +24,10 @@ tar = "0.4"  # Tar extraction for OCI layers
 tempfile = "3"  # Temp files for layer downloads
 sha2 = "0.10"  # SHA-256 for content-addressable layer digests
 
+[[bin]]
+name = "remora-dns"
+path = "src/bin/remora-dns.rs"
+
 [dev-dependencies]
 serial_test = "3"
 

@@ -6653,3 +6653,581 @@ mod multi_network {
         cleanup_test_network(net2);
     }
 }
+
+mod dns {
+    use super::*;
+    use remora::network::{Ipv4Net, NetworkDef};
+
+    fn cleanup_test_network(name: &str) {
+        let config_dir = remora::paths::network_config_dir(name);
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let runtime_dir = remora::paths::network_runtime_dir(name);
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        let bridge = format!("rm-{}", name);
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", &bridge])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn create_test_network(name: &str, cidr: &str) {
+        cleanup_test_network(name);
+        let subnet = Ipv4Net::from_cidr(cidr).unwrap();
+        let net = NetworkDef {
+            name: name.to_string(),
+            subnet: subnet.clone(),
+            gateway: subnet.gateway(),
+            bridge_name: format!("rm-{}", name),
+        };
+        net.save().expect("save network");
+    }
+
+    /// Clean up DNS config files and kill daemon.
+    fn cleanup_dns() {
+        let dns_dir = remora::paths::dns_config_dir();
+        // Kill daemon if running.
+        let pid_file = dns_dir.join("pid");
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = content.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dns_dir);
+    }
+
+    /// Container B resolves container A by name via the embedded DNS daemon.
+    ///
+    /// Requires root + rootfs.
+    ///
+    /// Spawns container A (sleep) on a bridge network, registers it with DNS,
+    /// then spawns container B on the same network and runs `nslookup A <gateway>`.
+    /// Verifies the resolved IP matches A's bridge IP.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_resolves_container_name() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_resolves_container_name (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_resolves_container_name (no rootfs)");
+                return;
+            }
+        };
+
+        let net_name = "dnstest1";
+        cleanup_dns();
+        create_test_network(net_name, "10.90.1.0/24");
+
+        // Spawn container A (long-running sleep).
+        let mut server = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn server");
+
+        let server_ip = server.container_ip().expect("server should have IP");
+
+        // Register server with DNS daemon.
+        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+        remora::dns::dns_add_entry(
+            net_name,
+            "server-a",
+            server_ip.parse().unwrap(),
+            net_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("dns_add_entry");
+
+        // Give the daemon time to start and bind to the gateway.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Spawn container B to resolve server-a.
+        let resolve_cmd = format!(
+            "nslookup server-a {} 2>&1 || echo 'NSLOOKUP_FAILED'",
+            net_def.gateway
+        );
+        let client = Command::new("/bin/sh")
+            .args(&["-c", &resolve_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, stderr_raw) = client.wait_with_output().expect("client wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+        let stderr = String::from_utf8_lossy(&stderr_raw);
+
+        assert!(
+            stdout.contains(&server_ip),
+            "nslookup should resolve server-a to {}, stdout: {}, stderr: {}",
+            server_ip,
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        // Cleanup.
+        remora::dns::dns_remove_entry(net_name, "server-a").ok();
+        unsafe { libc::kill(server.pid(), libc::SIGTERM) };
+        let _ = server.wait();
+        cleanup_dns();
+        cleanup_test_network(net_name);
+    }
+
+    /// Container on a bridge can resolve external domains via upstream DNS forwarding.
+    ///
+    /// Requires root + rootfs.
+    ///
+    /// Runs `nslookup example.com <gateway>` inside a container on a bridge
+    /// network. The DNS daemon should forward the query to upstream (8.8.8.8)
+    /// and relay the response.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_upstream_forward() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_upstream_forward (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_upstream_forward (no rootfs)");
+                return;
+            }
+        };
+
+        let net_name = "dnstest2";
+        cleanup_dns();
+        create_test_network(net_name, "10.90.2.0/24");
+
+        // Spawn a long-running container to create the bridge interface.
+        // The DNS daemon needs the bridge to exist so it can bind to the gateway IP.
+        let mut holder = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn holder");
+
+        // Register a dummy entry to start the DNS daemon (bridge now exists).
+        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+        remora::dns::dns_add_entry(
+            net_name,
+            "dummy",
+            "10.90.2.99".parse().unwrap(),
+            net_def.gateway,
+            &["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+        )
+        .expect("dns_add_entry");
+
+        // Give daemon time to start and bind.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Resolve example.com via the gateway DNS.
+        let resolve_cmd = format!(
+            "nslookup example.com {} 2>&1 || echo 'NSLOOKUP_FAILED'",
+            net_def.gateway
+        );
+        let client = Command::new("/bin/sh")
+            .args(&["-c", &resolve_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, stderr_raw) = client.wait_with_output().expect("client wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+        let stderr = String::from_utf8_lossy(&stderr_raw);
+
+        // example.com should resolve to some IP (93.184.x.x or similar).
+        assert!(
+            !stdout.contains("NSLOOKUP_FAILED")
+                && (stdout.contains("Address") || stdout.contains("Name")),
+            "nslookup example.com should succeed via upstream, stdout: {}, stderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        // Cleanup.
+        remora::dns::dns_remove_entry(net_name, "dummy").ok();
+        unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+        let _ = holder.wait();
+        cleanup_dns();
+        cleanup_test_network(net_name);
+    }
+
+    /// DNS respects network boundaries: container on net1 cannot resolve
+    /// containers on net2.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_network_isolation() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_network_isolation (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_network_isolation (no rootfs)");
+                return;
+            }
+        };
+
+        let net1 = "dnsiso1";
+        let net2 = "dnsiso2";
+        cleanup_dns();
+        create_test_network(net1, "10.90.3.0/24");
+        create_test_network(net2, "10.90.4.0/24");
+
+        // Spawn holder containers to create both bridge interfaces.
+        // The DNS daemon needs bridges to exist so it can bind to gateway IPs.
+        let mut holder1 = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn holder1");
+
+        let mut holder2 = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net2.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn holder2");
+
+        // Register "alpha" on net1 and "beta" on net2.
+        let net1_def = remora::network::load_network_def(net1).expect("load net1");
+        remora::dns::dns_add_entry(
+            net1,
+            "alpha",
+            "10.90.3.5".parse().unwrap(),
+            net1_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("add alpha");
+
+        let net2_def = remora::network::load_network_def(net2).expect("load net2");
+        remora::dns::dns_add_entry(
+            net2,
+            "beta",
+            "10.90.4.5".parse().unwrap(),
+            net2_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("add beta");
+
+        // Give daemon time to start and bind both IPs.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Container on net2 tries to resolve "alpha" (which is on net1) — should get NXDOMAIN.
+        let resolve_cmd = format!("nslookup alpha {} 2>&1; echo EXIT=$?", net2_def.gateway);
+        let client = Command::new("/bin/sh")
+            .args(&["-c", &resolve_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net2.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, _stderr) = client.wait_with_output().expect("client wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+
+        // alpha should NOT resolve on net2.
+        assert!(
+            !stdout.contains("10.90.3.5"),
+            "alpha's IP should NOT be resolvable from net2, got: {}",
+            stdout.trim()
+        );
+
+        // But "beta" should resolve on net2.
+        let resolve_beta = format!("nslookup beta {} 2>&1", net2_def.gateway);
+        let client2 = Command::new("/bin/sh")
+            .args(&["-c", &resolve_beta])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net2.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client2");
+
+        let (_status, stdout_raw, _stderr) = client2.wait_with_output().expect("client2 wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+
+        assert!(
+            stdout.contains("10.90.4.5"),
+            "beta should resolve on net2 to 10.90.4.5, got: {}",
+            stdout.trim()
+        );
+
+        // Cleanup.
+        remora::dns::dns_remove_entry(net1, "alpha").ok();
+        remora::dns::dns_remove_entry(net2, "beta").ok();
+        unsafe { libc::kill(holder1.pid(), libc::SIGTERM) };
+        unsafe { libc::kill(holder2.pid(), libc::SIGTERM) };
+        let _ = holder1.wait();
+        let _ = holder2.wait();
+        cleanup_dns();
+        cleanup_test_network(net1);
+        cleanup_test_network(net2);
+    }
+
+    /// Container A on net1+net2, container B on net2 — B resolves A to A's net2 IP.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_multi_network() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_multi_network (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_multi_network (no rootfs)");
+                return;
+            }
+        };
+
+        let net1 = "dnsmn1";
+        let net2 = "dnsmn2";
+        cleanup_dns();
+        create_test_network(net1, "10.90.5.0/24");
+        create_test_network(net2, "10.90.6.0/24");
+
+        // Spawn container A on net1 + net2 (multi-network).
+        let mut server = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net1.to_string()))
+            .with_additional_network(net2)
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn server");
+
+        let ip_net1 = server.container_ip().expect("server IP on net1");
+        let ip_net2 = server.container_ip_on(net2).expect("server IP on net2");
+
+        assert!(ip_net1.starts_with("10.90.5."), "net1 IP: {}", ip_net1);
+        assert!(ip_net2.starts_with("10.90.6."), "net2 IP: {}", ip_net2);
+
+        // Register server "multi-a" on both networks.
+        let net1_def = remora::network::load_network_def(net1).expect("load net1");
+        let net2_def = remora::network::load_network_def(net2).expect("load net2");
+        remora::dns::dns_add_entry(
+            net1,
+            "multi-a",
+            ip_net1.parse().unwrap(),
+            net1_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("add to net1");
+        remora::dns::dns_add_entry(
+            net2,
+            "multi-a",
+            ip_net2.parse().unwrap(),
+            net2_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("add to net2");
+
+        // Give the daemon time to start and bind both IPs.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Container B on net2 resolves "multi-a" — should get net2 IP.
+        let resolve_cmd = format!("nslookup multi-a {} 2>&1", net2_def.gateway);
+        let client = Command::new("/bin/sh")
+            .args(&["-c", &resolve_cmd])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net2.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn client");
+
+        let (_status, stdout_raw, _stderr) = client.wait_with_output().expect("client wait");
+        let stdout = String::from_utf8_lossy(&stdout_raw);
+
+        // Should resolve to net2 IP, not net1 IP.
+        assert!(
+            stdout.contains(&ip_net2),
+            "should resolve multi-a to net2 IP {}, got: {}",
+            ip_net2,
+            stdout.trim()
+        );
+
+        // Cleanup.
+        remora::dns::dns_remove_entry(net1, "multi-a").ok();
+        remora::dns::dns_remove_entry(net2, "multi-a").ok();
+        unsafe { libc::kill(server.pid(), libc::SIGTERM) };
+        let _ = server.wait();
+        cleanup_dns();
+        cleanup_test_network(net1);
+        cleanup_test_network(net2);
+    }
+
+    /// DNS daemon starts when first container registers, and exits when the
+    /// last container deregisters.
+    ///
+    /// Requires root + rootfs.
+    #[test]
+    #[serial(nat)]
+    fn test_dns_daemon_lifecycle() {
+        if !is_root() {
+            eprintln!("Skipping test_dns_daemon_lifecycle (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_dns_daemon_lifecycle (no rootfs)");
+                return;
+            }
+        };
+
+        let net_name = "dnslc";
+        cleanup_dns();
+        create_test_network(net_name, "10.90.7.0/24");
+
+        // Spawn a holder container to create the bridge interface so the
+        // daemon can bind to the gateway IP.
+        let mut holder = Command::new("/bin/sleep")
+            .args(&["30"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::BridgeNamed(net_name.to_string()))
+            .with_nat()
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn holder");
+
+        let net_def = remora::network::load_network_def(net_name).expect("load net def");
+
+        // No daemon should be running initially.
+        let pid_file = remora::paths::dns_pid_file();
+        assert!(
+            !pid_file.exists(),
+            "PID file should not exist before any DNS entries"
+        );
+
+        // Add an entry — daemon should start.
+        remora::dns::dns_add_entry(
+            net_name,
+            "lifecycle-test",
+            "10.90.7.5".parse().unwrap(),
+            net_def.gateway,
+            &["8.8.8.8".to_string()],
+        )
+        .expect("dns_add_entry");
+
+        // Give daemon time to start.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert!(
+            pid_file.exists(),
+            "PID file should exist after DNS entry added"
+        );
+
+        // Read PID and verify process is alive.
+        let pid_str = std::fs::read_to_string(&pid_file).expect("read PID file");
+        let pid: i32 = pid_str.trim().parse().expect("parse PID");
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "DNS daemon (PID {}) should be alive",
+            pid
+        );
+
+        // Remove the entry — daemon should eventually exit (SIGHUP triggers reload,
+        // daemon sees no entries and exits).
+        remora::dns::dns_remove_entry(net_name, "lifecycle-test").expect("dns_remove_entry");
+
+        // Give daemon time to process SIGHUP and exit.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "DNS daemon (PID {}) should have exited after last entry removed",
+            pid
+        );
+
+        // Cleanup.
+        unsafe { libc::kill(holder.pid(), libc::SIGTERM) };
+        let _ = holder.wait();
+        cleanup_dns();
+        cleanup_test_network(net_name);
+    }
+}

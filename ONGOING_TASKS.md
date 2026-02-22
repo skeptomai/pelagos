@@ -1,96 +1,117 @@
 # Ongoing Tasks
 
-## Current Task: Multi-Network Containers
+## Current Task: Embedded DNS Server for Container Name Resolution
 
-Allow containers to join multiple bridge networks simultaneously. This enables
-network isolation patterns like frontend/backend separation.
+### Context
 
-Target architecture:
-```
-frontend (10.88.1.0/24):  proxy ←→ app
-backend  (10.88.2.0/24):           app ←→ redis
-```
-Redis is isolated from proxy — they share no network.
+Remora containers currently use `--link name:alias` to resolve other containers
+by name. The goal is automatic DNS-based service discovery: any container on a
+bridge network can resolve other containers on the same network by name, with no
+`--link` needed.
 
-### Step 1: Network layer — `attach_network_to_netns()`
+**Architecture model: Podman's aardvark-dns.** A custom Rust micro-daemon binary
+(`remora-dns`) that:
+- Is forked by the first `remora run` on a network
+- Listens on each bridge gateway IP (e.g., `172.19.0.1:53`)
+- Reads per-network config files for container name → IP mappings
+- Reloads on SIGHUP when containers start/stop
+- Auto-exits when all config files are empty (last container left)
 
-**File: `src/network.rs`**
+### Implementation Steps
 
-New function `attach_network_to_netns(ns_name, network_name, iface_name)`:
-1. Load NetworkDef, ensure bridge exists
-2. Allocate IP from per-network IPAM
-3. Generate unique veth pair via `veth_names_for_network(ns_name, network_name)`
-4. Create veth pair, move peer into existing netns, rename to `iface_name`
-5. Assign IP, bring up, add subnet route only (no default route)
-6. Attach host-side veth to bridge
+#### Step 1: `src/bin/remora-dns.rs` — DNS daemon binary (~400 lines)
 
-New `teardown_secondary_network(setup)` — deletes veth only (not the netns).
+New binary. Minimal DNS server compiled as a separate binary in the same crate.
 
-New `veth_names_for_network(ns_name, network_name)` — FNV-1a hash of
-`"ns_name:network_name"` for unique veth names.
+- DNS packet parsing: only A-record queries
+- Config file format: one file per network in `/run/remora/dns/`
+  ```
+  172.19.0.1 8.8.8.8,1.1.1.1
+  redis 172.19.0.2
+  app 172.19.0.3
+  ```
+- Server loop: bind UDP sockets to gateway IPs, poll with 100ms timeout
+- SIGHUP handler: reload config files, rebind/unbind sockets
+- Auto-exit: when all config files are empty/gone
+- Upstream forwarding: relay unknown queries to upstream DNS servers
+- PID file: `<config-dir>/pid`
+- Unit tests: parse/build DNS packets, config parsing
 
-### Step 2: Container multi-network support
+#### Step 2: `src/dns.rs` — DNS daemon management library
 
-**File: `src/container.rs`**
+- `ensure_dns_daemon()` — start daemon if not running (double-fork + exec)
+- `dns_add_entry()` — add container to network config file, SIGHUP daemon
+- `dns_remove_entry()` — remove container, SIGHUP daemon
+- `daemon_pid()` / `signal_reload()` — PID file management
+- Config file locking with flock
 
-- Add `additional_networks: Vec<String>` to Command
-- Add `with_additional_network(network_name)` builder method
-- In spawn()/spawn_interactive(): after primary bridge setup, iterate additional_networks
-  and call `attach_network_to_netns()` for each
-- Add `secondary_networks: Vec<NetworkSetup>` to Child
-- Add `container_ips()` and `container_ip_on(network_name)` accessors
-- Teardown: secondary networks torn down before primary
+#### Step 3: `src/paths.rs` — DNS paths
 
-### Step 3: Smart link resolution
+- `dns_config_dir()` → `<runtime>/dns/`
+- `dns_pid_file()` → `<runtime>/dns/pid`
+- `dns_network_file(name)` → `<runtime>/dns/<network_name>`
 
-Update link resolution in spawn() to check shared networks first.
-Add `resolve_container_ip_on_network(name, network_name)`.
+#### Step 4: `src/container.rs` — Auto-inject gateway as nameserver
 
-### Step 4: Container state with multiple IPs
+In `spawn()` and `spawn_interactive()`, auto-inject bridge gateway IP(s) as
+primary nameservers in resolv.conf when bridge networking is active. User
+`--dns` servers appended as fallback.
 
-Add `network_ips: HashMap<String, String>` to ContainerState.
-Populate from `child.container_ips()` after spawn.
+#### Step 5: `src/cli/run.rs` — Register/deregister containers with DNS
 
-### Step 5: CLI `--network` repeatable
+After spawn: call `dns_add_entry()` for primary + secondary networks.
+On container exit: call `dns_remove_entry()` for all networks.
 
-Change `--network` from `String` to `Vec<String>`. First value is primary,
-additional values are secondary bridge networks.
+#### Step 6: Module registration + Cargo.toml
 
-### Step 6: Integration tests
+- `src/lib.rs`: add `pub mod dns;`
+- `Cargo.toml`: add `[[bin]]` for `remora-dns`
 
-4 tests in `multi_network` module:
-- `test_multi_network_dual_interface`
-- `test_multi_network_isolation`
-- `test_multi_network_teardown`
-- `test_multi_network_link_resolution`
+#### Step 7: Integration tests (5 new tests)
 
-### Step 7: Update web-stack example
+| Test | Asserts |
+|------|---------|
+| `test_dns_resolves_container_name` | Container B resolves A by name |
+| `test_dns_upstream_forward` | Container resolves `example.com` |
+| `test_dns_network_isolation` | A on net1, B on net2 → NXDOMAIN |
+| `test_dns_multi_network` | A on net1+net2, B on net2 → resolves A's net2 IP |
+| `test_dns_daemon_lifecycle` | Daemon starts/stops with containers |
 
-Create frontend/backend networks, launch with isolation, add isolation test.
+#### Step 8: Documentation
 
-### Step 8: Documentation
+- `docs/INTEGRATION_TESTS.md` — document 5 new tests
+- `CLAUDE.md` — update networking section
 
-Update CLAUDE.md, INTEGRATION_TESTS.md.
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/bin/remora-dns.rs` | **NEW** — DNS daemon binary |
+| `src/dns.rs` | **NEW** — daemon management library |
+| `src/lib.rs` | Add `pub mod dns;` |
+| `src/paths.rs` | Add DNS path functions |
+| `src/container.rs` | Auto-inject gateway nameserver |
+| `src/cli/run.rs` | Register/deregister DNS entries |
+| `Cargo.toml` | Add `[[bin]]` |
+| `tests/integration_tests.rs` | 5 new tests |
+| `docs/INTEGRATION_TESTS.md` | Document new tests |
+| `CLAUDE.md` | Update networking docs |
+
+---
+
+## Next Task: `remora compose`
+
+Declarative multi-container stacks from a YAML file — replacing manual shell
+scripts like `examples/web-stack/run.sh`.
 
 ---
 
 ## Previously Completed
 
-### High-Impact Quick Wins (v0.3.3)
-- **ENTRYPOINT/LABEL/USER** build instructions
-- **Build cache**: sha256(parent_layer + instruction) keyed
-- **Localhost port forwarding**: userspace TCP proxy
-
-### Multi-Network Support (v0.3.2)
-- User-defined bridge networks with per-network subnets, IPAM, NAT
-- `remora network create/ls/rm/inspect` CLI
-- `--network <name>` on run/build
-
-### JSON Output + Container Inspect (v0.3.2)
-- `--format json` on all list commands
-- `remora container inspect <name>`
-
-### `remora build` (v0.3.0)
-- Remfile parser, overlay snapshot per RUN step, build cache
+### Multi-Network Containers (v0.4.0)
+- Containers join multiple bridge networks simultaneously
+- `attach_network_to_netns()` for secondary interfaces (eth1, eth2, ...)
+- Smart `--link` resolution across shared networks
+- 4 new integration tests
 
 ### Full feature list in CLAUDE.md

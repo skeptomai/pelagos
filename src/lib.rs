@@ -7,6 +7,7 @@ pub mod build;
 pub mod cgroup;
 pub mod cgroup_rootless;
 pub mod container;
+pub mod dns;
 pub mod idmap;
 pub mod image;
 pub mod network;

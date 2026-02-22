@@ -607,15 +607,22 @@ fn run_foreground(
     let mut state2 = state;
     state2.pid = pid;
     state2.bridge_ip = child.container_ip();
-    state2.network_ips = child
+    let all_ips: Vec<(String, String)> = child
         .container_ips()
         .into_iter()
         .map(|(name, ip)| (name.to_string(), ip))
         .collect();
+    state2.network_ips = all_ips.iter().cloned().collect();
     write_state(&state2)?;
+
+    // Register container with embedded DNS daemon for each bridge network.
+    register_dns(&name, &all_ips);
 
     let exit = child.wait().map_err(|e| format!("wait failed: {}", e))?;
     let code = exit.code().unwrap_or(1);
+
+    // Deregister container from DNS.
+    deregister_dns(&name, &all_ips);
 
     // Update final state
     state2.status = ContainerStatus::Exited;
@@ -708,12 +715,16 @@ fn run_detached(
             updated.pid = pid;
             updated.watcher_pid = watcher_pid;
             updated.bridge_ip = child.container_ip();
-            updated.network_ips = child
+            let all_ips: Vec<(String, String)> = child
                 .container_ips()
                 .into_iter()
                 .map(|(name, ip)| (name.to_string(), ip))
                 .collect();
+            updated.network_ips = all_ips.iter().cloned().collect();
             let _ = write_state(&updated);
+
+            // Register container with embedded DNS daemon.
+            register_dns(&name, &all_ips);
 
             // Relay stdout and stderr to log files concurrently.
             let mut stdout_handle = child.take_stdout();
@@ -765,6 +776,9 @@ fn run_detached(
             let _ = t_out.join();
             let _ = t_err.join();
 
+            // Deregister container from DNS.
+            deregister_dns(&name, &all_ips);
+
             // Update final state.
             updated.status = ContainerStatus::Exited;
             updated.exit_code = exit.code();
@@ -778,4 +792,50 @@ fn run_detached(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DNS registration helpers
+// ---------------------------------------------------------------------------
+
+/// Register a container with the embedded DNS daemon for each bridge network.
+fn register_dns(container_name: &str, network_ips: &[(String, String)]) {
+    for (net_name, ip_str) in network_ips {
+        let ip: std::net::Ipv4Addr = match ip_str.parse() {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+        let net_def = match remora::network::load_network_def(net_name) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if let Err(e) = remora::dns::dns_add_entry(
+            net_name,
+            container_name,
+            ip,
+            net_def.gateway,
+            &["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+        ) {
+            log::warn!(
+                "dns: failed to register '{}' on {}: {}",
+                container_name,
+                net_name,
+                e
+            );
+        }
+    }
+}
+
+/// Deregister a container from the embedded DNS daemon for each bridge network.
+fn deregister_dns(container_name: &str, network_ips: &[(String, String)]) {
+    for (net_name, _ip_str) in network_ips {
+        if let Err(e) = remora::dns::dns_remove_entry(net_name, container_name) {
+            log::warn!(
+                "dns: failed to deregister '{}' from {}: {}",
+                container_name,
+                net_name,
+                e
+            );
+        }
+    }
 }

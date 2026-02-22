@@ -1915,9 +1915,28 @@ impl Command {
         let oci_sync = self.oci_sync;
         let container_cwd = self.container_cwd.clone();
 
+        // DNS: auto-inject bridge gateway IP(s) as primary nameservers for the
+        // embedded DNS daemon, then append user-specified --dns servers as fallback.
+        let mut auto_dns: Vec<String> = Vec::new();
+        if let Some(ref net) = bridge_network {
+            if let Ok(net_def) = crate::network::load_network_def(&net.network_name) {
+                auto_dns.push(net_def.gateway.to_string());
+            }
+        }
+        for sec in &secondary_networks {
+            if let Ok(net_def) = crate::network::load_network_def(&sec.network_name) {
+                let gw = net_def.gateway.to_string();
+                if !auto_dns.contains(&gw) {
+                    auto_dns.push(gw);
+                }
+            }
+        }
+        // Append user-specified DNS servers as fallback.
+        auto_dns.extend(self.dns_servers.iter().cloned());
+
         // DNS: write nameservers to a per-container temp file; bind-mount into container.
         // Requires Namespace::MOUNT so the bind mount stays in the container's private namespace.
-        if !self.dns_servers.is_empty() {
+        if !auto_dns.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
                 return Err(Error::Io(io::Error::other(
                     "with_dns requires Namespace::MOUNT",
@@ -1927,13 +1946,13 @@ impl Command {
                 return Err(Error::Io(io::Error::other("with_dns requires with_chroot")));
             }
         }
-        let dns_temp_dir: Option<PathBuf> = if !self.dns_servers.is_empty() {
+        let dns_temp_dir: Option<PathBuf> = if !auto_dns.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = DNS_COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = crate::paths::dns_dir(pid, n);
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::new();
-            for s in &self.dns_servers {
+            for s in &auto_dns {
                 content.push_str("nameserver ");
                 content.push_str(s);
                 content.push('\n');
@@ -3364,8 +3383,26 @@ impl Command {
         let oci_sync = self.oci_sync;
         let container_cwd = self.container_cwd.clone();
 
+        // DNS: auto-inject bridge gateway IP(s) as primary nameservers for the
+        // embedded DNS daemon, then append user-specified --dns servers as fallback.
+        let mut auto_dns: Vec<String> = Vec::new();
+        if let Some(ref net) = bridge_network {
+            if let Ok(net_def) = crate::network::load_network_def(&net.network_name) {
+                auto_dns.push(net_def.gateway.to_string());
+            }
+        }
+        for sec in &secondary_networks {
+            if let Ok(net_def) = crate::network::load_network_def(&sec.network_name) {
+                let gw = net_def.gateway.to_string();
+                if !auto_dns.contains(&gw) {
+                    auto_dns.push(gw);
+                }
+            }
+        }
+        auto_dns.extend(self.dns_servers.iter().cloned());
+
         // DNS: write nameservers to a per-container temp file; bind-mount into container.
-        if !self.dns_servers.is_empty() {
+        if !auto_dns.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
                 return Err(Error::Io(io::Error::other(
                     "with_dns requires Namespace::MOUNT",
@@ -3375,13 +3412,13 @@ impl Command {
                 return Err(Error::Io(io::Error::other("with_dns requires with_chroot")));
             }
         }
-        let dns_temp_dir: Option<PathBuf> = if !self.dns_servers.is_empty() {
+        let dns_temp_dir: Option<PathBuf> = if !auto_dns.is_empty() {
             let pid = unsafe { libc::getpid() };
             let n = DNS_COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = crate::paths::dns_dir(pid, n);
             std::fs::create_dir_all(&dir).map_err(Error::Io)?;
             let mut content = String::new();
-            for s in &self.dns_servers {
+            for s in &auto_dns {
                 content.push_str("nameserver ");
                 content.push_str(s);
                 content.push('\n');

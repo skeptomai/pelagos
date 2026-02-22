@@ -905,3 +905,26 @@ dnf install passt
 ### Container exec fails with "no container namespaces found"
 
 The target container must be running. Check with `remora ps`.
+
+### Stale networking state after crash
+
+If a container or test run is killed without clean shutdown (e.g. `kill -9`, system
+crash, interrupted test suite), nftables tables, iptables rules, and refcount files
+may be left behind. Symptoms include containers failing to start networking, or
+cleanup assertions failing in integration tests.
+
+To reset:
+
+```bash
+# List and remove stale nftables tables
+sudo nft list tables | grep remora
+sudo nft delete table ip remora-remora0  # (or whatever table name)
+
+# Clear stale refcount and port-forward files
+sudo rm -f /run/remora/networks/*/nat_refcount /run/remora/networks/*/port_forwards
+
+# Remove stale iptables FORWARD rules (if using iptables-nft)
+sudo iptables -S FORWARD | grep remora  # inspect first
+sudo iptables -D FORWARD -s 172.19.0.0/24 -j ACCEPT 2>/dev/null
+sudo iptables -D FORWARD -d 172.19.0.0/24 -j ACCEPT 2>/dev/null
+```
