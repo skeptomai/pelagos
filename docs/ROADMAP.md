@@ -204,14 +204,6 @@ Build custom OCI images from Remfiles (simplified Dockerfiles).
 
 ## Planned
 
-### Image Build Enhancements
-
-Additional Remfile instructions and build optimisations:
-- ENTRYPOINT, ADD, LABEL, USER, ARG instructions
-- Multi-stage builds (`FROM ... AS builder` / `COPY --from=builder`)
-- Build cache (skip unchanged RUN steps)
-- `.remignore` file (exclude from build context)
-
 ### AppArmor / SELinux (Moderate Effort)
 
 Apply MAC profiles to containers. Adds defence-in-depth on top of seccomp.

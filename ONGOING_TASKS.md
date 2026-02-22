@@ -1,48 +1,27 @@
 # Ongoing Tasks
 
-## Current: Image Build Enhancements (ARG, .remignore, ADD, Multi-stage)
+## Completed: Image Build Enhancements (ARG, .remignore, ADD, Multi-stage)
 
-### Context
+### Summary
 
-The build engine (`src/build.rs`) supports FROM, RUN, COPY, CMD, ENTRYPOINT, ENV, WORKDIR, EXPOSE, LABEL, USER with a working build cache. Four features remain: ARG, ADD, multi-stage builds, and `.remignore`.
+Added four build engine features across 4 commits:
 
-### Commit 1: ARG instruction + variable substitution
+1. **ARG instruction + variable substitution**: `ARG NAME=default` with `$VAR`/`${VAR}` substitution, `--build-arg` CLI flag, ARG before FROM (Docker compat)
+2. **`.remignore` support**: gitignore-style context filtering via `ignore` crate, `copy_dir_filtered()`, wired into COPY and ADD
+3. **ADD instruction**: URL download (ureq), archive auto-extraction (.tar/.tar.gz/.tar.bz2/.tar.xz), plain copy fallback
+4. **Multi-stage builds**: `FROM ... AS alias`, `COPY --from=stage`, `split_into_stages()`, `execute_stage()`, layer-walk for cross-stage copies
 
-- Add `Arg { name, default }` variant to `Instruction`
-- Parser: `ARG NAME=default` or bare `NAME`; allowed before FROM
-- `substitute_vars(text, vars) -> String`: replace `$VAR` / `${VAR}`, `$$` → literal `$`
-- `substitute_instruction(instr, vars) -> Instruction`: clone with substitution
-- Build state: `args_map: HashMap<String, String>` seeded from CLI `--build-arg`
-- `execute_build()` signature: add `build_args: &HashMap<String, String>`
-- CLI: `--build-arg KEY=VALUE` flag
-- Tests: unit + integration
+### Changes Made
 
-### Commit 2: .remignore support
+1. **`Cargo.toml`**: Added `ignore`, `ureq`, `bzip2`, `xz2` dependencies
+2. **`src/build.rs`**: ARG variant, ADD variant, From/Copy variant restructuring, `substitute_vars()`, `substitute_instruction()`, `load_remignore()`, `copy_dir_filtered()`, `execute_add()`, `execute_add_url()`, `execute_add_archive()`, `BuildStage`, `split_into_stages()`, `execute_stage()`, `execute_copy_from_stage()`, 13 new unit tests
+3. **`src/cli/build.rs`**: `--build-arg` flag, HashMap parsing
+4. **`src/image.rs`**: Added `Default` derive to `ImageConfig`
+5. **`tests/integration_tests.rs`**: 5 new integration tests (parser + filtering)
+6. **`docs/INTEGRATION_TESTS.md`**: Documented all 5 new tests
+7. **`CLAUDE.md`**: Updated build features section
+8. **`docs/ROADMAP.md`**: Removed completed "Image Build Enhancements" from planned section
 
-- Add `ignore = "0.4"` dependency
-- `load_remignore(context_dir) -> Option<Gitignore>`
-- `copy_dir_filtered(src, dst, ignore, src_root)` — skip matching entries
-- Wire into `execute_copy()` with optional ignore param
-- Tests: unit + integration
+## Next Task
 
-### Commit 3: ADD instruction
-
-- Add `ureq`, `bzip2`, `xz2` dependencies
-- `Add { src, dest }` variant
-- URL download, archive extraction (.tar, .tar.gz, .tar.bz2, .tar.xz)
-- `execute_add()` dispatch: URL → download, archive → extract, else → copy
-- Tests: unit + integration
-
-### Commit 4: Multi-stage builds
-
-- `From { image, alias }` and `Copy { src, dest, from_stage }` variants
-- FROM: parse `AS alias`; COPY: parse `--from=name`
-- `split_into_stages()`, `execute_stage()`
-- COPY --from: walk stage layers to find source file
-- Update all pattern matches (~15+ locations)
-- Tests: unit + integration
-
-### Verification
-
-After each commit: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --lib`
-After all 4: user runs `sudo -E cargo test --test integration_tests`
+(No next task planned — awaiting user direction.)

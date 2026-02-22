@@ -148,14 +148,18 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **`src/cli/network.rs`**: `cmd_network_create()`, `cmd_network_ls()`, `cmd_network_rm()`, `cmd_network_inspect()`
 
 **Image Build (COMPLETE ✅):**
-- **`remora build -t <tag> [--file <path>] [--network bridge|pasta] [context]`**: build images from Remfiles
-- **Remfile parser**: FROM, RUN, COPY, CMD, ENTRYPOINT (JSON + shell form), ENV, WORKDIR, EXPOSE, LABEL, USER
+- **`remora build -t <tag> [--file <path>] [--network bridge|pasta] [--build-arg KEY=VALUE] [context]`**: build images from Remfiles
+- **Remfile parser**: FROM (+ `AS alias`), RUN, COPY (+ `--from=stage`), ADD, CMD, ENTRYPOINT (JSON + shell form), ENV, WORKDIR, EXPOSE, LABEL, USER, ARG
 - **Build engine**: overlay snapshot per RUN step, context COPY as layers, config-only instructions
+- **Multi-stage builds**: `FROM ... AS builder` / `COPY --from=builder`; stages split at FROM boundaries; only final stage produces output manifest
+- **ARG instruction**: `ARG NAME=default` with `$VAR`/`${VAR}` substitution; `--build-arg` CLI flag; ARG allowed before FROM (Docker compat)
+- **ADD instruction**: URL download (http/https via ureq), local archive auto-extraction (.tar, .tar.gz, .tar.bz2, .tar.xz), plain copy fallback
+- **`.remignore`**: gitignore-style patterns to exclude files from COPY/ADD context (via `ignore` crate)
 - **Build cache**: sha256(parent_layer + instruction) keyed layer cache; `--no-cache` flag to bypass
 - **Layer creation**: tar+gzip for sha256 digest, extracted dir stored in layer store (dedup)
-- **Path traversal protection**: COPY rejects sources outside the build context
+- **Path traversal protection**: COPY/ADD rejects sources outside the build context
 - **`wait_preserve_overlay()`**: Child method that skips overlay cleanup for build engine
-- **`src/build.rs`**: `Instruction`, `parse_remfile()`, `execute_build()`, `create_layer_from_dir()`, `BuildError`
+- **`src/build.rs`**: `Instruction`, `parse_remfile()`, `execute_build()`, `execute_stage()`, `split_into_stages()`, `substitute_vars()`, `create_layer_from_dir()`, `BuildError`
 - **`src/cli/build.rs`**: `BuildArgs`, `cmd_build()`
 
 **Container Exec (COMPLETE ✅):**
