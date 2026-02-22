@@ -24,6 +24,9 @@ tar = "0.4"  # Tar extraction for OCI layers
 tempfile = "3"  # Temp files for layer downloads
 sha2 = "0.10"  # SHA-256 for content-addressable layer digests
 ignore = "0.4"  # Gitignore-style pattern matching for .remignore
+ureq = "2"      # Blocking HTTP client for ADD URL downloads
+bzip2 = "0.5"   # bz2 decompression for ADD tar.bz2
+xz2 = "0.1"     # xz decompression for ADD tar.xz
 
 [[bin]]
 name = "remora-dns"

@@ -1184,6 +1184,23 @@ Verifies excluded files (`debug.log`, `build/output`) are absent and kept files
 
 Failure indicates `.remignore` pattern loading or the filtered copy logic is broken.
 
+### `test_parse_add_instruction`
+**Requires:** neither root nor rootfs (parser-only)
+
+Parses a Remfile with ADD instructions for both local archive and URL sources.
+Verifies both produce correct `Instruction::Add` variants with src/dest fields.
+
+Failure indicates the ADD parser is broken.
+
+### `test_add_local_tar_extraction`
+**Requires:** neither root nor rootfs
+
+Creates a temporary `.tar.gz` archive containing two files (one in a subdirectory),
+extracts it using the same tar+flate2 pipeline that ADD uses, and verifies both files
+are present with correct contents.
+
+Failure indicates the ADD archive extraction logic is broken.
+
 ---
 
 ## Port Proxy

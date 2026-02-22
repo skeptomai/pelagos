@@ -5943,6 +5943,97 @@ EXPOSE 8080
         assert!(!dst.path().join("debug.log").exists());
         assert!(!dst.path().join("build").exists());
     }
+
+    /// test_parse_add_instruction
+    ///
+    /// Requires: neither root nor rootfs (parser-only).
+    ///
+    /// Parses a Remfile with ADD instructions (local archive and URL forms).
+    /// Verifies both produce `Instruction::Add` with correct src/dest fields.
+    ///
+    /// Failure indicates the ADD parser is broken.
+    #[test]
+    fn test_parse_add_instruction() {
+        let content =
+            "FROM alpine\nADD app.tar.gz /opt/app\nADD https://example.com/file /tmp/file";
+        let instructions = build::parse_remfile(content).unwrap();
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(
+            instructions[1],
+            build::Instruction::Add {
+                src: "app.tar.gz".into(),
+                dest: "/opt/app".into()
+            }
+        );
+        assert_eq!(
+            instructions[2],
+            build::Instruction::Add {
+                src: "https://example.com/file".into(),
+                dest: "/tmp/file".into()
+            }
+        );
+    }
+
+    /// test_add_local_tar_extraction
+    ///
+    /// Requires: neither root nor rootfs.
+    ///
+    /// Creates a temporary .tar.gz archive containing two files, then uses
+    /// the tar+flate2 extraction path (same as ADD uses internally) to extract
+    /// it and verifies both files are present with correct contents.
+    ///
+    /// Failure indicates the ADD archive extraction logic is broken.
+    #[test]
+    fn test_add_local_tar_extraction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = tmp.path().join("test.tar.gz");
+
+        // Create a tar.gz with two files.
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut tar_builder = tar::Builder::new(gz);
+
+            let data1 = b"hello world";
+            let mut header1 = tar::Header::new_gnu();
+            header1.set_size(data1.len() as u64);
+            header1.set_mode(0o644);
+            header1.set_cksum();
+            tar_builder
+                .append_data(&mut header1, "hello.txt", &data1[..])
+                .unwrap();
+
+            let data2 = b"sub content";
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_size(data2.len() as u64);
+            header2.set_mode(0o644);
+            header2.set_cksum();
+            tar_builder
+                .append_data(&mut header2, "subdir/file.txt", &data2[..])
+                .unwrap();
+
+            let gz = tar_builder.into_inner().unwrap();
+            gz.finish().unwrap();
+        }
+
+        // Extract it.
+        let extract_dir = tmp.path().join("extracted");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let decoder = flate2::read::GzDecoder::new(file);
+        tar::Archive::new(decoder).unpack(&extract_dir).unwrap();
+
+        assert!(extract_dir.join("hello.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.join("hello.txt")).unwrap(),
+            "hello world"
+        );
+        assert!(extract_dir.join("subdir/file.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.join("subdir/file.txt")).unwrap(),
+            "sub content"
+        );
+    }
 }
 
 // ── Port proxy tests ────────────────────────────────────────────────────────

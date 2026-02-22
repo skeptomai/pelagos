@@ -33,6 +33,9 @@ pub enum BuildError {
 
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    #[error("URL download failed: {0}")]
+    UrlDownload(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +66,10 @@ pub enum Instruction {
     Arg {
         name: String,
         default: Option<String>,
+    },
+    Add {
+        src: String,
+        dest: String,
     },
 }
 
@@ -185,6 +192,19 @@ pub fn parse_remfile(content: &str) -> Result<Vec<Instruction>, BuildError> {
                     });
                 }
                 instructions.push(Instruction::User(rest.to_string()));
+            }
+            "ADD" => {
+                let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+                if parts.len() < 2 {
+                    return Err(BuildError::Parse {
+                        line: line_num,
+                        message: "ADD requires <src> <dest>".to_string(),
+                    });
+                }
+                instructions.push(Instruction::Add {
+                    src: parts[0].to_string(),
+                    dest: parts[1].trim().to_string(),
+                });
             }
             "ARG" => {
                 if rest.is_empty() {
@@ -363,6 +383,10 @@ fn substitute_instruction(instr: &Instruction, vars: &HashMap<String, String>) -
             name: name.clone(),
             default: default.as_ref().map(|d| substitute_vars(d, vars)),
         },
+        Instruction::Add { src, dest } => Instruction::Add {
+            src: substitute_vars(src, vars),
+            dest: substitute_vars(dest, vars),
+        },
     }
 }
 
@@ -519,6 +543,13 @@ pub fn execute_build(
             Instruction::User(ref user) => {
                 eprintln!("Step {}/{}: USER {}", step, total, user);
                 config.user = user.clone();
+            }
+            Instruction::Add { ref src, ref dest } => {
+                // ADD always invalidates cache.
+                cache_active = false;
+                eprintln!("Step {}/{}: ADD {} {}", step, total, src, dest);
+                let digest = execute_add(src, dest, context_dir, remignore.as_ref())?;
+                layers.push(digest);
             }
         }
     }
@@ -678,6 +709,129 @@ fn execute_copy(
             }
         }
         std::fs::copy(&src_path, &dest_in_tmp)?;
+    }
+
+    let digest = create_layer_from_dir(tmp.path())?;
+    Ok(digest)
+}
+
+// ---------------------------------------------------------------------------
+// ADD instruction execution
+// ---------------------------------------------------------------------------
+
+/// Detect whether a source string looks like a URL.
+fn is_url(src: &str) -> bool {
+    src.starts_with("http://") || src.starts_with("https://")
+}
+
+/// Recognised archive extensions for ADD auto-extraction.
+fn is_archive(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".tar")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tar.xz")
+        || lower.ends_with(".txz")
+}
+
+/// Execute an ADD instruction: URL download, archive extraction, or plain copy.
+fn execute_add(
+    src: &str,
+    dest: &str,
+    context_dir: &Path,
+    remignore: Option<&ignore::gitignore::Gitignore>,
+) -> Result<String, BuildError> {
+    if is_url(src) {
+        execute_add_url(src, dest)
+    } else if is_archive(src) {
+        execute_add_archive(src, dest, context_dir, remignore)
+    } else {
+        // Fall through to normal COPY behaviour.
+        execute_copy(src, dest, context_dir, remignore)
+    }
+}
+
+/// Download a URL and place it at `dest` inside a new layer.
+fn execute_add_url(url: &str, dest: &str) -> Result<String, BuildError> {
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| BuildError::UrlDownload(format!("{}: {}", url, e)))?;
+
+    let tmp = tempfile::tempdir()?;
+    let relative_dest = dest.strip_prefix('/').unwrap_or(dest);
+    let dest_in_tmp = tmp.path().join(relative_dest);
+
+    if let Some(parent) = dest_in_tmp.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut reader = response.into_reader();
+    let mut file = std::fs::File::create(&dest_in_tmp)?;
+    io::copy(&mut reader, &mut file)?;
+
+    let digest = create_layer_from_dir(tmp.path())?;
+    Ok(digest)
+}
+
+/// Extract a local archive into a layer at `dest`.
+fn execute_add_archive(
+    src: &str,
+    dest: &str,
+    context_dir: &Path,
+    remignore: Option<&ignore::gitignore::Gitignore>,
+) -> Result<String, BuildError> {
+    let src_path = context_dir.join(src);
+    if !src_path.exists() {
+        return Err(BuildError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("ADD source not found: {}", src_path.display()),
+        )));
+    }
+
+    // Path traversal check.
+    let canonical_src = src_path.canonicalize()?;
+    let canonical_ctx = context_dir.canonicalize()?;
+    if !canonical_src.starts_with(&canonical_ctx) {
+        return Err(BuildError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "ADD source '{}' is outside build context",
+                src_path.display()
+            ),
+        )));
+    }
+
+    // Check .remignore on the archive file itself.
+    if let Some(gi) = remignore {
+        let rel = src_path.strip_prefix(context_dir).unwrap_or(&src_path);
+        if gi.matched(rel, false).is_ignore() {
+            log::debug!("remignore: skipping ADD archive {}", rel.display());
+            let tmp = tempfile::tempdir()?;
+            return Ok(create_layer_from_dir(tmp.path())?);
+        }
+    }
+
+    let tmp = tempfile::tempdir()?;
+    let relative_dest = dest.strip_prefix('/').unwrap_or(dest);
+    let dest_in_tmp = tmp.path().join(relative_dest);
+    std::fs::create_dir_all(&dest_in_tmp)?;
+
+    let file = std::fs::File::open(&src_path)?;
+    let lower = src.to_ascii_lowercase();
+
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        let decoder = flate2::read::GzDecoder::new(file);
+        tar::Archive::new(decoder).unpack(&dest_in_tmp)?;
+    } else if lower.ends_with(".tar.bz2") {
+        let decoder = bzip2::read::BzDecoder::new(file);
+        tar::Archive::new(decoder).unpack(&dest_in_tmp)?;
+    } else if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
+        let decoder = xz2::read::XzDecoder::new(file);
+        tar::Archive::new(decoder).unpack(&dest_in_tmp)?;
+    } else {
+        // Plain .tar
+        tar::Archive::new(file).unpack(&dest_in_tmp)?;
     }
 
     let digest = create_layer_from_dir(tmp.path())?;
@@ -1286,6 +1440,49 @@ ENTRYPOINT ["/usr/bin/python3", "-m", "http.server"]"#;
         let content = "FROM alpine\nARG";
         let err = parse_remfile(content).unwrap_err();
         assert!(err.to_string().contains("ARG requires"));
+    }
+
+    // -- ADD parsing tests --
+
+    #[test]
+    fn test_parse_add() {
+        let content = "FROM alpine\nADD archive.tar.gz /opt/app";
+        let instructions = parse_remfile(content).unwrap();
+        assert_eq!(
+            instructions[1],
+            Instruction::Add {
+                src: "archive.tar.gz".into(),
+                dest: "/opt/app".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_add_error_missing_dest() {
+        let content = "FROM alpine\nADD onlysrc";
+        let err = parse_remfile(content).unwrap_err();
+        assert!(err.to_string().contains("ADD requires <src> <dest>"));
+    }
+
+    #[test]
+    fn test_is_archive() {
+        assert!(is_archive("foo.tar"));
+        assert!(is_archive("foo.tar.gz"));
+        assert!(is_archive("foo.tgz"));
+        assert!(is_archive("foo.tar.bz2"));
+        assert!(is_archive("foo.tar.xz"));
+        assert!(is_archive("foo.txz"));
+        assert!(is_archive("FOO.TAR.GZ"));
+        assert!(!is_archive("foo.zip"));
+        assert!(!is_archive("foo.txt"));
+    }
+
+    #[test]
+    fn test_is_url() {
+        assert!(is_url("http://example.com/file.tar.gz"));
+        assert!(is_url("https://example.com/file"));
+        assert!(!is_url("local/path"));
+        assert!(!is_url("ftp://example.com"));
     }
 
     // -- Variable substitution tests --
