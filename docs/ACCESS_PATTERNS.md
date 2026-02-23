@@ -10,18 +10,21 @@ Kubernetes equivalents.
 
 ### 1. Ad-hoc port forward
 
-**What it is:** Forward a host port to a running container *after* it has
-started, without having declared the mapping at launch. Torn down on demand.
+**What it is:** Forward a host port to a pod/container without having declared
+the mapping at launch.
 
 **Kubernetes:** `kubectl port-forward svc/grafana 3000:3000`
 
-**Remora today:** Not supported. Port mappings must be declared at start time —
-`(port 3000 3000)` in `compose.rem` or `--publish 3000:3000` on `remora run`.
-There is no equivalent of attaching a port forward to an already-running
-container.
+This exists because Kubernetes schedules pods — you don't control when or where
+they start, so you can't always declare ports at launch time. `port-forward` is
+a development convenience for reaching something that's already running
+somewhere in the cluster.
 
-**Gap:** A future `remora port-forward <container> <host-port>:<container-port>`
-command.
+**Remora today:** Not applicable as a use case. You control exactly when
+containers start and what ports they expose, so declaring `(port 3000 3000)` in
+`compose.rem` is already the right answer. The scenario that motivates
+`kubectl port-forward` — needing to reach a container whose ports weren't
+declared at launch — doesn't arise in remora.
 
 ---
 
@@ -116,7 +119,7 @@ service name. No remora changes required — just configuration.
 
 | Pattern | Kubernetes | Remora | Status |
 |---------|-----------|--------|--------|
-| Ad-hoc port forward | `kubectl port-forward` | Not supported | Gap |
+| Ad-hoc port forward | `kubectl port-forward` | Not applicable — ports declared at launch | N/A |
 | Static host port | `NodePort` | `(port X X)` in compose | ✅ Full support |
 | Standard port on node IP | `LoadBalancer` | Same as NodePort on single host | ✅ No gap |
 | Hostname/path routing | `Ingress` + controller | Add Traefik/Caddy as compose service | ✅ Composable, not built-in |
