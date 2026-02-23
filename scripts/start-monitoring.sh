@@ -122,6 +122,8 @@ done
 IMAGES=(
     "prom/snmp-exporter:v0.21.0"
     "ghcr.io/axsuul/plex-media-server-exporter:latest"
+    "ghcr.io/akpw/mktxp:latest"
+    "prom/graphite-exporter:latest"
     "prom/prometheus:latest"
     "grafana/grafana:latest"
 )
