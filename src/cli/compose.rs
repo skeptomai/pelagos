@@ -153,9 +153,8 @@ fn cmd_compose_up(
         let config = remora::paths::network_config_dir(&scoped).join("config.json");
         if !config.exists() {
             let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
-            super::network::cmd_network_create(&scoped, subnet).map_err(|e| {
-                format!("compose: failed to create network '{}': {}", scoped, e)
-            })?;
+            super::network::cmd_network_create(&scoped, subnet)
+                .map_err(|e| format!("compose: failed to create network '{}': {}", scoped, e))?;
         }
         created_networks.push(scoped);
     }
@@ -353,7 +352,6 @@ fn spawn_service(
     let exe = &exe_and_args[0];
     let rest = &exe_and_args[1..];
 
-
     let mut cmd = Command::new(exe).args(rest).with_image_layers(layers);
 
     // Apply image config env.
@@ -442,11 +440,7 @@ fn spawn_service(
     for (k, v) in &svc.env {
         cmd = cmd.env(k, v);
     }
-    let image_sets_path = manifest
-        .config
-        .env
-        .iter()
-        .any(|e| e.starts_with("PATH="));
+    let image_sets_path = manifest.config.env.iter().any(|e| e.starts_with("PATH="));
     if !image_sets_path {
         cmd = cmd.env(
             "PATH",

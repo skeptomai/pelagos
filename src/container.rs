@@ -2674,7 +2674,6 @@ impl Command {
                         .unwrap_or(std::path::Path::new("/"));
                     std::env::set_current_dir(cwd)
                         .map_err(|e| io::Error::other(format!("set_current_dir: {}", e)))?;
-
                 }
 
                 // Step 4.5: Perform automatic mounts if requested.
