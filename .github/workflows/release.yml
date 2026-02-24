@@ -8,28 +8,37 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            artifact: remora-x86_64-linux
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            artifact: remora-aarch64-linux
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - name: Install musl toolchain and build deps
         run: sudo apt-get install -y musl-tools cmake
       - name: Build release binary (musl static)
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --release --target ${{ matrix.target }}
       - name: Prepare artifact
         run: |
-          cp target/x86_64-unknown-linux-musl/release/remora remora-x86_64-linux
-          sha256sum remora-x86_64-linux > remora-x86_64-linux.sha256
+          cp target/${{ matrix.target }}/release/remora ${{ matrix.artifact }}
+          sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
       - name: Verify static binary
         run: |
-          file remora-x86_64-linux
-          ldd remora-x86_64-linux || true
+          file ${{ matrix.artifact }}
+          ldd ${{ matrix.artifact }} || true
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            remora-x86_64-linux
-            remora-x86_64-linux.sha256
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
           generate_release_notes: true
