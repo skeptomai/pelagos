@@ -2217,7 +2217,10 @@ impl Command {
                                 break;
                             }
                             if r < 0 {
-                                let e = *libc::__errno_location();
+                                // std::io::Error::last_os_error() reads errno
+                                // without allocating — portable across glibc and musl.
+                                let e =
+                                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
                                 if e != libc::EINTR {
                                     libc::_exit(1);
                                 }
@@ -3709,7 +3712,10 @@ impl Command {
                                 break;
                             }
                             if r < 0 {
-                                let e = *libc::__errno_location();
+                                // std::io::Error::last_os_error() reads errno
+                                // without allocating — portable across glibc and musl.
+                                let e =
+                                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
                                 if e != libc::EINTR {
                                     libc::_exit(1);
                                 }

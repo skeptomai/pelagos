@@ -12,12 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build release binary
-        run: cargo build --release
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl toolchain and build deps
+        run: sudo apt-get install -y musl-tools cmake
+      - name: Build release binary (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
       - name: Prepare artifact
         run: |
-          cp target/release/remora remora-x86_64-linux
+          cp target/x86_64-unknown-linux-musl/release/remora remora-x86_64-linux
           sha256sum remora-x86_64-linux > remora-x86_64-linux.sha256
+      - name: Verify static binary
+        run: |
+          file remora-x86_64-linux
+          ldd remora-x86_64-linux || true
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
