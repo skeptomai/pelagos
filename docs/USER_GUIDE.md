@@ -164,6 +164,34 @@ EXPOSE 8080
 
 Comments (`#`) and blank lines are ignored. Continuation lines (trailing `\`) are supported.
 
+### Remfile vs Dockerfile
+
+**A valid Remfile is always a valid Dockerfile.** The syntax is identical — same
+keywords, same `#` comments, same `\` line continuation. Remfile is a strict subset:
+you can rename any Remfile to `Dockerfile` and `docker build` it without changes.
+
+The converse is not true. These Dockerfile instructions are **not supported** and will
+cause a parse error if used in a Remfile:
+
+| Unsupported | Notes |
+|-------------|-------|
+| `HEALTHCHECK` | Not parsed |
+| `SHELL` | Not parsed; `RUN` always uses `/bin/sh -c` |
+| `STOPSIGNAL` | Not parsed |
+| `VOLUME` | Not parsed; use `remora volume` or `with_volume()` at runtime |
+| `ONBUILD` | Not parsed |
+
+These **flags** are accepted by the parser but **silently ignored**:
+
+| Flag | Instruction | Notes |
+|------|-------------|-------|
+| `--chown`, `--chmod`, `--link` | `COPY`, `ADD` | Ownership/mode changes not applied |
+| `--mount`, `--network`, `--security` | `RUN` | BuildKit extensions, not supported |
+| `--platform` | `FROM` | Multi-platform builds not supported |
+
+Also note: `ENV` and `LABEL` only accept a **single `KEY=VALUE` pair per line**.
+Docker allows space-separated multiple pairs on one line; Remfile does not.
+
 ### ARG and Build Arguments
 
 Use `ARG` to declare build-time variables that can be overridden from the command line:
@@ -357,6 +385,119 @@ remora rm <name>
 # Force remove (SIGKILL + remove even if running)
 remora rm --force <name>
 ```
+
+---
+
+## Compose
+
+`remora compose` orchestrates multi-service applications using an S-expression compose file
+(default: `compose.rem`).
+
+### Basic Usage
+
+```bash
+# Start all services (daemonised)
+sudo remora compose up
+
+# Start in foreground
+sudo remora compose up --foreground
+
+# Use a custom file and project name
+sudo remora compose up -f mystack.rem -p myproject
+
+# List services
+remora compose ps
+
+# View logs
+remora compose logs
+remora compose logs --follow api
+
+# Stop and remove all services
+sudo remora compose down
+
+# Stop and remove services + volumes
+sudo remora compose down -v
+```
+
+### Compose File Format
+
+```lisp
+(compose
+  (network backend (subnet "10.88.1.0/24"))
+  (volume pgdata)
+
+  (service db
+    (image "postgres:16")
+    (network backend)
+    (volume pgdata "/var/lib/postgresql/data")
+    (env POSTGRES_PASSWORD "secret")
+    (port 5432 5432)
+    (memory "512m"))
+
+  (service api
+    (image "my-api:latest")
+    (network backend)
+    (depends-on (db :ready-port 5432))
+    (port 8080 8080)))
+```
+
+### `depends-on` and Health Checks
+
+`depends-on` controls startup order. Without a health check, Remora just verifies the
+dependency process is alive. With a health check, Remora polls until the check passes
+(60-second timeout, 250ms interval).
+
+#### Shorthand: `:ready-port N`
+
+```lisp
+; TCP connect to port 5432
+(depends-on (db :ready-port 5432))
+```
+
+#### Full `:ready` Syntax
+
+```lisp
+; TCP connect
+(depends-on (db :ready (port 5432)))
+
+; HTTP GET — host is replaced with the container IP; returns true for 2xx
+(depends-on (api :ready (http "http://localhost:8080/healthz")))
+
+; Command in container — true if exit code 0 (single-string form, split on whitespace)
+(depends-on (db :ready (cmd "pg_isready -U postgres")))
+
+; Multi-argument form
+(depends-on (db :ready (cmd "pg_isready" "-U" "postgres")))
+```
+
+#### Composable Operators: `and` / `or`
+
+```lisp
+; All checks must pass
+(depends-on (db :ready (and (port 5432) (cmd "pg_isready -U postgres"))))
+
+; Any check may pass
+(depends-on (api :ready (or (http "http://localhost:8080/health") (port 8080))))
+
+; Nested: port AND (http OR cmd)
+(depends-on (svc :ready (and (port 8080) (or (http "http://localhost:8080/ready") (cmd "test -f /var/ready")))))
+
+; Multiple dependencies with mixed checks
+(depends-on
+  (db    :ready (and (port 5432) (cmd "pg_isready")))
+  (cache :ready (or  (port 6379) (http "http://localhost:6380/ping"))))
+```
+
+#### Check Types Reference
+
+| Expression | What it does |
+|---|---|
+| `(port N)` | TCP connect to the container's IP on port N |
+| `(http "URL")` | HTTP GET (host replaced with container IP); passes on 2xx |
+| `(cmd "str")` | Run command in container's namespaces; passes if exit 0 |
+| `(cmd "exe" "a1" ...)` | Multi-arg form of cmd |
+| `(and e1 e2 ...)` | All sub-checks must pass |
+| `(or e1 e2 ...)` | Any sub-check must pass |
 
 ---
 

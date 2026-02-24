@@ -4,7 +4,9 @@ use super::{
     check_liveness, container_dir, containers_dir, now_iso8601, write_state, ContainerState,
     ContainerStatus,
 };
-use remora::compose::{parse_compose, topo_sort, ComposeFile, Dependency, ServiceSpec};
+use remora::compose::{
+    parse_compose, topo_sort, ComposeFile, Dependency, HealthCheck, ServiceSpec,
+};
 use remora::container::{Command, Stdio, Volume};
 use remora::network::NetworkMode;
 use serde::{Deserialize, Serialize};
@@ -888,73 +890,198 @@ fn wait_for_dependency(
     let dep_name = &dep.service;
 
     // Make sure the dependency is running.
-    if let Some(&pid) = container_pids.get(dep_name.as_str()) {
+    let dep_pid = container_pids.get(dep_name.as_str()).copied();
+    if let Some(pid) = dep_pid {
         if !check_liveness(pid) {
             return Err(format!("dependency '{}' exited before becoming ready", dep_name).into());
         }
     }
 
-    // If no ready_port, just check the process is alive.
-    let port = match dep.ready_port {
-        Some(p) => p,
+    // If no health_check, just verify the process is alive and return.
+    let check = match &dep.health_check {
+        Some(c) => c,
         None => return Ok(()),
     };
 
-    // Get the container IP.
-    let ip_str = container_ips.get(dep_name.as_str()).ok_or_else(|| {
-        format!(
-            "dependency '{}' has no IP address for readiness check",
-            dep_name
-        )
-    })?;
-    let ip: Ipv4Addr = ip_str.parse().map_err(|e| {
-        format!(
-            "dependency '{}' has invalid IP '{}': {}",
-            dep_name, ip_str, e
-        )
-    })?;
+    // Resolve the container IP (needed by Port and Http checks).
+    let ip_str = container_ips
+        .get(dep_name.as_str())
+        .map(|s| s.as_str())
+        .unwrap_or("");
 
-    let addr = SocketAddr::new(ip.into(), port);
     let timeout = Duration::from_secs(60);
     let interval = Duration::from_millis(250);
     let deadline = Instant::now() + timeout;
 
     log::info!(
-        "compose: waiting for {}:{} (service '{}')",
-        ip,
-        port,
+        "compose: waiting for service '{}' to pass health check",
         dep_name
     );
 
     while Instant::now() < deadline {
-        match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
-            Ok(_) => {
-                log::info!("compose: {}:{} ready", ip, port);
-                return Ok(());
-            }
-            Err(_) => {
-                // Check dependency is still alive.
-                if let Some(&pid) = container_pids.get(dep_name.as_str()) {
-                    if !check_liveness(pid) {
-                        return Err(format!(
-                            "dependency '{}' exited while waiting for port {}",
-                            dep_name, port
-                        )
-                        .into());
-                    }
-                }
-                std::thread::sleep(interval);
+        if eval_health_check(check, dep_pid.unwrap_or(0), ip_str) {
+            log::info!("compose: service '{}' is ready", dep_name);
+            return Ok(());
+        }
+        // Check the dependency is still alive before sleeping.
+        if let Some(pid) = dep_pid {
+            if !check_liveness(pid) {
+                return Err(format!(
+                    "dependency '{}' exited while waiting for health check",
+                    dep_name
+                )
+                .into());
             }
         }
+        std::thread::sleep(interval);
     }
 
     Err(format!(
-        "dependency '{}' did not become ready on port {} within {}s",
+        "dependency '{}' did not become ready within {}s",
         dep_name,
-        port,
         timeout.as_secs()
     )
     .into())
+}
+
+/// Recursively evaluate a [`HealthCheck`] expression.
+///
+/// - `pid`: PID of the container process (for `Cmd` checks).
+/// - `ip`: container IP string (for `Port` and `Http` checks).
+fn eval_health_check(check: &HealthCheck, pid: i32, ip: &str) -> bool {
+    match check {
+        HealthCheck::Port(p) => try_tcp(ip, *p),
+        HealthCheck::Http(url) => try_http(url, ip),
+        HealthCheck::Cmd(args) => try_exec(pid, args),
+        HealthCheck::And(checks) => checks.iter().all(|c| eval_health_check(c, pid, ip)),
+        HealthCheck::Or(checks) => checks.iter().any(|c| eval_health_check(c, pid, ip)),
+    }
+}
+
+/// Attempt a TCP connection to `ip:port` with a 500ms timeout.
+fn try_tcp(ip: &str, port: u16) -> bool {
+    let addr_str = format!("{}:{}", ip, port);
+    let addr: SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Attempt an HTTP GET to `url`, replacing the host with `container_ip`.
+///
+/// Returns true if the response status is 2xx (200–299).
+fn try_http(url: &str, container_ip: &str) -> bool {
+    // Strip scheme.
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+
+    // Split host:port from path.
+    let (host_port, path) = if let Some(slash) = rest.find('/') {
+        (&rest[..slash], &rest[slash..])
+    } else {
+        (rest, "/")
+    };
+
+    // Extract port from host:port, defaulting to 80.
+    let port: u16 = if let Some(colon) = host_port.rfind(':') {
+        host_port[colon + 1..].parse().unwrap_or(80)
+    } else {
+        80
+    };
+
+    let target_url = format!("http://{}:{}{}", container_ip, port, path);
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(500))
+        .build();
+
+    match agent.get(&target_url).call() {
+        Ok(resp) => {
+            let status = resp.status();
+            (200..300).contains(&status)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Run `args` inside the container identified by `pid`'s namespaces.
+///
+/// Returns true if the command exits with status 0.
+fn try_exec(pid: i32, args: &[String]) -> bool {
+    if args.is_empty() || pid <= 0 {
+        return false;
+    }
+
+    let ns_entries = match super::exec::discover_namespaces(pid) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    use remora::container::{Command, Namespace, Stdio};
+    use std::os::unix::io::AsRawFd;
+
+    let mut cmd = Command::new(&args[0]).args(&args[1..]);
+    cmd = cmd
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null);
+
+    let mut has_mount_ns = false;
+    for (path, ns) in &ns_entries {
+        if *ns == Namespace::MOUNT {
+            has_mount_ns = true;
+        } else {
+            cmd = cmd.with_namespace_join(path, *ns);
+        }
+    }
+
+    if has_mount_ns {
+        let mnt_ns_path = format!("/proc/{}/ns/mnt", pid);
+        let mnt_ns_file = match std::fs::File::open(&mnt_ns_path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mnt_ns_fd = mnt_ns_file.as_raw_fd();
+
+        let root_path = format!("/proc/{}/root", pid);
+        let root_file = match std::fs::File::open(&root_path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let root_fd = root_file.as_raw_fd();
+
+        cmd = cmd.with_pre_exec(move || {
+            let _keep_mnt = &mnt_ns_file;
+            let _keep_root = &root_file;
+            unsafe {
+                if libc::setns(mnt_ns_fd, libc::CLONE_NEWNS) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fchdir(root_fd) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let dot = std::ffi::CString::new(".").unwrap();
+                if libc::chroot(dot.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let root_c = std::ffi::CString::new("/").unwrap();
+                if libc::chdir(root_c.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    } else {
+        cmd = cmd.with_chroot(format!("/proc/{}/root", pid));
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => child.wait().map(|s| s.success()).unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

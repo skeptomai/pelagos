@@ -1,6 +1,41 @@
 # Ongoing Tasks
 
-## Current State (Feb 23, 2026)
+## Current Task: Composable Health Checks for `depends-on` (Feb 24, 2026)
+
+### Context
+Adding HTTP GET and exec-in-container health checks to the compose `depends-on` system,
+composable with `and`/`or` S-expression operators.
+
+### Target Syntax
+```lisp
+(depends-on (db :ready-port 5432))                          ; backward compat unchanged
+(depends-on (api :ready (http "http://localhost:8080/healthz")))
+(depends-on (db  :ready (cmd "pg_isready -U postgres")))
+(depends-on (db  :ready (and (port 5432) (cmd "pg_isready -U postgres"))))
+(depends-on (api :ready (or  (http "http://localhost:8080/health") (port 8080))))
+```
+
+### Files to Modify
+| File | Change |
+|------|--------|
+| `src/compose.rs` | Add `HealthCheck` enum; update `Dependency`; add `parse_health_expr`; update `parse_dependency` |
+| `src/cli/compose.rs` | Refactor `wait_for_dependency`; add `eval_health_check`, `try_tcp`, `try_http`, `try_exec` |
+| `src/cli/exec.rs` | Make `discover_namespaces` pub |
+| `docs/USER_GUIDE.md` | Document new `:ready` syntax |
+| `tests/integration_tests.rs` | New test for http and cmd health checks |
+| `docs/INTEGRATION_TESTS.md` | Document new test |
+
+### Key Design Decisions
+- `HealthCheck` enum: `Port(u16)`, `Http(String)`, `Cmd(Vec<String>)`, `And(Vec<HealthCheck>)`, `Or(Vec<HealthCheck>)`
+- `Dependency.ready_port: Option<u16>` → `Dependency.health_check: Option<HealthCheck>`
+- `:ready-port N` stays as sugar for `:ready (port N)`
+- HTTP: use `ureq` (already a dep); parse URL, replace host with container IP, check 2xx
+- Cmd: join container namespaces (reuse `discover_namespaces` from exec.rs), run command, check exit 0
+- Poll every 250ms, 60s timeout (unchanged from TCP check)
+
+---
+
+## Previous State (Feb 23, 2026)
 
 Both repos clean and pushed. Stack fully operational (6/6 Prometheus targets up).
 TrueNAS API key set in `monitoring-setup/.env` — pool metrics flowing.

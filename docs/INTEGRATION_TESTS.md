@@ -1511,3 +1511,24 @@ correctly with `depends-on` without disrupting topological sort.
 Failure means `(tmpfs ...)` entries would be silently dropped by the parser,
 causing containers to launch without the intended in-memory filesystems — for
 example, an app writing to a read-only path would fail immediately on startup.
+
+
+### `test_compose_health_check_parse`
+**Requires:** nothing (no root, no rootfs, no image pull)
+
+Verifies that all `depends-on` health-check expression forms parse into the correct
+`HealthCheck` enum variants via `parse_compose`. Exercises every syntax form in a single
+compose file:
+
+- `:ready (port N)` → `HealthCheck::Port(N)`
+- `:ready (http "URL")` → `HealthCheck::Http(url)`
+- `:ready (cmd "str")` (single-string, split on whitespace) → `HealthCheck::Cmd(argv)`
+- `:ready (and (port N) (cmd "..."))` → `HealthCheck::And([Port, Cmd])`
+- `:ready (or (port N) (http "..."))` → `HealthCheck::Or([Port, Http])`
+- `:ready-port N` (backward-compat sugar) → `HealthCheck::Port(N)`
+
+Also asserts that a service with no `depends-on` has an empty `depends_on` vec.
+
+Failure means the parser produces wrong `HealthCheck` variants, so `eval_health_check` would
+evaluate incorrect conditions and the compose supervisor would start services out of order or
+time out waiting for the wrong signal.

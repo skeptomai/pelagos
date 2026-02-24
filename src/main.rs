@@ -5,6 +5,7 @@ mod cli;
 pub(crate) use clap::{Parser, Subcommand};
 pub(crate) use log::error;
 pub(crate) use std::fmt;
+use std::{fmt::Display, str::FromStr};
 
 // ---------------------------------------------------------------------------
 // Output format enum (shared by all list commands)
@@ -16,7 +17,7 @@ enum OutputFormat {
     Json = 1,
 }
 
-impl std::str::FromStr for OutputFormat {
+impl FromStr for OutputFormat {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
@@ -30,7 +31,7 @@ impl std::str::FromStr for OutputFormat {
     }
 }
 
-impl std::fmt::Display for OutputFormat {
+impl Display for OutputFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             OutputFormat::Table => {

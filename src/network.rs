@@ -598,7 +598,7 @@ pub fn setup_bridge_network(
 
     // 7. Optionally enable NAT (MASQUERADE) for internet access.
     if nat {
-        enable_nat(&net_def)?;
+        enable_nat(ns_name, &net_def)?;
     }
 
     // 8. Optionally install port-forward (DNAT) rules.
@@ -661,7 +661,7 @@ pub fn teardown_network(setup: &NetworkSetup) {
         disable_port_forwards(&net_def, setup.container_ip, &setup.port_forwards);
     }
     if setup.nat_enabled {
-        disable_nat(&net_def);
+        disable_nat(&setup.ns_name, &net_def);
     }
 }
 
@@ -821,9 +821,25 @@ fn run_nft_quiet(script: &str) -> io::Result<()> {
 /// Uses `flock(LOCK_EX)` on the per-network NAT refcount file to serialise
 /// concurrent spawns. IP forwarding is written to `/proc/sys/net/ipv4/ip_forward`
 /// once (never disabled on teardown — other software may rely on it).
-fn enable_nat(net: &NetworkDef) -> io::Result<()> {
-    let refcount_path = crate::paths::network_nat_refcount_file(&net.name);
-    if let Some(parent) = refcount_path.parent() {
+/// Returns `true` if the named network namespace still exists on the host.
+///
+/// Used to detect stale entries in the NAT active-set file left by containers
+/// that exited without calling `disable_nat()` (e.g. due to a process crash).
+fn netns_exists(ns_name: &str) -> bool {
+    std::path::Path::new(&format!("/run/netns/{}", ns_name)).exists()
+}
+
+/// Increment the NAT active set; install nftables rules when the set goes from empty → 1.
+///
+/// The active-set file (`nat_refcount`) now stores **one netns name per line** rather than
+/// a plain integer. On each call stale entries (whose `/run/netns/{name}` no longer exists)
+/// are filtered out, making the mechanism crash-safe: a container that died without calling
+/// `disable_nat()` is automatically evicted the next time any container calls `enable_nat()`.
+///
+/// `flock(LOCK_EX)` serialises concurrent spawns.
+fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
+    let active_path = crate::paths::network_nat_refcount_file(&net.name);
+    if let Some(parent) = active_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
@@ -832,15 +848,22 @@ fn enable_nat(net: &NetworkDef) -> io::Result<()> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&refcount_path)?;
+        .open(&active_path)?;
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    let count: u32 = content.trim().parse().unwrap_or(0);
 
-    if count == 0 {
+    // Filter to live entries only (crash-safe eviction of stale ns names).
+    let mut active: Vec<String> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|name| netns_exists(name))
+        .map(|s| s.to_string())
+        .collect();
+
+    if active.is_empty() {
         // Enable IP forwarding.
         std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
 
@@ -859,7 +882,7 @@ fn enable_nat(net: &NetworkDef) -> io::Result<()> {
         // the FORWARD chain policy to DROP.
         //
         // Purge any stale duplicates first (from previous crashes where the
-        // refcount was lost but the kernel rules survived).
+        // active set was lost but the kernel rules survived).
         let cidr = net.subnet.cidr_string();
         while run_quiet("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]).is_ok() {}
         while run_quiet("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]).is_ok() {}
@@ -867,9 +890,10 @@ fn enable_nat(net: &NetworkDef) -> io::Result<()> {
         let _ = run("iptables", &["-I", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
     }
 
+    active.push(ns_name.to_string());
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-    write!(file, "{}", count + 1)?;
+    write!(file, "{}", active.join("\n"))?;
     // flock released when `file` is dropped.
     Ok(())
 }
@@ -882,19 +906,26 @@ fn enable_nat(net: &NetworkDef) -> io::Result<()> {
 /// are empty.
 ///
 /// Errors are non-fatal (logged via `log::warn!`).
-fn disable_nat(net: &NetworkDef) {
-    let refcount_path = crate::paths::network_nat_refcount_file(&net.name);
+/// Decrement the NAT active set; remove or trim the nftables table when the set becomes empty.
+///
+/// Removes `ns_name` from the active-set file and also evicts any stale entries whose
+/// `/run/netns/{name}` no longer exists (crash-safe). If the set is then empty, tears
+/// down iptables rules and the nftables table (unless port-forwards are still active).
+///
+/// Errors are non-fatal (logged via `log::warn!`).
+fn disable_nat(ns_name: &str, net: &NetworkDef) {
+    let active_path = crate::paths::network_nat_refcount_file(&net.name);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&refcount_path);
+        .open(&active_path);
 
     let mut file = match file {
         Ok(f) => f,
         Err(e) => {
-            log::warn!("NAT refcount open (non-fatal): {}", e);
+            log::warn!("NAT active-set open (non-fatal): {}", e);
             return;
         }
     };
@@ -903,50 +934,53 @@ fn disable_nat(net: &NetworkDef) {
 
     let mut content = String::new();
     if let Err(e) = file.read_to_string(&mut content) {
-        log::warn!("NAT refcount read (non-fatal): {}", e);
+        log::warn!("NAT active-set read (non-fatal): {}", e);
         return;
     }
-    let count: u32 = content.trim().parse().unwrap_or(0);
+
+    // Remove this container explicitly; also evict any other stale entries.
+    // Note: by the time disable_nat() is called, ip netns del has already
+    // removed /run/netns/{ns_name}, so we must remove by name rather than
+    // relying on the liveness filter for this container's own entry.
+    let remaining: Vec<String> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|name| *name != ns_name) // remove this container explicitly
+        .filter(|name| netns_exists(name)) // evict other stale entries
+        .map(|s| s.to_string())
+        .collect();
 
     let table = net.nft_table_name();
     let cidr = net.subnet.cidr_string();
 
-    if count <= 1 {
-        if let Err(e) = file
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| file.set_len(0))
-            .and_then(|_| {
-                write!(file, "0")?;
-                Ok(())
-            })
-        {
-            log::warn!("NAT refcount write (non-fatal): {}", e);
-        }
-        // flock on refcount released; now decide what to do with the table.
-        drop(file);
+    if let Err(e) = file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| file.set_len(0))
+        .and_then(|_| {
+            write!(file, "{}", remaining.join("\n"))?;
+            Ok(())
+        })
+    {
+        log::warn!("NAT active-set write (non-fatal): {}", e);
+    }
+    drop(file);
 
+    if remaining.is_empty() {
         // Remove the iptables FORWARD rules added by enable_nat().
         let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
         let _ = run("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
 
         if read_port_forwards_count(&net.name) == 0 {
             // No active port forwards either — remove the entire table.
-            if let Err(e) = run_nft(&format!("delete table ip {}\n", table)) {
+            // Use run_nft_quiet: deletion is non-fatal and the table may have
+            // already been removed by a concurrent disable_port_forwards().
+            if let Err(e) = run_nft_quiet(&format!("delete table ip {}\n", table)) {
                 log::warn!("nft delete table {} (non-fatal): {}", table, e);
             }
         } else {
             // Port forwards still active — remove MASQUERADE but keep the table.
             let _ = run_nft(&format!("flush chain ip {} postrouting\n", table));
         }
-    } else if let Err(e) = file
-        .seek(SeekFrom::Start(0))
-        .and_then(|_| file.set_len(0))
-        .and_then(|_| {
-            write!(file, "{}", count - 1)?;
-            Ok(())
-        })
-    {
-        log::warn!("NAT refcount write (non-fatal): {}", e);
     }
 }
 
@@ -984,14 +1018,20 @@ fn read_port_forwards_count(network_name: &str) -> usize {
     content.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
-/// Read the NAT refcount without locking (for teardown checks only).
+/// Count live NAT active-set entries without locking (for teardown checks only).
+///
+/// Reads the ns-name list file and counts entries whose `/run/netns/{name}` still exists.
 fn read_nat_refcount(network_name: &str) -> u32 {
     let content =
         match std::fs::read_to_string(crate::paths::network_nat_refcount_file(network_name)) {
             Ok(c) => c,
             Err(_) => return 0,
         };
-    content.trim().parse().unwrap_or(0)
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|name| netns_exists(name))
+        .count() as u32
 }
 
 /// Build the nftables script that (re)installs all current DNAT rules.
@@ -1118,7 +1158,9 @@ fn disable_port_forwards(net: &NetworkDef, container_ip: Ipv4Addr, forwards: &[(
         // No more port forwards — check if NAT is also gone.
         if read_nat_refcount(&net.name) == 0 {
             // Nothing using the table — remove it entirely.
-            if let Err(e) = run_nft(&format!("delete table ip {}\n", table)) {
+            // Use run_nft_quiet: deletion is non-fatal and the table may have
+            // already been removed by a concurrent disable_nat().
+            if let Err(e) = run_nft_quiet(&format!("delete table ip {}\n", table)) {
                 log::warn!("nft delete table {} (non-fatal): {}", table, e);
             }
         } else {

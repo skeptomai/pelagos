@@ -176,7 +176,9 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Compare `/proc/{pid}/ns/{type}` inodes against `/proc/1/ns/{type}` to discover
 /// which namespaces the container process is in (i.e., different from init).
-fn discover_namespaces(pid: i32) -> Result<Vec<(PathBuf, Namespace)>, Box<dyn std::error::Error>> {
+pub fn discover_namespaces(
+    pid: i32,
+) -> Result<Vec<(PathBuf, Namespace)>, Box<dyn std::error::Error>> {
     let ns_map: &[(&str, Namespace)] = &[
         ("mnt", Namespace::MOUNT),
         ("uts", Namespace::UTS),

@@ -7973,7 +7973,10 @@ fn test_compose_parse_and_validate() {
     let api = &compose.services[1];
     assert_eq!(api.depends_on.len(), 1);
     assert_eq!(api.depends_on[0].service, "db");
-    assert_eq!(api.depends_on[0].ready_port, Some(5432));
+    assert_eq!(
+        api.depends_on[0].health_check,
+        Some(remora::compose::HealthCheck::Port(5432))
+    );
 }
 
 #[test]
@@ -8147,7 +8150,10 @@ fn test_compose_bind_mount_parse_and_validate() {
     assert_eq!(grafana.bind_mounts.len(), 1);
     assert!(grafana.bind_mounts[0].read_only);
     assert_eq!(grafana.depends_on[0].service, "prometheus");
-    assert_eq!(grafana.depends_on[0].ready_port, Some(9090));
+    assert_eq!(
+        grafana.depends_on[0].health_check,
+        Some(remora::compose::HealthCheck::Port(9090))
+    );
 
     // SNMP exporter: single RO config mount, no volumes.
     let snmp = compose
@@ -8213,4 +8219,111 @@ fn test_compose_tmpfs_parse_and_validate() {
     let redis_pos = order.iter().position(|n| n == "redis").unwrap();
     let app_pos = order.iter().position(|n| n == "app").unwrap();
     assert!(redis_pos < app_pos, "redis must start before app");
+}
+
+#[test]
+fn test_compose_health_check_parse() {
+    // Verifies all health-check expression forms parse into the correct HealthCheck
+    // variants without requiring root or image pulls.
+    use remora::compose::HealthCheck;
+
+    let input = r#"
+(compose
+  (network net (subnet "10.77.1.0/24"))
+
+  ; port check (new :ready syntax)
+  (service svc-port
+    (image "img")
+    (network net)
+    (depends-on (base :ready (port 5432))))
+
+  ; http check
+  (service svc-http
+    (image "img")
+    (network net)
+    (depends-on (base :ready (http "http://localhost:8080/healthz"))))
+
+  ; cmd check (single-string form, split on whitespace)
+  (service svc-cmd
+    (image "img")
+    (network net)
+    (depends-on (base :ready (cmd "pg_isready -U postgres"))))
+
+  ; and check
+  (service svc-and
+    (image "img")
+    (network net)
+    (depends-on (base :ready (and (port 5432) (cmd "pg_isready")))))
+
+  ; or check
+  (service svc-or
+    (image "img")
+    (network net)
+    (depends-on (base :ready (or (port 8080) (http "http://localhost:8080/health")))))
+
+  ; backward compat: :ready-port N stays as Port(N)
+  (service svc-compat
+    (image "img")
+    (network net)
+    (depends-on (base :ready-port 6379)))
+
+  (service base
+    (image "img")
+    (network net)))
+"#;
+
+    let compose = remora::compose::parse_compose(input).expect("should parse");
+    assert_eq!(compose.services.len(), 7);
+
+    let find = |name: &str| {
+        compose
+            .services
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .depends_on[0]
+            .health_check
+            .clone()
+    };
+
+    assert_eq!(find("svc-port"), Some(HealthCheck::Port(5432)));
+
+    assert_eq!(
+        find("svc-http"),
+        Some(HealthCheck::Http(
+            "http://localhost:8080/healthz".to_string()
+        ))
+    );
+
+    assert_eq!(
+        find("svc-cmd"),
+        Some(HealthCheck::Cmd(vec![
+            "pg_isready".into(),
+            "-U".into(),
+            "postgres".into()
+        ]))
+    );
+
+    assert_eq!(
+        find("svc-and"),
+        Some(HealthCheck::And(vec![
+            HealthCheck::Port(5432),
+            HealthCheck::Cmd(vec!["pg_isready".into()])
+        ]))
+    );
+
+    assert_eq!(
+        find("svc-or"),
+        Some(HealthCheck::Or(vec![
+            HealthCheck::Port(8080),
+            HealthCheck::Http("http://localhost:8080/health".into())
+        ]))
+    );
+
+    // :ready-port N is sugar for Port(N)
+    assert_eq!(find("svc-compat"), Some(HealthCheck::Port(6379)));
+
+    // Service with no health check
+    let base = compose.services.iter().find(|s| s.name == "base").unwrap();
+    assert!(base.depends_on.is_empty());
 }

@@ -68,11 +68,26 @@ pub struct PortMapping {
     pub container: u16,
 }
 
+/// A composable health-check expression used in `depends-on`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthCheck {
+    /// TCP connect to the container's IP on the given port.
+    Port(u16),
+    /// HTTP GET to the given URL (host is replaced with the container IP at eval time).
+    Http(String),
+    /// Run a command inside the container's namespaces; passes if exit code is 0.
+    Cmd(Vec<String>),
+    /// All sub-checks must pass.
+    And(Vec<HealthCheck>),
+    /// Any sub-check must pass.
+    Or(Vec<HealthCheck>),
+}
+
 /// A dependency on another service with optional readiness check.
 #[derive(Debug, Clone)]
 pub struct Dependency {
     pub service: String,
-    pub ready_port: Option<u16>,
+    pub health_check: Option<HealthCheck>,
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +417,7 @@ fn parse_dependency(expr: &SExpr, service_name: &str) -> Result<Dependency, Comp
     match expr {
         SExpr::Atom(name) => Ok(Dependency {
             service: name.clone(),
-            ready_port: None,
+            health_check: None,
         }),
         SExpr::List(items) => {
             if items.is_empty() {
@@ -421,7 +436,7 @@ fn parse_dependency(expr: &SExpr, service_name: &str) -> Result<Dependency, Comp
                 })?
                 .to_string();
 
-            let mut ready_port = None;
+            let mut health_check = None;
             let mut i = 1;
             while i < items.len() {
                 if let Some(kw) = items[i].as_atom() {
@@ -432,12 +447,24 @@ fn parse_dependency(expr: &SExpr, service_name: &str) -> Result<Dependency, Comp
                                 service_name
                             ))
                         })?;
-                        ready_port = Some(port_str.parse::<u16>().map_err(|e| {
+                        let port = port_str.parse::<u16>().map_err(|e| {
                             ComposeError::InvalidValue(format!(
                                 "service '{}': :ready-port: {}",
                                 service_name, e
                             ))
-                        })?);
+                        })?;
+                        health_check = Some(HealthCheck::Port(port));
+                        i += 2;
+                        continue;
+                    }
+                    if kw == ":ready" && i + 1 < items.len() {
+                        let check = parse_health_expr(&items[i + 1]).map_err(|e| {
+                            ComposeError::InvalidValue(format!(
+                                "service '{}': :ready: {}",
+                                service_name, e
+                            ))
+                        })?;
+                        health_check = Some(check);
                         i += 2;
                         continue;
                     }
@@ -447,9 +474,94 @@ fn parse_dependency(expr: &SExpr, service_name: &str) -> Result<Dependency, Comp
 
             Ok(Dependency {
                 service: dep_name,
-                ready_port,
+                health_check,
             })
         }
+    }
+}
+
+/// Parse a health-check S-expression into a [`HealthCheck`] value.
+///
+/// Supported forms:
+/// - `(port N)` → `Port(N)`
+/// - `(http "url")` → `Http(url)`
+/// - `(cmd "str")` or `(cmd "exe" "arg" ...)` → `Cmd(argv)`
+/// - `(and e1 e2 ...)` → `And(checks)`
+/// - `(or  e1 e2 ...)` → `Or(checks)`
+pub fn parse_health_expr(expr: &SExpr) -> Result<HealthCheck, String> {
+    let list = expr
+        .as_list()
+        .ok_or_else(|| "health check must be a list, got atom".to_string())?;
+    if list.is_empty() {
+        return Err("empty health check expression".into());
+    }
+    let head = list[0]
+        .as_atom()
+        .ok_or_else(|| "health check type must be an atom".to_string())?;
+
+    match head {
+        "port" => {
+            let s = list
+                .get(1)
+                .and_then(|e| e.as_atom())
+                .ok_or_else(|| "port check requires a port number".to_string())?;
+            let p: u16 = s.parse().map_err(|e| format!("invalid port: {}", e))?;
+            Ok(HealthCheck::Port(p))
+        }
+        "http" => {
+            let url = list
+                .get(1)
+                .and_then(|e| e.as_atom())
+                .ok_or_else(|| "http check requires a URL string".to_string())?;
+            Ok(HealthCheck::Http(url.to_string()))
+        }
+        "cmd" => {
+            if list.len() < 2 {
+                return Err("cmd check requires at least one argument".into());
+            }
+            // If a single string argument: split on whitespace.
+            // If multiple atoms: treat as explicit argv.
+            if list.len() == 2 {
+                let s = list[1]
+                    .as_atom()
+                    .ok_or_else(|| "cmd argument must be a string".to_string())?;
+                let argv: Vec<String> = s.split_whitespace().map(|w| w.to_string()).collect();
+                if argv.is_empty() {
+                    return Err("cmd check has empty command string".into());
+                }
+                Ok(HealthCheck::Cmd(argv))
+            } else {
+                let mut argv = Vec::new();
+                for item in &list[1..] {
+                    let s = item
+                        .as_atom()
+                        .ok_or_else(|| "cmd arguments must be atoms".to_string())?;
+                    argv.push(s.to_string());
+                }
+                Ok(HealthCheck::Cmd(argv))
+            }
+        }
+        "and" => {
+            if list.len() < 2 {
+                return Err("and check requires at least one sub-check".into());
+            }
+            let checks = list[1..]
+                .iter()
+                .map(parse_health_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(HealthCheck::And(checks))
+        }
+        "or" => {
+            if list.len() < 2 {
+                return Err("or check requires at least one sub-check".into());
+            }
+            let checks = list[1..]
+                .iter()
+                .map(parse_health_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(HealthCheck::Or(checks))
+        }
+        other => Err(format!("unknown health check type: '{}'", other)),
     }
 }
 
@@ -661,7 +773,10 @@ mod tests {
         assert_eq!(api.networks, vec!["backend", "frontend"]);
         assert_eq!(api.depends_on.len(), 1);
         assert_eq!(api.depends_on[0].service, "db");
-        assert_eq!(api.depends_on[0].ready_port, Some(5432));
+        assert_eq!(
+            api.depends_on[0].health_check,
+            Some(HealthCheck::Port(5432))
+        );
 
         let web = &compose.services[2];
         assert_eq!(
@@ -787,6 +902,100 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_health_expr_port() {
+        let input = "(compose (service db (image \"db\")) (service app (image \"app\") (depends-on (db :ready (port 5432)))))";
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(
+            compose.services[1].depends_on[0].health_check,
+            Some(HealthCheck::Port(5432))
+        );
+    }
+
+    #[test]
+    fn test_parse_health_expr_http() {
+        let input = "(compose (service db (image \"db\")) (service app (image \"app\") (depends-on (db :ready (http \"http://localhost:8080/healthz\")))))";
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(
+            compose.services[1].depends_on[0].health_check,
+            Some(HealthCheck::Http("http://localhost:8080/healthz".into()))
+        );
+    }
+
+    #[test]
+    fn test_parse_health_expr_cmd_single() {
+        let input = "(compose (service db (image \"db\")) (service app (image \"app\") (depends-on (db :ready (cmd \"pg_isready -U postgres\")))))";
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(
+            compose.services[1].depends_on[0].health_check,
+            Some(HealthCheck::Cmd(vec![
+                "pg_isready".into(),
+                "-U".into(),
+                "postgres".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_parse_health_expr_cmd_multi() {
+        let input = "(compose (service db (image \"db\")) (service app (image \"app\") (depends-on (db :ready (cmd \"pg_isready\" \"-U\" \"postgres\")))))";
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(
+            compose.services[1].depends_on[0].health_check,
+            Some(HealthCheck::Cmd(vec![
+                "pg_isready".into(),
+                "-U".into(),
+                "postgres".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_parse_health_expr_and() {
+        let input = "(compose (service db (image \"db\")) (service app (image \"app\") (depends-on (db :ready (and (port 5432) (cmd \"pg_isready\"))))))";
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(
+            compose.services[1].depends_on[0].health_check,
+            Some(HealthCheck::And(vec![
+                HealthCheck::Port(5432),
+                HealthCheck::Cmd(vec!["pg_isready".into()])
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_parse_health_expr_or() {
+        let input = "(compose (service db (image \"db\")) (service app (image \"app\") (depends-on (db :ready (or (port 8080) (http \"http://localhost:8080/health\"))))))";
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(
+            compose.services[1].depends_on[0].health_check,
+            Some(HealthCheck::Or(vec![
+                HealthCheck::Port(8080),
+                HealthCheck::Http("http://localhost:8080/health".into())
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_ready_port_sugar_backward_compat() {
+        // :ready-port N is sugar for :ready (port N)
+        let input = "(compose (service db (image \"db\")) (service app (image \"app\") (depends-on (db :ready-port 5432))))";
+        let compose = parse_compose(input).unwrap();
+        assert_eq!(
+            compose.services[1].depends_on[0].health_check,
+            Some(HealthCheck::Port(5432))
+        );
+    }
+
+    #[test]
+    fn test_parse_health_expr_unknown_type() {
+        use crate::sexpr::parse as sexpr_parse;
+        let expr = sexpr_parse("(bogus 1234)").unwrap();
+        let err = parse_health_expr(&expr);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("unknown health check type"));
+    }
+
+    #[test]
     fn test_dependency_simple_atom() {
         let input = r#"
 (compose
@@ -797,7 +1006,7 @@ mod tests {
 "#;
         let compose = parse_compose(input).unwrap();
         assert_eq!(compose.services[1].depends_on[0].service, "db");
-        assert_eq!(compose.services[1].depends_on[0].ready_port, None);
+        assert_eq!(compose.services[1].depends_on[0].health_check, None);
     }
 
     #[test]
@@ -953,6 +1162,9 @@ mod tests {
         let app = compose.services.iter().find(|s| s.name == "app").unwrap();
         assert_eq!(app.networks, vec!["frontend", "backend"]);
         assert_eq!(app.depends_on[0].service, "redis");
-        assert_eq!(app.depends_on[0].ready_port, Some(6379));
+        assert_eq!(
+            app.depends_on[0].health_check,
+            Some(HealthCheck::Port(6379))
+        );
     }
 }
