@@ -1620,3 +1620,29 @@ the var set it returns the parsed value. Tests the full round-trip through `env`
 
 Failure means operators cannot reliably use environment variables to configure their
 `.reml` stacks without modifying the file itself.
+
+### `test_lisp_eval_file_jupyter_fixture`
+**Requires:** nothing (no root, no rootfs, no container spawning)
+
+Evaluates the actual `examples/compose/jupyter/compose.reml` file through the full
+Lisp interpreter pipeline and asserts the resulting `ComposeFile` matches the
+expected structure:
+
+- Exactly 1 network (`jupyter-net`, subnet `10.89.0.0/24`)
+- Volume `jupyter-notebooks` declared
+- 2 services: `redis` and `jupyterlab`
+- `redis`: image `jupyter-redis:latest`, no deps, memory `64m`
+- `jupyterlab`: image `jupyter-jupyterlab:latest`, depends-on `redis:6379`
+  with `HealthCheck::Port(6379)`, port mapping `8888→8888`, env vars
+  `REDIS_HOST=redis` and `REDIS_PORT=6379`
+- `on-ready "redis"` hook registered (1 hook in HookMap)
+- `JUPYTER_PORT` absent → `string->number` fallback path produces port 8888
+
+Exercises the full end-to-end Lisp evaluation path: `define`, `let`, `env` with
+fallback, `on-ready`, `service`, `network`, `volume`, `compose`, `compose-up`, and
+the `depends-on` TCP health-check option.
+
+Failure indicates a regression in the Lisp interpreter, the `depends-on` port
+parsing, the `on-ready` hook registration, or the `env`/fallback pipeline — any
+of which would make the Jupyter stack silently broken before containers are even
+started.

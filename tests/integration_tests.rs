@@ -8599,3 +8599,88 @@ fn test_lisp_env_fallback_and_override() {
 
     std::env::remove_var("_REMORA_TEST_PORT");
 }
+
+#[test]
+fn test_lisp_eval_file_jupyter_fixture() {
+    // Parse and evaluate the actual examples/compose/jupyter/compose.reml file.
+    // Validates that the Jupyter stack's compose.reml produces the expected
+    // ComposeFile structure without requiring root or running any containers.
+    use remora::compose::{HealthCheck, ServiceSpec};
+    use remora::lisp::Interpreter;
+
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/compose/jupyter/compose.reml");
+
+    // Ensure JUPYTER_PORT is not set so we exercise the default-fallback path.
+    // SAFETY: single-threaded test; no concurrent env access.
+    unsafe { std::env::remove_var("JUPYTER_PORT") };
+
+    let mut interp = Interpreter::new();
+    interp.eval_file(&fixture).expect("eval_file failed");
+
+    let pending = interp.take_pending().expect("compose-up was not called");
+    let spec = pending.spec.expect("compose-up produced no spec");
+
+    // Network: exactly one named network
+    assert_eq!(spec.networks.len(), 1, "expected 1 network");
+    assert_eq!(spec.networks[0].name, "jupyter-net");
+    assert_eq!(
+        spec.networks[0].subnet.as_deref(),
+        Some("10.89.0.0/24"),
+        "wrong subnet"
+    );
+
+    // Volume: jupyter-notebooks persists across restarts
+    assert!(
+        spec.volumes.contains(&"jupyter-notebooks".to_string()),
+        "missing jupyter-notebooks volume"
+    );
+
+    // Services: redis and jupyterlab
+    assert_eq!(spec.services.len(), 2, "expected 2 services");
+
+    let redis = spec
+        .services
+        .iter()
+        .find(|s: &&ServiceSpec| s.name == "redis")
+        .expect("redis service missing");
+    assert_eq!(redis.image, "jupyter-redis:latest");
+    assert!(redis.depends_on.is_empty(), "redis should have no deps");
+    assert_eq!(redis.memory.as_deref(), Some("64m"));
+
+    let jlab = spec
+        .services
+        .iter()
+        .find(|s: &&ServiceSpec| s.name == "jupyterlab")
+        .expect("jupyterlab service missing");
+    assert_eq!(jlab.image, "jupyter-jupyterlab:latest");
+    // Depends on redis:6379 with TCP health check
+    assert_eq!(jlab.depends_on.len(), 1);
+    assert_eq!(jlab.depends_on[0].service, "redis");
+    assert_eq!(
+        jlab.depends_on[0].health_check,
+        Some(HealthCheck::Port(6379))
+    );
+    // Port mapping: default 8888 → 8888 (no JUPYTER_PORT override)
+    assert_eq!(jlab.ports.len(), 1);
+    assert_eq!(jlab.ports[0].host, 8888);
+    assert_eq!(jlab.ports[0].container, 8888);
+    // Env vars injected
+    assert_eq!(
+        jlab.env.get("REDIS_HOST").map(String::as_str),
+        Some("redis")
+    );
+    assert_eq!(jlab.env.get("REDIS_PORT").map(String::as_str), Some("6379"));
+
+    // on-ready hook registered for redis
+    let hooks = interp.take_hooks();
+    assert!(
+        hooks.contains_key("redis"),
+        "on-ready hook for redis not registered"
+    );
+    assert_eq!(
+        hooks["redis"].len(),
+        1,
+        "expected exactly one hook for redis"
+    );
+}

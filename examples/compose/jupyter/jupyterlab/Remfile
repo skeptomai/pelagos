@@ -1,0 +1,41 @@
+FROM alpine:latest
+
+# Scientific Python stack via APK (no glibc required)
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    py3-numpy \
+    py3-pandas \
+    py3-matplotlib \
+    py3-scipy \
+    py3-scikit-learn \
+    gcc \
+    g++ \
+    python3-dev \
+    musl-dev \
+    libffi-dev \
+    freetype-dev \
+    libpng-dev
+
+# JupyterLab + kernel + Redis Python client
+# Use --break-system-packages because Alpine 3.20+ uses PEP 668 externally-managed envs
+RUN pip install --no-cache-dir --break-system-packages \
+    jupyterlab \
+    ipykernel \
+    redis \
+    matplotlib
+
+# Notebooks are stored in /notebooks (mounted as a named volume)
+RUN mkdir -p /notebooks
+WORKDIR /notebooks
+
+EXPOSE 8888
+
+CMD ["jupyter", "lab", \
+     "--ip=0.0.0.0", \
+     "--port=8888", \
+     "--no-browser", \
+     "--allow-root", \
+     "--NotebookApp.token=", \
+     "--NotebookApp.password=", \
+     "--notebook-dir=/notebooks"]

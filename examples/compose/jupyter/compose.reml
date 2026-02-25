@@ -1,0 +1,69 @@
+; Remora Jupyter Stack — compose.reml
+;
+; Architecture:
+;
+;   jupyter-net (10.89.0.0/24):  jupyterlab ←→ redis
+;
+; Lisp features demonstrated:
+;
+;   define    — all ports and resource limits named at the top
+;   env       — JUPYTER_PORT read from host environment with safe default
+;   on-ready  — hook fires when redis is healthy, before notebooks can cache
+;   volume    — named volume persists notebooks across container restarts
+
+;; ── Configuration ─────────────────────────────────────────────────
+;;
+;; Override the JupyterLab port without editing this file:
+;;   JUPYTER_PORT=9999 sudo remora compose up -f compose.reml -p jupyter
+
+(define jupyter-port
+  (let ((p (env "JUPYTER_PORT")))
+    (if (null? p) 8888 (string->number p))))
+
+(define mem-redis      "64m")
+(define mem-jupyter    "512m")
+(define cpu-jupyter    "1.0")
+
+;; ── Network ───────────────────────────────────────────────────────
+
+(define net-jupyter (network "jupyter-net" '(subnet "10.89.0.0/24")))
+
+;; ── Lifecycle hooks ───────────────────────────────────────────────
+;;
+;; on-ready fires after redis's TCP port check passes.
+;; This guarantees the redis Python client in notebooks will connect
+;; successfully on the first attempt.
+
+(on-ready "redis"
+  (lambda ()
+    (log "redis: cache layer ready — JupyterLab kernel can connect")))
+
+;; ── Services ──────────────────────────────────────────────────────
+
+(define svc-redis
+  (service "redis"
+    '(image "jupyter-redis:latest")
+    (list 'network "jupyter-net")
+    (list 'memory mem-redis)))
+
+(define svc-jupyterlab
+  (service "jupyterlab"
+    '(image "jupyter-jupyterlab:latest")
+    (list 'network "jupyter-net")
+    ; Wait for redis TCP port before starting the kernel
+    (list 'depends-on "redis" 6379)
+    ; Redis connection info available to notebook code
+    (list 'env "REDIS_HOST" "redis")
+    (list 'env "REDIS_PORT" "6379")
+    (list 'port jupyter-port 8888)
+    (list 'memory mem-jupyter)
+    (list 'cpus cpu-jupyter)))
+
+;; ── Assemble and run ──────────────────────────────────────────────
+
+(compose-up
+  (compose
+    net-jupyter
+    (volume "jupyter-notebooks")
+    svc-redis
+    svc-jupyterlab))
