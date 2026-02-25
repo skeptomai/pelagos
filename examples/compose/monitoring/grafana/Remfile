@@ -1,7 +1,6 @@
 FROM alpine:latest
-RUN apk add --no-cache grafana
+RUN apk add --no-cache grafana \
+    && mkdir -p /etc/grafana/provisioning /var/lib/grafana /var/log/grafana
 COPY provisioning /etc/grafana/provisioning
 EXPOSE 3000
-CMD ["grafana", "server", \
-     "--homepath=/usr/share/grafana", \
-     "--config=/etc/grafana/grafana.ini"]
+CMD ["grafana-server", "--homepath=/usr/share/grafana"]

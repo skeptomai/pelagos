@@ -39,7 +39,7 @@ for arg in "$@"; do
 done
 
 command -v "$REMORA" >/dev/null 2>&1 || \
-    die "remora not found in PATH.  Run: cargo build --release && export PATH=\$PWD/target/release:\$PATH"
+    die "remora not found.  Run: cargo build --release && sudo REMORA=\$PWD/target/release/remora $0"
 
 # ── Build Phase ───────────────────────────────────────────────────
 

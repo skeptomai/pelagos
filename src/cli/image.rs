@@ -49,11 +49,31 @@ pub fn cmd_image_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Remove a locally stored image (does not remove shared layers).
+///
+/// Tries the local reference first (just adds `:latest` if no tag), so that
+/// locally-built images like `monitoring-grafana` are found without the
+/// `docker.io/library/` prefix that `normalise_reference` adds for pulls.
 pub fn cmd_image_rm(reference: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let local_ref = add_default_tag(reference);
+    if remove_image(&local_ref).is_ok() {
+        println!("Removed image: {}", local_ref);
+        return Ok(());
+    }
+    // Fall back to fully-normalised reference (e.g. pulled registry images).
     let full_ref = normalise_reference(reference);
     remove_image(&full_ref)?;
     println!("Removed image: {}", full_ref);
     Ok(())
+}
+
+/// Add `:latest` tag if the reference has no tag or digest, but do not add
+/// any registry prefix.  Used for local-image operations.
+fn add_default_tag(reference: &str) -> String {
+    if reference.contains(':') || reference.contains('@') {
+        reference.to_string()
+    } else {
+        format!("{}:latest", reference)
+    }
 }
 
 /// Expand bare image names to fully qualified references.
