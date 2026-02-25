@@ -382,6 +382,10 @@ fn apply_service_opt(spec: &mut ServiceSpec, key: &str, vals: &[Value]) -> Resul
                     .collect::<Result<_, _>>()?,
             );
         }
+        "tmpfs" => {
+            let path = str_or_sym_at("tmpfs", vals, 0)?;
+            spec.tmpfs_mounts.push(path);
+        }
         "volume" => {
             let name = str_or_sym_at("volume name", vals, 0)?;
             let mount_path = str_or_sym_at("volume mount_path", vals, 1)?;
