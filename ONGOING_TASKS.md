@@ -1,6 +1,6 @@
 # Ongoing Tasks
 
-## Current Task: `defmacro` + `define-service` (Feb 24, 2026)
+## Completed: `defmacro` + `define-service` + dotted pairs (Feb 24, 2026) ✅
 
 ### Context
 

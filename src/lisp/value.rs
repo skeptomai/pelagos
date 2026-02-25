@@ -246,13 +246,24 @@ pub fn value_to_sexpr(v: Value) -> Result<SExpr, LispError> {
         Value::Str(s) => Ok(SExpr::Str(s)),
         Value::Symbol(s) => Ok(SExpr::Atom(s)),
         Value::Pair(_) => {
-            let items = v.to_vec()?;
-            Ok(SExpr::List(
-                items
-                    .into_iter()
-                    .map(value_to_sexpr)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            // Walk the chain; produce DottedList if it terminates non-nil.
+            let mut head_items = Vec::new();
+            let mut cur = v;
+            loop {
+                match cur {
+                    Value::Nil => return Ok(SExpr::List(head_items)),
+                    Value::Pair(p) => {
+                        head_items.push(value_to_sexpr(p.0.clone())?);
+                        cur = p.1.clone();
+                    }
+                    other => {
+                        return Ok(SExpr::DottedList(
+                            head_items,
+                            Box::new(value_to_sexpr(other)?),
+                        ));
+                    }
+                }
+            }
         }
         other => Err(LispError::new(format!(
             "macro expansion produced non-serialisable value: {}",

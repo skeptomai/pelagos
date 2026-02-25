@@ -22,6 +22,8 @@ pub enum SExpr {
     /// A double-quoted string literal.
     Str(String),
     List(Vec<SExpr>),
+    /// An improper list: `(a b . c)` — head items plus a non-nil tail.
+    DottedList(Vec<SExpr>, Box<SExpr>),
 }
 
 impl SExpr {
@@ -33,14 +35,14 @@ impl SExpr {
     pub fn as_atom(&self) -> Option<&str> {
         match self {
             SExpr::Atom(s) | SExpr::Str(s) => Some(s.as_str()),
-            SExpr::List(_) => None,
+            SExpr::List(_) | SExpr::DottedList(_, _) => None,
         }
     }
 
-    /// Return the list contents, or `None` if this is an atom or string.
+    /// Return the list contents, or `None` if this is an atom, string, or dotted list.
     pub fn as_list(&self) -> Option<&[SExpr]> {
         match self {
-            SExpr::Atom(_) | SExpr::Str(_) => None,
+            SExpr::Atom(_) | SExpr::Str(_) | SExpr::DottedList(_, _) => None,
             SExpr::List(v) => Some(v),
         }
     }
@@ -82,6 +84,17 @@ impl fmt::Display for SExpr {
                     }
                     write!(f, "{}", item)?;
                 }
+                write!(f, ")")
+            }
+            SExpr::DottedList(items, tail) => {
+                write!(f, "(")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, " . {}", tail)?;
                 write!(f, ")")
             }
         }
@@ -222,8 +235,47 @@ fn parse_list(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
             *pos += 1; // skip ')'
             return Ok(SExpr::List(items));
         }
+        // Dotted pair separator: '.' followed immediately by a delimiter.
+        // This distinguishes `(a . b)` from atoms like `.5` or `...`.
+        if is_dot_separator(input, *pos) {
+            *pos += 1; // skip '.'
+            skip_ws_and_comments(input, pos);
+            if *pos >= input.len() {
+                return Err(make_err(
+                    input,
+                    open_pos,
+                    "dotted pair: expected tail after '.'",
+                ));
+            }
+            let tail = parse_sexpr(input, pos)?;
+            skip_ws_and_comments(input, pos);
+            if *pos >= input.len() || input.as_bytes()[*pos] != b')' {
+                return Err(make_err(
+                    input,
+                    *pos,
+                    "dotted pair: expected ')' after tail expression",
+                ));
+            }
+            *pos += 1; // skip ')'
+            return Ok(SExpr::DottedList(items, Box::new(tail)));
+        }
         items.push(parse_sexpr(input, pos)?);
     }
+}
+
+/// Return `true` if position `pos` is a dotted-pair `.` separator, i.e. a lone `.`
+/// followed by whitespace, `(`, `)`, `;`, or end-of-input.
+fn is_dot_separator(input: &str, pos: usize) -> bool {
+    let bytes = input.as_bytes();
+    if bytes[pos] != b'.' {
+        return false;
+    }
+    let next = pos + 1;
+    if next >= bytes.len() {
+        return true;
+    }
+    let ch = bytes[next];
+    ch.is_ascii_whitespace() || ch == b'(' || ch == b')' || ch == b';' || ch == b'"'
 }
 
 fn parse_atom(input: &str, pos: &mut usize) -> Result<SExpr, ParseError> {
@@ -515,6 +567,51 @@ mod tests {
         assert_eq!(exprs.len(), 3);
         assert_eq!(exprs[0].as_list().unwrap()[0].as_atom().unwrap(), "define");
         assert_eq!(exprs[2].as_atom().unwrap(), "x");
+    }
+
+    #[test]
+    fn test_dotted_pair() {
+        let expr = parse(r#"("REDIS_HOST" . "redis")"#).unwrap();
+        match expr {
+            SExpr::DottedList(items, tail) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].as_atom().unwrap(), "REDIS_HOST");
+                assert_eq!(tail.as_atom().unwrap(), "redis");
+            }
+            _ => panic!("expected DottedList"),
+        }
+    }
+
+    #[test]
+    fn test_dotted_pair_multi_head() {
+        let expr = parse("(a b . c)").unwrap();
+        match expr {
+            SExpr::DottedList(items, tail) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].as_atom().unwrap(), "a");
+                assert_eq!(items[1].as_atom().unwrap(), "b");
+                assert_eq!(tail.as_atom().unwrap(), "c");
+            }
+            _ => panic!("expected DottedList"),
+        }
+    }
+
+    #[test]
+    fn test_dotted_pair_display_round_trip() {
+        let input = r#"("KEY" . "val")"#;
+        let expr = parse(input).unwrap();
+        let printed = expr.to_string();
+        let reparsed = parse(&printed).unwrap();
+        assert_eq!(expr, reparsed);
+    }
+
+    #[test]
+    fn test_dotted_number_is_not_separator() {
+        // ".5" should parse as the atom ".5", not trigger dotted pair
+        let expr = parse("(.5)").unwrap();
+        assert!(matches!(expr, SExpr::List(_)));
+        let items = expr.as_list().unwrap();
+        assert_eq!(items[0].as_atom().unwrap(), ".5");
     }
 
     #[test]

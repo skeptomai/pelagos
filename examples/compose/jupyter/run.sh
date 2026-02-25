@@ -139,6 +139,9 @@ if [ "$fail" -gt 0 ]; then
     echo -e "\nCheck service logs:"
     echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p jupyter redis"
     echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p jupyter jupyterlab"
-    echo -e "\nPress Enter to tear down..."
-    read -r
 fi
+
+echo -e "\n${CYAN}JupyterLab:${NC} http://localhost:${JUPYTER_PORT}/lab  (no token required)"
+echo -e "${CYAN}Logs:${NC}       $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p jupyter jupyterlab"
+echo -e "\nPress Enter to tear down..."
+read -r

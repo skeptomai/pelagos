@@ -53,13 +53,22 @@
 
   ;; Convert one group (kw val...) into a list of (list 'key args...) forms.
   ;; Returns a list so multi-value groups (like :env) can yield multiple forms.
+  ;;
+  ;; Values may be:
+  ;;   atoms/exprs  — all grouped into one option: :memory mem-var → (list 'memory mem-var)
+  ;;   proper lists — one option per sublist, spliced: :env ("K" "v") → (list 'env "K" "v")
+  ;;   dotted pairs — one option per pair, car/cdr:  :env ("K" . "v") → (list 'env "K" "v")
   (define (expand-opt group)
     (let* ((kw   (car group))
            (sym  (string->symbol (substring (symbol->string kw) 1)))
            (args (cdr group)))
       (if (and (not (null? args)) (pair? (car args)))
-          ;; All values are sublists → one service option per sublist.
-          (map (lambda (sub) `(list ',sym ,@sub)) args)
+          ;; All values are pairs (proper or dotted) — one service option per sub-value.
+          (map (lambda (sub)
+                 (if (list? sub)
+                     `(list ',sym ,@sub)              ; proper list: splice all items
+                     `(list ',sym ,(car sub) ,(cdr sub)))) ; dotted pair: key . val
+               args)
           ;; Atom values → a single service option with all args.
           (list `(list ',sym ,@args)))))
 

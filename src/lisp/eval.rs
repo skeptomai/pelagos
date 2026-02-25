@@ -90,6 +90,9 @@ fn eval_step(expr: SExpr, env: Env) -> Result<Step, LispError> {
         SExpr::List(ref items) if items.is_empty() => Ok(Step::Done(Value::Nil)),
 
         SExpr::List(items) => eval_list(items, env),
+
+        // Dotted lists are data, not callable forms.
+        SExpr::DottedList(_, _) => Err(LispError::new("cannot evaluate dotted list as expression")),
     }
 }
 
@@ -212,6 +215,13 @@ pub fn sexpr_to_datum(expr: &SExpr) -> Value {
         }
         SExpr::Str(s) => Value::Str(s.clone()),
         SExpr::List(items) => Value::list(items.iter().map(sexpr_to_datum)),
+        SExpr::DottedList(items, tail) => {
+            // Build an improper list: (a b . c) → Pair(a, Pair(b, c))
+            let tail_val = sexpr_to_datum(tail);
+            items.iter().rev().fold(tail_val, |acc, item| {
+                Value::Pair(Rc::new((sexpr_to_datum(item), acc)))
+            })
+        }
     }
 }
 
@@ -236,6 +246,28 @@ fn eval_quasiquote(template: &SExpr, env: &Env) -> Result<Value, LispError> {
             let mut result = Value::Nil;
             for item in items.iter().rev() {
                 // (unquote-splicing e) → splice a list
+                if let SExpr::List(inner) = item {
+                    if inner.len() == 2 {
+                        if let SExpr::Atom(head) = &inner[0] {
+                            if head == "unquote-splicing" {
+                                let spliced = eval(inner[1].clone(), Rc::clone(env))?;
+                                result = list_append(spliced, result)?;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let val = eval_quasiquote(item, env)?;
+                result = Value::Pair(Rc::new((val, result)));
+            }
+            Ok(result)
+        }
+        SExpr::DottedList(items, tail) => {
+            // Build an improper quasiquoted list: `(a b . ,c) → Pair(a, Pair(b, eval(c)))
+            let tail_val = eval_quasiquote(tail, env)?;
+            let mut result = tail_val;
+            for item in items.iter().rev() {
+                // (unquote-splicing e) is allowed in head position
                 if let SExpr::List(inner) = item {
                     if inner.len() == 2 {
                         if let SExpr::Atom(head) = &inner[0] {
@@ -379,6 +411,37 @@ fn eval_define(tail: &[SExpr], env: Env) -> Result<Step, LispError> {
                 .ok_or_else(|| LispError::new("define: function name must be a symbol"))?
                 .to_string();
             let params = parse_params_list(&sig[1..])?;
+            let body = tail[1..].to_vec();
+            let lambda = Value::Lambda {
+                params,
+                body,
+                env: Rc::clone(&env),
+            };
+            env.borrow_mut().define(&name, lambda);
+            Ok(Step::Done(Value::Nil))
+        }
+        // (define (name fixed... . rest) body...) — variadic function shorthand.
+        SExpr::DottedList(sig, rest_param) => {
+            if sig.is_empty() {
+                return Err(LispError::new("define: empty function signature"));
+            }
+            let name = sig[0]
+                .as_atom()
+                .ok_or_else(|| LispError::new("define: function name must be a symbol"))?
+                .to_string();
+            let fixed: Result<Vec<_>, _> = sig[1..]
+                .iter()
+                .map(|e| {
+                    e.as_atom()
+                        .ok_or_else(|| LispError::new("lambda: parameter must be a symbol"))
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            let rest = rest_param
+                .as_atom()
+                .ok_or_else(|| LispError::new("lambda: rest parameter must be a symbol"))?
+                .to_string();
+            let params = Params::Variadic(fixed?, rest);
             let body = tail[1..].to_vec();
             let lambda = Value::Lambda {
                 params,
@@ -678,6 +741,22 @@ pub fn parse_params(expr: &SExpr) -> Result<Params, LispError> {
         SExpr::Atom(s) => Ok(Params::Rest(s.clone())),
         SExpr::Str(s) => Ok(Params::Rest(s.clone())),
         SExpr::List(items) => parse_params_list(items),
+        // (lambda (a b . rest) ...) — parser now produces DottedList directly.
+        SExpr::DottedList(items, tail) => {
+            let fixed: Result<Vec<_>, _> = items
+                .iter()
+                .map(|e| {
+                    e.as_atom()
+                        .ok_or_else(|| LispError::new("lambda: parameter must be a symbol"))
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            let rest = tail
+                .as_atom()
+                .ok_or_else(|| LispError::new("lambda: rest parameter must be a symbol"))?
+                .to_string();
+            Ok(Params::Variadic(fixed?, rest))
+        }
     }
 }
 

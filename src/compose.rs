@@ -477,6 +477,10 @@ fn parse_dependency(expr: &SExpr, service_name: &str) -> Result<Dependency, Comp
                 health_check,
             })
         }
+        SExpr::DottedList(_, _) => Err(ComposeError::InvalidValue(format!(
+            "service '{}': depends-on entry must be an atom or list",
+            service_name
+        ))),
     }
 }
 
