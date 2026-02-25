@@ -77,3 +77,12 @@
 
   `(define ,var-name
      (service ,svc-name ,@(apply append (map expand-opt (split-opts opts))))))
+
+;; (with-cleanup cleanup-thunk body...)
+;; Runs body; calls cleanup-thunk on any exit (normal or error).
+;; Equivalent to try/finally.
+(defmacro with-cleanup (cleanup . body)
+  `(guard (exn (#t (,cleanup) (error exn)))
+     (let ((result (begin ,@body)))
+       (,cleanup)
+       result)))

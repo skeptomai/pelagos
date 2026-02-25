@@ -1,0 +1,58 @@
+;;; Imperative compose example
+;;;
+;;; Demonstrates container-start, await-port, with-cleanup, guard, and format.
+;;; This file runs containers directly without (compose-up ...).
+;;;
+;;; Usage:
+;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
+
+;; ── Service definitions ───────────────────────────────────────────────────
+
+(define-service svc-db "db"
+  :image   "postgres:16"
+  :network "app-net"
+  :env     ("POSTGRES_PASSWORD" . "secret")
+           ("POSTGRES_DB" . "appdb"))
+
+(define-service svc-app "app"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command (list "/bin/sh" "-c" "echo 'app ready'; sleep 30"))
+
+;; ── Imperative orchestration ──────────────────────────────────────────────
+
+;; Start the database.
+(log (format "Starting database..."))
+(define db (container-start svc-db))
+(log (format "DB started at ~a (pid ~s)" (container-ip db) (container-status db)))
+
+;; Wait for the DB port to be available (up to 60 seconds).
+(define db-ready (await-port "localhost" 5432 60))
+(when (not db-ready)
+  (error "database did not become ready within 60 seconds"))
+(log "Database is ready — running migrations")
+
+;; Run the migration step as a one-shot container; exit code must be 0.
+(define-service svc-migrate "migrate"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command (list "/bin/sh" "-c" "echo 'migrations ok'; exit 0"))
+
+(define migration-exit (container-run svc-migrate))
+(when (not (= migration-exit 0))
+  (container-stop db)
+  (error (format "migrations failed with exit code ~s" migration-exit)))
+(log "Migrations complete")
+
+;; Start the application tier with cleanup on error.
+(with-cleanup
+  (lambda ()
+    (log "Cleanup: stopping db")
+    (container-stop db))
+  (begin
+    (define app (container-start svc-app))
+    (log (format "App started: ~a" (container-status app)))
+
+    ;; Wait for the app to exit (in production, you'd await-port here instead).
+    (container-wait app)
+    (log (format "App exited — status: ~a" (container-status app)))))

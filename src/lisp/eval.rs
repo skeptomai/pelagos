@@ -126,6 +126,7 @@ fn eval_list(items: Vec<SExpr>, env: Env) -> Result<Step, LispError> {
             "let*" => return eval_let_star(tail, env),
             "letrec" => return eval_letrec(tail, env),
             "do" => return eval_do(tail, env),
+            "guard" => return eval_guard(tail, env),
             _ => {}
         }
     }
@@ -645,6 +646,64 @@ fn eval_letrec(tail: &[SExpr], env: Env) -> Result<Step, LispError> {
         frame.borrow_mut().set(&names[i], val)?;
     }
     eval_begin(&tail[1..], frame)
+}
+
+/// `(guard (var clause...) body...)` — SRFI-34-style structured error handling.
+///
+/// Evaluates `body...`.  If an error is raised, binds the error message string
+/// to `var` and evaluates each `clause` as in `cond`.  If a clause matches,
+/// returns its value.  If no clause matches, the original error is re-raised.
+/// If `body` completes normally, its value is returned unchanged.
+fn eval_guard(tail: &[SExpr], env: Env) -> Result<Step, LispError> {
+    if tail.len() < 2 {
+        return Err(LispError::new(
+            "guard: expected (var clause...) and at least one body form",
+        ));
+    }
+    let handler_spec = tail[0]
+        .as_list()
+        .ok_or_else(|| LispError::new("guard: first argument must be (var clause...)"))?;
+    if handler_spec.is_empty() {
+        return Err(LispError::new(
+            "guard: handler spec must start with variable name",
+        ));
+    }
+    let var_name = handler_spec[0]
+        .as_atom()
+        .ok_or_else(|| LispError::new("guard: variable name must be a symbol"))?
+        .to_string();
+    let clauses = &handler_spec[1..];
+    let body = &tail[1..];
+
+    // Evaluate body; catch any LispError.
+    match eval_body(body, Rc::clone(&env)) {
+        Ok(v) => Ok(Step::Done(v)),
+        Err(err) => {
+            // Bind the condition message to var in a new frame.
+            let handler_env = EnvFrame::child(&env);
+            handler_env
+                .borrow_mut()
+                .define(&var_name, Value::Str(err.message.clone()));
+
+            // Evaluate clauses like `cond`.
+            for clause in clauses {
+                let items = clause
+                    .as_list()
+                    .ok_or_else(|| LispError::new("guard: clause must be a list"))?;
+                if items.is_empty() {
+                    return Err(LispError::new("guard: empty clause"));
+                }
+                let is_else = matches!(&items[0], SExpr::Atom(s) if s == "else");
+                let matched =
+                    is_else || eval(items[0].clone(), Rc::clone(&handler_env))?.is_truthy();
+                if matched {
+                    return eval_begin(&items[1..], handler_env);
+                }
+            }
+            // No clause matched — re-raise the original error.
+            Err(err)
+        }
+    }
 }
 
 /// `do` loop: `(do ((var init step) ...) (test result...) body ...)`

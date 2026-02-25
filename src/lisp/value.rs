@@ -44,6 +44,15 @@ pub enum Value {
     NetworkSpec(Box<crate::compose::NetworkSpec>),
     VolumeSpec(String),
     ComposeSpec(Box<crate::compose::ComposeFile>),
+    /// A running container spawned via `container-start`.
+    ContainerHandle {
+        /// Scoped container name, e.g. `"proj-postgres"`.
+        name: String,
+        /// PID of the container process.
+        pid: i32,
+        /// Primary bridge IP assigned to the container, if any.
+        ip: Option<String>,
+    },
 }
 
 /// Lambda parameter specification.
@@ -143,6 +152,7 @@ impl Value {
             Value::NetworkSpec(_) => "network-spec",
             Value::VolumeSpec(_) => "volume-spec",
             Value::ComposeSpec(_) => "compose-spec",
+            Value::ContainerHandle { .. } => "container",
         }
     }
 
@@ -218,6 +228,7 @@ impl fmt::Display for Value {
             Value::NetworkSpec(n) => write!(f, "#<network:{}>", n.name),
             Value::VolumeSpec(v) => write!(f, "#<volume:{}>", v),
             Value::ComposeSpec(_) => write!(f, "#<compose-spec>"),
+            Value::ContainerHandle { name, .. } => write!(f, "#<container {}>", name),
         }
     }
 }

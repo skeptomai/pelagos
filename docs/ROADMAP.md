@@ -202,6 +202,47 @@ Build custom OCI images from Remfiles (simplified Dockerfiles).
 
 ---
 
+## Imperative Runtime Builtins ✅ (Feb 25, 2026)
+
+Make Lisp the **primary programming interface** to Remora's runtime, not just
+a config DSL.  `.reml` files can now directly orchestrate containers without
+using `compose-up`.
+
+### What shipped
+
+- **`(format fmt arg...)`** — `~a` display / `~s` write sprintf-style formatting
+- **`(sleep secs)`** — thread sleep accepting int or float
+- **`(guard (var clause...) body...)`** — SRFI-34 structured error handling
+- **`(with-cleanup thunk body...)`** — try/finally macro built on `guard`
+- **`container-start`** — spawn a container from a service spec; returns a handle
+- **`container-stop`** — send SIGTERM to a container handle
+- **`container-wait`** — block until a container exits; returns exit code
+- **`container-run`** — start + wait (one-shot containers)
+- **`container-ip`** — retrieve primary bridge IP of a container handle
+- **`container-status`** — `"running"` or `"exited"` liveness check
+- **`await-port`** — TCP connect loop with configurable timeout
+- **`Interpreter::new_with_runtime(project, compose_dir)`** — opt-in constructor
+- **Drop impl** — automatic SIGTERM to any containers left running on interpreter drop
+
+### Example pattern
+
+```lisp
+(define db (container-start svc-postgres))
+(when (not (await-port "localhost" 5432 60))
+  (error "postgres did not come up"))
+
+(define migrate-exit (container-run svc-migrate))
+(when (not (= migrate-exit 0))
+  (container-stop db)
+  (error (format "migrations failed: exit ~s" migrate-exit)))
+
+(with-cleanup (lambda () (container-stop db))
+  (define app (container-start svc-app))
+  (container-wait app))
+```
+
+---
+
 ## Planned
 
 ### AppArmor / SELinux (Moderate Effort)

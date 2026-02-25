@@ -12,6 +12,7 @@ pub mod builtins;
 pub mod env;
 pub mod eval;
 pub mod remora;
+pub mod runtime;
 pub mod value;
 
 use std::cell::RefCell;
@@ -32,6 +33,10 @@ pub struct Interpreter {
     global_env: Env,
     hooks: Rc<RefCell<HookMap>>,
     pending: Rc<RefCell<PendingCompose>>,
+    /// Registry of containers started via `container-start`.
+    /// Entries are `(container_name, pid)`.
+    /// The `Drop` impl sends SIGTERM to any still-running containers.
+    pub(crate) container_registry: Rc<RefCell<Vec<(String, i32)>>>,
 }
 
 impl Interpreter {
@@ -40,6 +45,7 @@ impl Interpreter {
         let global_env = EnvFrame::new();
         let hooks: Rc<RefCell<HookMap>> = Rc::new(RefCell::new(HookMap::new()));
         let pending: Rc<RefCell<PendingCompose>> = Rc::new(RefCell::new(PendingCompose::default()));
+        let container_registry: Rc<RefCell<Vec<(String, i32)>>> = Rc::new(RefCell::new(Vec::new()));
 
         register_builtins(&global_env);
         register_remora_builtins(&global_env, Rc::clone(&hooks), Rc::clone(&pending));
@@ -48,10 +54,24 @@ impl Interpreter {
             global_env,
             hooks,
             pending,
+            container_registry,
         };
         interp
             .eval_str(include_str!("stdlib.lisp"))
             .expect("stdlib.lisp failed to load — this is a bug");
+        interp
+    }
+
+    /// Create a new interpreter with all builtins **plus** imperative runtime
+    /// builtins (`container-start`, `container-stop`, `await-port`, etc.).
+    ///
+    /// `project` is the compose project name used to scope container names.
+    /// `compose_dir` is the directory containing the compose file; it is used
+    /// to resolve relative bind-mount host paths.
+    pub fn new_with_runtime(project: String, compose_dir: std::path::PathBuf) -> Self {
+        let interp = Self::new();
+        let registry = Rc::clone(&interp.container_registry);
+        runtime::register_runtime_builtins(&interp.global_env, registry, project, compose_dir);
         interp
     }
 
@@ -106,6 +126,18 @@ impl Interpreter {
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Interpreter {
+    fn drop(&mut self) {
+        for (name, pid) in self.container_registry.borrow().iter() {
+            log::info!("interpreter cleanup: stopping '{}' (pid {})", name, pid);
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
     }
 }
 
@@ -880,5 +912,104 @@ mod tests {
             Some("2021"),
             "RUST_EDITION should be '2021'"
         );
+    }
+
+    // ── format builtin ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_builtin() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, r#"(format "~s + ~s = ~s" 1 2 3)"#),
+            Value::Str("1 + 2 = 3".into())
+        );
+    }
+
+    #[test]
+    fn test_format_tilde_a_display_no_quotes() {
+        // ~a = display: strings without quotes
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, r#"(format "hello ~a" "world")"#),
+            Value::Str("hello world".into())
+        );
+    }
+
+    #[test]
+    fn test_format_tilde_s_write_with_quotes() {
+        // ~s = write: strings with quotes
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, r#"(format "val=~s" "hi")"#),
+            Value::Str("val=\"hi\"".into())
+        );
+    }
+
+    // ── sleep builtin ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sleep_builtin() {
+        // sleep 0 returns Nil without panic
+        let mut i = interp();
+        assert_eq!(eval_ok(&mut i, "(sleep 0)"), Value::Nil);
+    }
+
+    // ── guard special form ────────────────────────────────────────────────
+
+    #[test]
+    fn test_guard_catches_error() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, r#"(guard (e (#t "caught")) (error "boom"))"#),
+            Value::Str("caught".into())
+        );
+    }
+
+    #[test]
+    fn test_guard_no_error_returns_body_value() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, r#"(guard (e (#t "caught")) 42)"#),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn test_guard_reraises_on_no_match() {
+        let mut i = interp();
+        let msg = eval_err(&mut i, r#"(guard (e (#f "nope")) (error "boom"))"#);
+        assert!(msg.contains("boom"), "expected 'boom' in: {}", msg);
+    }
+
+    #[test]
+    fn test_guard_binds_error_message() {
+        let mut i = interp();
+        assert_eq!(
+            eval_ok(&mut i, r#"(guard (msg (#t msg)) (error "the-message"))"#),
+            Value::Str("the-message".into())
+        );
+    }
+
+    // ── with-cleanup macro ────────────────────────────────────────────────
+
+    #[test]
+    fn test_with_cleanup_normal_exit() {
+        let mut i = interp();
+        eval_ok(&mut i, "(define cleaned #f)");
+        let v = eval_ok(&mut i, r#"(with-cleanup (lambda () (set! cleaned #t)) 99)"#);
+        assert_eq!(v, Value::Int(99));
+        assert_eq!(eval_ok(&mut i, "cleaned"), Value::Bool(true));
+    }
+
+    #[test]
+    fn test_with_cleanup_error_exit() {
+        let mut i = interp();
+        eval_ok(&mut i, "(define cleaned #f)");
+        let msg = eval_err(
+            &mut i,
+            r#"(with-cleanup (lambda () (set! cleaned #t)) (error "oops"))"#,
+        );
+        assert!(msg.contains("oops"), "got: {}", msg);
+        assert_eq!(eval_ok(&mut i, "cleaned"), Value::Bool(true));
     }
 }

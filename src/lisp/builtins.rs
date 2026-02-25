@@ -780,6 +780,70 @@ pub fn register_builtins(env: &Env) {
         print!("{}", args[0]);
         Ok(Value::Nil)
     });
+
+    // ── Format string ──────────────────────────────────────────────────────
+    // (format fmt arg...)
+    // ~a = display: strings without quotes, numbers as-is
+    // ~s = write:   all values in their Value::Display form (strings WITH quotes)
+    native(env, "format", |args| {
+        if args.is_empty() {
+            return Err(LispError::new("format: requires format string"));
+        }
+        let fmt = str_val("format", &args[0])?;
+        let mut result = String::new();
+        let mut arg_idx = 1usize;
+        let mut chars = fmt.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '~' {
+                match chars.next() {
+                    Some('a') | Some('A') => {
+                        if arg_idx >= args.len() {
+                            return Err(LispError::new("format: too few arguments"));
+                        }
+                        // Display: strings without quotes.
+                        match &args[arg_idx] {
+                            Value::Str(s) => result.push_str(s),
+                            v => result.push_str(&v.to_string()),
+                        }
+                        arg_idx += 1;
+                    }
+                    Some('s') | Some('S') => {
+                        if arg_idx >= args.len() {
+                            return Err(LispError::new("format: too few arguments"));
+                        }
+                        // Write: use Value's Display (strings have quotes).
+                        result.push_str(&args[arg_idx].to_string());
+                        arg_idx += 1;
+                    }
+                    Some('%') => result.push('\n'),
+                    Some('~') => result.push('~'),
+                    Some(other) => {
+                        result.push('~');
+                        result.push(other);
+                    }
+                    None => result.push('~'),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        Ok(Value::Str(result))
+    });
+
+    // ── Sleep ──────────────────────────────────────────────────────────────
+    // (sleep secs) — accepts int or float; returns ()
+    native(env, "sleep", |args| {
+        check_arity("sleep", 1, args)?;
+        let secs = match &args[0] {
+            Value::Int(n) => *n as f64,
+            Value::Float(f) => *f,
+            a => return Err(type_err("sleep", "number", a)),
+        };
+        if secs > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+        }
+        Ok(Value::Nil)
+    });
 }
 
 // ---------------------------------------------------------------------------

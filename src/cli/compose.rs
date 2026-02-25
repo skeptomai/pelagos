@@ -250,14 +250,29 @@ fn cmd_compose_up_reml(
     project_name: Option<&str>,
     foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut interp = Interpreter::new();
+    // Derive a preliminary project name from the file path so that
+    // imperative `container-start` calls during eval use the right scope.
+    let preliminary_project = if let Some(name) = project_name {
+        name.to_string()
+    } else {
+        derive_project_name(file, None)?
+    };
+    let compose_dir = file
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+
+    let mut interp = Interpreter::new_with_runtime(preliminary_project, compose_dir.clone());
     interp
         .eval_file(file)
         .map_err(|e| format!("{}: {}", file.display(), e))?;
 
-    let pending = interp
-        .take_pending()
-        .ok_or("reml file did not call (compose-up ...)")?;
+    // If the script never called (compose-up ...) it was purely imperative:
+    // containers were started/stopped during evaluation.  Nothing more to do.
+    let pending = match interp.take_pending() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
     let spec = pending.spec.ok_or("compose-up: missing spec")?;
     let effective_foreground = pending.foreground || foreground;
 
@@ -272,7 +287,6 @@ fn cmd_compose_up_reml(
 
     let hooks = interp.take_hooks();
     let order = topo_sort(&spec.services)?;
-    let compose_dir = file.parent().unwrap_or(std::path::Path::new("."));
 
     // Check for already-running project.
     let state_file = remora::paths::compose_state_file(&project);
@@ -323,7 +337,7 @@ fn cmd_compose_up_reml(
             &created_networks,
             &created_volumes,
             &hooks,
-            compose_dir,
+            &compose_dir,
         )
     } else {
         let fork_result = unsafe { libc::fork() };
@@ -339,7 +353,7 @@ fn cmd_compose_up_reml(
                     &created_networks,
                     &created_volumes,
                     &hooks,
-                    compose_dir,
+                    &compose_dir,
                 ) {
                     log::error!("compose supervisor (.reml): {}", e);
                     unsafe { libc::_exit(1) };
