@@ -397,16 +397,16 @@ fn apply_service_opt(spec: &mut ServiceSpec, key: &str, vals: &[Value]) -> Resul
             spec.bind_mounts.push(BindMount {
                 host_path,
                 container_path,
-                read_only: false,
+                read_only: true,
             });
         }
-        "bind-ro" => {
-            let host_path = str_or_sym_at("bind-ro host_path", vals, 0)?;
-            let container_path = str_or_sym_at("bind-ro container_path", vals, 1)?;
+        "bind-rw" => {
+            let host_path = str_or_sym_at("bind-rw host_path", vals, 0)?;
+            let container_path = str_or_sym_at("bind-rw container_path", vals, 1)?;
             spec.bind_mounts.push(BindMount {
                 host_path,
                 container_path,
-                read_only: true,
+                read_only: false,
             });
         }
         "workdir" => {
