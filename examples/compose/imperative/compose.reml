@@ -31,13 +31,13 @@
 (define-service svc-migrate "migrate"
   :image   "alpine:latest"
   :network "app-net"
-  :command (list "/bin/sh" "-c"
+  :command '("/bin/sh" "-c"
              "echo \"migrating ${DATABASE_URL}\"; exit 0"))
 
 (define-service svc-app "app"
   :image   "alpine:latest"
   :network "app-net"
-  :command (list "/bin/sh" "-c"
+  :command '("/bin/sh" "-c"
              "echo \"db=${DATABASE_URL} cache=${CACHE_URL}\"; sleep 5; echo done"))
 
 ;; ── Declare the graph — nothing executes yet ─────────────────────────────
@@ -60,17 +60,17 @@
 ;; Migrations: depend on db-url; :inject wires it into the container env
 (define migrate-fut
   (container-start-async svc-migrate
-    :after  (list db-url-fut)
+    :after  `(,db-url-fut)
     :inject (lambda (db-url)
-              (list (cons "DATABASE_URL" db-url)))))
+              `(("DATABASE_URL" . ,db-url)))))
 
 ;; Application: depends on both URLs; :inject wires both into the container env
 (define app-fut
   (container-start-async svc-app
-    :after  (list db-url-fut cache-url-fut)
+    :after  `(,db-url-fut ,cache-url-fut)
     :inject (lambda (db-url cache-url)
-              (list (cons "DATABASE_URL" db-url)
-                    (cons "CACHE_URL"    cache-url)))))
+              `(("DATABASE_URL" . ,db-url)
+                ("CACHE_URL"    . ,cache-url)))))
 
 ;; ── Execute: tier-parallel run ───────────────────────────────────────────
 ;;
@@ -84,7 +84,7 @@
 ;; All dependency ordering is still respected — tiers execute sequentially.
 
 (define results
-  (run-all (list db-fut cache-fut db-url-fut cache-url-fut migrate-fut app-fut) :parallel))
+  (run-all `(,db-fut ,cache-fut ,db-url-fut ,cache-url-fut ,migrate-fut ,app-fut) :parallel))
 
 ;; ── Post-execution ────────────────────────────────────────────────────────
 
