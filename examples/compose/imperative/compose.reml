@@ -12,6 +12,10 @@
 ;;; Data flows through (then ...) transforms rather than imperative steps.
 ;;; :inject wires derived values into the service env at execution time.
 ;;;
+;;; Naming convention (enforced by macros):
+;;;   (define-future name svc)           binds name-fut
+;;;   (define-transform name upstream …) reads upstream-fut, binds name-fut
+;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
 
@@ -47,16 +51,12 @@
   (db    svc-db)
   (cache svc-cache))
 
-;; Derive connection strings from resolved handles via (then ...)
-(define db-url-fut
-  (then db-fut
-    (lambda (db)
-      (format "postgres://app:secret@~a/appdb" (container-ip db)))))
+;; Derive connection strings from resolved handles
+(define-transform db-url db
+  (format "postgres://app:secret@~a/appdb" (container-ip db)))
 
-(define cache-url-fut
-  (then cache-fut
-    (lambda (cache)
-      (format "redis://~a:6379" (container-ip cache)))))
+(define-transform cache-url cache
+  (format "redis://~a:6379" (container-ip cache)))
 
 ;; Migrations: depend on db-url; :inject wires it into the container env
 (define migrate-fut

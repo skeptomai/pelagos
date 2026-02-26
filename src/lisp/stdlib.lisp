@@ -155,3 +155,12 @@
      ,@(map (lambda (clause)
               `(define-future ,(car clause) ,(cadr clause)))
             clauses)))
+
+;; (define-transform name upstream body...)
+;; Shorthand for (define name-fut (then upstream-fut (lambda (upstream) body...))).
+;; Convention: name-fut is the output future; upstream-fut is the input future;
+;; upstream is the lambda parameter bound to the resolved value.
+(defmacro define-transform (name upstream . body)
+  (define fut-name  (string->symbol (string-append (symbol->string name)     "-fut")))
+  (define up-name   (string->symbol (string-append (symbol->string upstream) "-fut")))
+  `(define ,fut-name (then ,up-name (lambda (,upstream) ,@body))))

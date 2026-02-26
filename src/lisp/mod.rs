@@ -1283,6 +1283,19 @@ mod tests {
     }
 
     #[test]
+    fn test_define_transform_macro() {
+        // (define-transform db-url db body) binds db-url-fut in the environment.
+        // Stub then to return its lambda so we can inspect it without a real future.
+        let mut i = Interpreter::new();
+        eval_ok(&mut i, "(defmacro then (fut lam) lam)");
+        eval_ok(&mut i, "(define db-fut 'ignored)");
+        eval_ok(&mut i, "(define-transform db-url db (string-append \"url:\" (symbol->string db)))");
+        // db-url-fut should be a lambda; apply it to verify the param binding.
+        let v = eval_ok(&mut i, "(db-url-fut 'myhost)");
+        assert_eq!(v, Value::Str("url:myhost".into()));
+    }
+
+    #[test]
     fn test_define_future_macro() {
         // (define-future db svc) should bind db-fut in the environment.
         let mut i = Interpreter::new();
