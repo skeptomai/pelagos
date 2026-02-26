@@ -654,6 +654,7 @@ Four macros cover the common patterns without boilerplate:
 | `(define-service var "name" opts...)` | Declare a service spec (no container starts) |
 | `(define-nodes (var svc) ...)` | Declare multiple lazy start nodes at once |
 | `(define-then name upstream (param) body...)` | Compute a value once `upstream` resolves |
+| `(define-run [opts] (var future) ...)` | Execute the graph and bind results in one form |
 | `(define-results results (var "key") ...)` | Destructure a `run` result alist |
 
 ### A complete example
@@ -670,11 +671,21 @@ Four macros cover the common patterns without boilerplate:
   :image   "redis:7-alpine"
   :network "app-net")
 
+(define-service svc-migrate "migrate"
+  :image   "alpine:latest"
+  :network "app-net"
+  :command '("/bin/sh" "-c" "echo \"migrating ${DATABASE_URL}\"; exit 0"))
+
 (define-service svc-app "app"
   :image   "myapp:latest"
   :network "app-net")
 
 ;; ── Declare the graph — nothing executes yet ─────────────────────────
+;;
+;;   db ──→ db-url ──→ migrate ──→ app
+;;   db ──→ db-url ─────────────→ app  (DATABASE_URL env)
+;;   cache ──→ cache-url ─────────→ app
+;;
 (define-nodes
   (db    svc-db)
   (cache svc-cache))
@@ -686,27 +697,35 @@ Four macros cover the common patterns without boilerplate:
 (define-then cache-url cache (h)
   (format "redis://~a:6379" (container-ip h)))
 
-;; App needs both URLs injected into its environment
+;; Migration runs first; app waits for it to complete
+(define migrate (start svc-migrate
+  :needs (list db-url)
+  :env   (lambda (url) `(("DATABASE_URL" . ,url)))))
+
+;; App waits for migration, then starts with both URLs
 (define app (start svc-app
-  :needs (list db-url cache-url)
-  :env   (lambda (db-url cache-url)
+  :needs (list migrate db-url cache-url)
+  :env   (lambda (_ db-url cache-url)
            `(("DATABASE_URL" . ,db-url)
              ("CACHE_URL"    . ,cache-url)))))
 
-;; ── Execute ───────────────────────────────────────────────────────────
-;; List the containers whose handles you need.  run discovers db-url and
-;; cache-url automatically from app's :needs — no need to enumerate them.
-(define results (run (list db cache app) :parallel))
+;; ── Execute and bind ──────────────────────────────────────────────────
+;; migrate, db-url, cache-url are discovered automatically from app's
+;; :needs — only list the containers whose handles you need.
+(define-run :parallel
+  (db-handle    db)
+  (cache-handle cache)
+  (app-handle   app))
 
-;; ── Post-execution ────────────────────────────────────────────────────
-(define-results results
-  (db-handle    "db")
-  (cache-handle "cache")
-  (app-handle   "app"))
-
-(container-wait app-handle)
-(container-stop cache-handle)
-(container-stop db-handle)
+;; ── Wait and clean up ─────────────────────────────────────────────────
+;; container-wait cascades container-stop through app's transitive deps
+;; (migrate, cache, db) automatically — the same graph that governed
+;; startup governs shutdown.  No manual stop calls needed.
+(with-cleanup (lambda (result)
+                (if (ok? result)
+                  (logf "app exited cleanly (code ~a)" (ok-value result))
+                  (logf "app failed: ~a" (err-reason result))))
+  (container-wait app-handle))
 ```
 
 ### `run` — the static executor
@@ -729,7 +748,8 @@ executor blocks between tiers — dependencies are always respected.
 ```
 Tier 1:  db ∥ cache                    (no dependencies)
 Tier 2:  db-url ∥ cache-url            (unblocked after tier 1)
-Tier 3:  app                            (unblocked after tier 2)
+Tier 3:  migrate                        (unblocked after db-url)
+Tier 4:  app                            (unblocked after migrate + cache-url)
 ```
 
 The graph declaration is unchanged between serial and parallel execution.

@@ -266,21 +266,20 @@ and executed in the correct order.
 Given this graph:
 
 ```
-db ──→ db-url ──→ migrate
-db ──→ db-url ──→ app
-cache ──→ cache-url ──→ app
+db ──→ db-url ──→ migrate ──→ app
+db ──→ db-url ─────────────→ app  (DATABASE_URL env)
+cache ──→ cache-url ─────────→ app
 ```
 
-You only list the containers you need handles for:
+You only list the containers whose handles you need:
 
 ```lisp
 (define results (run (list db cache app) :parallel))
 ```
 
-`migrate` ran (it's a transitive dependency of `app` via `db-url`), but
-its handle is not needed so it is not listed.  `db-url` and `cache-url`
-are intermediate computations — they execute as needed but are not in the
-output alist.
+`migrate` ran (it's a transitive dependency of `app`) but its handle is
+not needed so it is not listed.  `db-url` and `cache-url` are intermediate
+Transform futures — they execute as needed but are not in the output alist.
 
 This keeps the terminal list as a statement of *intent* ("I need these
 handles") rather than a manual transcription of the dependency graph.
@@ -303,9 +302,10 @@ Given:
   :needs (list db-url)
   :env   (lambda (url) `(("DATABASE_URL" . ,url)))))
 
+;; app waits for migrate to complete, then starts with both URLs
 (define app (start svc-app
-  :needs (list db-url cache-url)
-  :env   (lambda (db-url cache-url)
+  :needs (list migrate db-url cache-url)
+  :env   (lambda (_ db-url cache-url)
            `(("DATABASE_URL" . ,db-url)
              ("CACHE_URL"    . ,cache-url)))))
 
@@ -438,22 +438,23 @@ stop calls needed.
 
 ```
 app
- ├── cache  (via cache-url → cache)
- └── db     (via db-url → db)
+ ├── migrate  (direct dep)
+ │    └── db  (via db-url → db)
+ ├── cache    (via cache-url → cache)
+ └── db       (via db-url → db)
 ```
 
 `(container-wait app-handle)` blocks until `app` exits, then stops
-`cache`, then stops `db` — in that order.
+`migrate`, `cache`, and `db` (in reverse execution order) — automatically.
 
 **Scope of cascade:** only container futures that are transitive
 dependencies of the handle being waited/stopped are auto-stopped.
-Services that are *not* in the dependency chain (e.g. `migrate`, which
-depends on `db-url` but is not depended on by `app`) must be stopped
-explicitly if needed.
+Containers started *outside* this dependency chain — a metrics sidecar,
+an ad-hoc debug container — must be stopped explicitly.
 
 ```lisp
-;; No explicit stop calls needed for cache or db — both are transitive
-;; deps of app and will be stopped automatically after app exits.
+;; No explicit stop calls needed — migrate, cache, and db are all
+;; transitive deps of app and are stopped automatically after app exits.
 (with-cleanup (lambda (result)
                 (if (ok? result)
                   (logf "app exited cleanly (code ~a)" (ok-value result))
