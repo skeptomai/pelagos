@@ -1281,4 +1281,31 @@ mod tests {
             other => panic!("expected pair, got: {}", other),
         }
     }
+
+    #[test]
+    fn test_define_future_macro() {
+        // (define-future db svc) should bind db-fut in the environment.
+        let mut i = Interpreter::new();
+        eval_ok(&mut i, "(define svc '())");
+        eval_ok(&mut i, r#"
+            (defmacro container-start-async (svc . rest) (list 'quote 'fake-future))
+        "#);
+        eval_ok(&mut i, "(define-future db svc)");
+        let v = eval_ok(&mut i, "db-fut");
+        assert_eq!(v, Value::Symbol("fake-future".into()));
+    }
+
+    #[test]
+    fn test_define_futures_macro() {
+        // (define-futures (db svc-db) (cache svc-cache)) binds db-fut and cache-fut.
+        let mut i = Interpreter::new();
+        eval_ok(&mut i, "(define svc-db '())");
+        eval_ok(&mut i, "(define svc-cache '())");
+        eval_ok(&mut i, r#"
+            (defmacro container-start-async (svc . rest) (list 'quote svc))
+        "#);
+        eval_ok(&mut i, "(define-futures (db svc-db) (cache svc-cache))");
+        assert_eq!(eval_ok(&mut i, "db-fut"),    Value::Symbol("svc-db".into()));
+        assert_eq!(eval_ok(&mut i, "cache-fut"), Value::Symbol("svc-cache".into()));
+    }
 }

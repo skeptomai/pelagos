@@ -43,8 +43,9 @@
 ;; ── Declare the graph — nothing executes yet ─────────────────────────────
 
 ;; Tier 1: independent services
-(define db-fut    (container-start-async svc-db))
-(define cache-fut (container-start-async svc-cache))
+(define-futures
+  (db    svc-db)
+  (cache svc-cache))
 
 ;; Derive connection strings from resolved handles via (then ...)
 (define db-url-fut

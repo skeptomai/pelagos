@@ -138,3 +138,20 @@
      (let ((result (begin ,@body)))
        (,cleanup (ok result))
        result)))
+
+;; ── Future helpers ────────────────────────────────────────────────────────
+
+;; (define-future name svc-spec [:after list] [:inject lambda])
+;; Shorthand for (define name-fut (container-start-async svc-spec ...)).
+;; The variable bound is name-fut; the service name comes from svc-spec.
+(defmacro define-future (name svc . opts)
+  (define fut-name (string->symbol (string-append (symbol->string name) "-fut")))
+  `(define ,fut-name (container-start-async ,svc ,@opts)))
+
+;; (define-futures (name svc-spec) ...)
+;; Batch form of define-future; expands each clause independently.
+(defmacro define-futures clauses
+  `(begin
+     ,@(map (lambda (clause)
+              `(define-future ,(car clause) ,(cadr clause)))
+            clauses)))
