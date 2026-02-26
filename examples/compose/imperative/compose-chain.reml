@@ -1,30 +1,30 @@
 ;;; Monadic chain example — dynamic graph via (resolve ...)
 ;;;
-;;; This example is the same three-service stack as compose.reml (db →
-;;; migrate → app), but uses the dynamic executor instead of run-all.
+;;; Same three-service stack as compose.reml (db → migrate → app),
+;;; using the dynamic executor instead of run.
 ;;;
 ;;; Key difference from compose.reml:
 ;;;
-;;;   compose.reml         — static: full graph declared before execution;
-;;;                          run-all topo-sorts and cycle-detects upfront.
+;;;   compose.reml       — static: full graph declared before execution;
+;;;                        run topo-sorts and cycle-detects upfront.
 ;;;
-;;;   compose-chain.reml   — dynamic: each (then ...) lambda returns the
-;;;                          *next* future; the graph unfolds as execution
-;;;                          proceeds.  No upfront graph declaration needed.
+;;;   compose-chain.reml — dynamic: each (derive ...) lambda returns the
+;;;                        *next* node; the graph unfolds as execution
+;;;                        proceeds.  No upfront graph declaration needed.
 ;;;
 ;;; When to use each:
 ;;;
-;;;   run-all   — complex multi-service graphs, independent services that
-;;;               can run in parallel (db ∥ cache), or when you want upfront
-;;;               cycle detection.
+;;;   run     — complex multi-service graphs, independent services that
+;;;             can run in parallel (db ∥ cache), or when you want upfront
+;;;             cycle detection.
 ;;;
-;;;   resolve   — linear pipelines where each step depends on the *value*
-;;;               produced by the previous step, and the next future cannot
-;;;               be described until that value is known.
+;;;   resolve — linear pipelines where each step depends on the *value*
+;;;             produced by the previous step, and the next node cannot
+;;;             be described until that value is known.
 ;;;
 ;;; Dependency graph (same as compose.reml):
 ;;;
-;;;   db-fut ──→ (derive db-url) ──→ migrate-fut ──→ (derive app-url) ──→ app-fut
+;;;   db ──→ (derive db-url) ──→ migrate ──→ (derive) ──→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose-chain.reml -p chain-demo
@@ -41,46 +41,45 @@
 (define-service svc-migrate "migrate"
   :image   "alpine:latest"
   :network "app-net"
-  :command (list "/bin/sh" "-c"
+  :command '("/bin/sh" "-c"
              "echo \"migrating ${DATABASE_URL}\"; exit 0"))
 
 (define-service svc-app "app"
   :image   "alpine:latest"
   :network "app-net"
-  :command (list "/bin/sh" "-c"
+  :command '("/bin/sh" "-c"
              "echo \"db=${DATABASE_URL}\"; sleep 5; echo done"))
 
 ;; ── Declare the chain — nothing executes yet ─────────────────────────────
 ;;
-;; The outermost (then ...) is the tip of the chain.  When (resolve ...)
-;; is called, it walks upstream recursively:
+;; When (resolve ...) is called it walks upstream recursively:
 ;;
-;;   1. resolve db-fut          → ContainerHandle
+;;   1. resolve db              → ContainerHandle
 ;;   2. derive db-url string    → "postgres://app:secret@<ip>/appdb"
-;;   3. resolve migrate-fut     → ContainerHandle  (inject wires DATABASE_URL)
-;;   4. lambda returns app-fut  → another Future!  resolve flattens it
-;;   5. resolve app-fut         → ContainerHandle  (inject wires DATABASE_URL)
+;;   3. resolve migrate         → ContainerHandle  (:env wires DATABASE_URL)
+;;   4. lambda returns app node → another node! resolve flattens it
+;;   5. resolve app             → ContainerHandle  (:env wires DATABASE_URL)
 ;;
-;; Step 4 is the monadic flatten: the lambda does not return a plain value
-;; but a *new Future*.  resolve detects this and executes it automatically,
+;; Step 4 is the monadic flatten: the lambda returns a *new node* rather
+;; than a plain value.  resolve detects this and executes it automatically,
 ;; so the whole pipeline is a single (resolve pipeline) call.
 
-(define db-fut (container-start-async svc-db))
+(define db (start svc-db))
 
 (define pipeline
-  (then db-fut
-    (lambda (db)
-      (let ((db-url (format "postgres://app:secret@~a/appdb" (container-ip db))))
+  (derive db
+    (lambda (db-handle)
+      (let ((db-url (format "postgres://app:secret@~a/appdb" (container-ip db-handle))))
         ;; Start migrate, injecting the db-url we just derived.
-        (then (container-start-async svc-migrate
-                :after  (list db-fut)
-                :inject (lambda (_db) (list (cons "DATABASE_URL" db-url))))
+        (derive (start svc-migrate
+                  :needs (list db)
+                  :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))
           (lambda (_migrate)
             ;; migrate finished — now start app with the same db-url.
-            ;; Returning a Future here triggers the monadic flatten in resolve.
-            (container-start-async svc-app
-              :after  (list db-fut)
-              :inject (lambda (_db) (list (cons "DATABASE_URL" db-url))))))))))
+            ;; Returning a node here triggers the monadic flatten in resolve.
+            (start svc-app
+              :needs (list db)
+              :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))))))))
 
 ;; ── Execute: dynamic executor resolves the chain ──────────────────────────
 

@@ -7,35 +7,35 @@
 //!
 //! | Function | Signature | Description |
 //! |----------|-----------|-------------|
-//! | `container-start`       | `(svc-spec)` → ContainerHandle | Spawn a container immediately |
-//! | `container-start-async` | `(svc-spec [:after list] [:inject lambda])` → Future | Create a lazy future; nothing starts |
-//! | `then`                  | `(future lambda)` → Future | Transform a future's resolved value |
-//! | `then-all`              | `((list fut...) lambda)` → Future | Join multiple futures, then transform |
-//! | `run-all`               | `((list fut...) [:parallel] [:max-parallel N])` → alist | Execute graph; serial or tier-parallel |
-//! | `resolve`               | `(future)` → value | Execute a monadic chain depth-first |
-//! | `await`                 | `(future [:port P] [:timeout T])` → ContainerHandle | Await a single Container future |
-//! | `container-stop`        | `(handle)` → `()` | Send SIGTERM to a container |
-//! | `container-wait`        | `(handle)` → Int | Wait for a container to exit |
-//! | `container-run`         | `(svc-spec)` → Int | Start + wait; returns exit code |
-//! | `container-ip`          | `(handle)` → Str\|Nil | Primary IP of container |
-//! | `container-status`      | `(handle)` → Str | `"running"` or `"exited"` |
-//! | `await-port`            | `(host port [timeout-secs])` → Bool | TCP connect loop |
+//! | `container-start`  | `(svc-spec)` → ContainerHandle | Spawn a container immediately |
+//! | `start`            | `(svc-spec [:needs list] [:env lambda])` → Future | Declare a lazy container start; nothing runs |
+//! | `derive`           | `(future lambda)` → Future | Derive a value from a future's resolved result |
+//! | `derive-all`       | `((list fut...) lambda)` → Future | Join multiple futures, then derive |
+//! | `run`              | `((list fut...) [:parallel] [:max-parallel N])` → alist | Execute graph; serial or tier-parallel |
+//! | `resolve`          | `(future)` → value | Execute a monadic chain depth-first |
+//! | `await`            | `(future [:port P] [:timeout T])` → ContainerHandle | Await a single Container future |
+//! | `container-stop`   | `(handle)` → `()` | Send SIGTERM to a container |
+//! | `container-wait`   | `(handle)` → Int | Wait for a container to exit |
+//! | `container-run`    | `(svc-spec)` → Int | Start + wait; returns exit code |
+//! | `container-ip`     | `(handle)` → Str\|Nil | Primary IP of container |
+//! | `container-status` | `(handle)` → Str | `"running"` or `"exited"` |
+//! | `await-port`       | `(host port [timeout-secs])` → Bool | TCP connect loop |
 //!
 //! ## Executor model
 //!
-//! `container-start-async` returns a [`Value::Future`] — a pure description of
-//! work (the service spec) with no side effects.  Two executors are provided:
+//! `start` returns a [`Value::Future`] — a pure description of work (the
+//! service spec) with no side effects.  Two executors are provided:
 //!
-//! - **`run-all`** — static graph executor.  Accepts a flat list of futures,
-//!   topologically sorts them by their `:after` dependencies, and executes them
-//!   in order.  Pass `:parallel` to run independent futures within each tier
-//!   concurrently; the executor blocks between tiers to enforce ordering.
+//! - **`run`** — static graph executor.  Accepts a flat list of futures,
+//!   topologically sorts them by their `:needs` dependencies, and executes
+//!   them in order.  Pass `:parallel` to run independent futures within each
+//!   tier concurrently; the executor blocks between tiers to enforce ordering.
 //!   Use `:max-parallel N` to cap the number of simultaneous threads per tier.
 //!   Returns an alist of `(name . resolved-value)` pairs.
 //!
 //! - **`resolve`** — dynamic (monadic) executor.  Executes a single future
 //!   depth-first: resolves all upstreams recursively before calling transforms.
-//!   If a `then` lambda returns a new Future, that Future is resolved too
+//!   If a `derive` lambda returns a new Future, that Future is resolved too
 //!   (monadic flatten).  Use this for chains where the next step is only known
 //!   after the previous one resolves.
 
@@ -93,40 +93,36 @@ pub fn register_runtime_builtins(
         });
     }
 
-    // ── container-start-async ─────────────────────────────────────────────
+    // ── start ─────────────────────────────────────────────
     // Returns a Future — nothing starts.  Keywords:
-    //   :after  (list fut...)   ordering dependencies
-    //   :inject (lambda ...)    called with resolved :after values; returns
+    //   :needs  (list fut...)   ordering dependencies
+    //   :env    (lambda ...)    called with resolved :needs values; returns
     //                           a list of (key . value) env pairs to merge
-    native(env, "container-start-async", |args| {
+    native(env, "start", |args| {
         if args.is_empty() {
             return Err(LispError::new(
-                "container-start-async: expected (svc [:after list] [:inject lambda])",
+                "start: expected (svc [:needs list] [:env lambda])",
             ));
         }
-        let svc = extract_service_spec("container-start-async", &args[0])?;
+        let svc = extract_service_spec("start", &args[0])?;
         let mut after: Vec<Value> = Vec::new();
         let mut inject: Option<Box<Value>> = None;
         let mut i = 1;
         while i < args.len() {
             match &args[i] {
-                Value::Symbol(s) if s == ":after" => {
+                Value::Symbol(s) if s == ":needs" => {
                     i += 1;
                     let deps = args
                         .get(i)
-                        .ok_or_else(|| {
-                            LispError::new("container-start-async: :after requires a list")
-                        })?
+                        .ok_or_else(|| LispError::new("start: :needs requires a list"))?
                         .to_vec()
-                        .map_err(|_| {
-                            LispError::new("container-start-async: :after requires a list")
-                        })?;
+                        .map_err(|_| LispError::new("start: :needs requires a list"))?;
                     for dep in deps {
                         match &dep {
                             Value::Future { .. } => after.push(dep),
                             other => {
                                 return Err(LispError::new(format!(
-                                    "container-start-async: :after requires futures, got {}",
+                                    "start: :needs requires futures, got {}",
                                     other.type_name()
                                 )))
                             }
@@ -134,19 +130,17 @@ pub fn register_runtime_builtins(
                     }
                     i += 1;
                 }
-                Value::Symbol(s) if s == ":inject" => {
+                Value::Symbol(s) if s == ":env" => {
                     i += 1;
                     let f = args
                         .get(i)
-                        .ok_or_else(|| {
-                            LispError::new("container-start-async: :inject requires a lambda")
-                        })?
+                        .ok_or_else(|| LispError::new("start: :env requires a lambda"))?
                         .clone();
                     match &f {
                         Value::Lambda { .. } | Value::Native(_, _) => {}
                         other => {
                             return Err(LispError::new(format!(
-                                "container-start-async: :inject requires a lambda, got {}",
+                                "start: :env requires a lambda, got {}",
                                 other.type_name()
                             )))
                         }
@@ -156,7 +150,7 @@ pub fn register_runtime_builtins(
                 }
                 other => {
                     return Err(LispError::new(format!(
-                        "container-start-async: unexpected argument: {}",
+                        "start: unexpected argument: {}",
                         other
                     )))
                 }
@@ -174,20 +168,20 @@ pub fn register_runtime_builtins(
         })
     });
 
-    // ── then ───────────────────────────────────────────────────────────────
-    // (then upstream-future (lambda (v) derived-value))
+    // ── derive ───────────────────────────────────────────────────────────────
+    // (derive upstream-future (lambda (v) derived-value))
     // Creates a Transform future whose resolved value is the result of
     // applying the lambda to the upstream future's resolved value.
-    // The new future declares :after the upstream automatically.
-    native(env, "then", |args| {
+    // The new future declares :needs the upstream automatically.
+    native(env, "derive", |args| {
         if args.len() != 2 {
-            return Err(LispError::new("then: expected (future transform-lambda)"));
+            return Err(LispError::new("derive: expected (future transform-lambda)"));
         }
         let upstream_name = match &args[0] {
             Value::Future { name, .. } => name.clone(),
             other => {
                 return Err(LispError::new(format!(
-                    "then: expected future, got {}",
+                    "derive: expected future, got {}",
                     other.type_name()
                 )))
             }
@@ -196,7 +190,7 @@ pub fn register_runtime_builtins(
             Value::Lambda { .. } | Value::Native(_, _) => {}
             other => {
                 return Err(LispError::new(format!(
-                    "then: expected lambda, got {}",
+                    "derive: expected lambda, got {}",
                     other.type_name()
                 )))
             }
@@ -205,7 +199,7 @@ pub fn register_runtime_builtins(
         let upstream = args[0].clone();
         Ok(Value::Future {
             id: next_future_id(),
-            name: format!("{}-then", upstream_name),
+            name: format!("{}-derive", upstream_name),
             kind: FutureKind::Transform {
                 upstream: Box::new(upstream.clone()),
                 transform: Box::new(args[1].clone()),
@@ -214,20 +208,20 @@ pub fn register_runtime_builtins(
         })
     });
 
-    // ── then-all ───────────────────────────────────────────────────────────
-    // (then-all (list f1 f2 ...) (lambda (v1 v2 ...) result))
+    // ── derive-all ───────────────────────────────────────────────────────────
+    // (derive-all (list f1 f2 ...) (lambda (v1 v2 ...) result))
     // Creates a Join future: waits for all listed futures, then calls the
     // lambda with all their resolved values in order.  If the lambda returns
-    // a Future it is flattened automatically (same rule as then).
-    native(env, "then-all", |args| {
+    // a Future it is flattened automatically (same rule as derive).
+    native(env, "derive-all", |args| {
         if args.len() != 2 {
             return Err(LispError::new(
-                "then-all: expected (list-of-futures lambda)",
+                "derive-all: expected (list-of-futures lambda)",
             ));
         }
         let futures_list = args[0]
             .to_vec()
-            .map_err(|_| LispError::new("then-all: first argument must be a list of futures"))?;
+            .map_err(|_| LispError::new("derive-all: first argument must be a list of futures"))?;
         let mut upstreams: Vec<Value> = Vec::new();
         let mut name_parts: Vec<String> = Vec::new();
         for f in futures_list {
@@ -238,7 +232,7 @@ pub fn register_runtime_builtins(
                 }
                 other => {
                     return Err(LispError::new(format!(
-                        "then-all: expected futures in list, got {}",
+                        "derive-all: expected futures in list, got {}",
                         other.type_name()
                     )))
                 }
@@ -248,7 +242,7 @@ pub fn register_runtime_builtins(
             Value::Lambda { .. } | Value::Native(_, _) => {}
             other => {
                 return Err(LispError::new(format!(
-                    "then-all: expected lambda, got {}",
+                    "derive-all: expected lambda, got {}",
                     other.type_name()
                 )))
             }
@@ -264,16 +258,16 @@ pub fn register_runtime_builtins(
         })
     });
 
-    // ── run-all ────────────────────────────────────────────────────────────
-    // Graph-aware executor.  Topologically sorts futures by :after, produces
+    // ── run ────────────────────────────────────────────────────────────
+    // Graph-aware executor.  Topologically sorts futures by :needs, produces
     // tiers of independent futures, then executes serially or (with :parallel)
     // spawns threads for Container futures within each tier.
     //
     // Syntax:
-    //   (run-all futures-list)                    ; serial (default)
-    //   (run-all futures-list :parallel)           ; parallel tiers
-    //   (run-all futures-list :parallel :max-parallel N) ; parallel, ≤N at once
-    //   (run-all futures-list :max-parallel N)    ; :max-parallel implies :parallel
+    //   (run futures-list)                    ; serial (default)
+    //   (run futures-list :parallel)           ; parallel tiers
+    //   (run futures-list :parallel :max-parallel N) ; parallel, ≤N at once
+    //   (run futures-list :max-parallel N)    ; :max-parallel implies :parallel
     //
     // Transform/Join futures always execute on the main thread (lambdas capture
     // Rc values which are !Send).  Only the raw container-spawn step runs in
@@ -284,15 +278,15 @@ pub fn register_runtime_builtins(
         let registry = Arc::clone(&registry);
         let project = Rc::clone(&project);
         let compose_dir = Rc::clone(&compose_dir);
-        native(env, "run-all", move |args| {
+        native(env, "run", move |args| {
             if args.is_empty() {
                 return Err(LispError::new(
-                    "run-all: expected (futures-list [:parallel] [:max-parallel N])",
+                    "run: expected (futures-list [:parallel] [:max-parallel N])",
                 ));
             }
             let future_list = args[0]
                 .to_vec()
-                .map_err(|_| LispError::new("run-all: argument must be a list of futures"))?;
+                .map_err(|_| LispError::new("run: argument must be a list of futures"))?;
 
             // Parse optional keywords.
             let mut parallel = false;
@@ -313,7 +307,7 @@ pub fn register_runtime_builtins(
                             }
                             _ => {
                                 return Err(LispError::new(
-                                    "run-all: :max-parallel requires a positive integer",
+                                    "run: :max-parallel requires a positive integer",
                                 ))
                             }
                         }
@@ -321,7 +315,7 @@ pub fn register_runtime_builtins(
                     }
                     other => {
                         return Err(LispError::new(format!(
-                            "run-all: unexpected argument: {}",
+                            "run: unexpected argument: {}",
                             other
                         )))
                     }
@@ -358,7 +352,7 @@ pub fn register_runtime_builtins(
                     }
                     other => {
                         return Err(LispError::new(format!(
-                            "run-all: expected futures, got {}",
+                            "run: expected futures, got {}",
                             other.type_name()
                         )))
                     }
@@ -397,7 +391,7 @@ pub fn register_runtime_builtins(
                 tiers.push(tier);
             }
             if tiers.iter().map(|t| t.len()).sum::<usize>() != n {
-                return Err(LispError::new("run-all: dependency cycle detected"));
+                return Err(LispError::new("run: dependency cycle detected"));
             }
 
             // Execute tiers; track resolved values for inject/transform.
@@ -422,7 +416,7 @@ pub fn register_runtime_builtins(
                                         .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
                                         .collect();
                                     let env_list = eval_apply(inject_fn, &dep_vals)?;
-                                    apply_inject_env(&mut spec, env_list, "run-all")?;
+                                    apply_inject_env(&mut spec, env_list, "run")?;
                                 }
                                 do_container_start(spec, &project, &compose_dir, &registry)?
                             }
@@ -503,7 +497,7 @@ pub fn register_runtime_builtins(
                                         .map(|id| resolved.get(id).cloned().unwrap_or(Value::Nil))
                                         .collect();
                                     let env_list = eval_apply(inject_fn, &dep_vals)?;
-                                    apply_inject_env(&mut spec, env_list, "run-all")?;
+                                    apply_inject_env(&mut spec, env_list, "run")?;
                                 }
                                 container_jobs.push((idx, spec));
                             }
@@ -591,7 +585,7 @@ pub fn register_runtime_builtins(
                                 }
                                 Ok(Err(e)) => return Err(e),
                                 Err(_) => {
-                                    return Err(LispError::new("run-all: a worker thread panicked"))
+                                    return Err(LispError::new("run: a worker thread panicked"))
                                 }
                             }
                         }
@@ -624,7 +618,7 @@ pub fn register_runtime_builtins(
     //
     // Unlike run-all, the full graph need not be declared upfront: the graph
     // emerges as lambdas execute.  Trade-off: no upfront cycle detection and
-    // no tier-based parallel dispatch.  Use run-all when the full graph is
+    // no tier-based parallel dispatch.  Use run via run when the full graph is
     // known; use resolve for linear pipelines or when the next step depends
     // on the runtime value of the previous one.
     {
@@ -670,25 +664,26 @@ pub fn register_runtime_builtins(
                 ));
             }
             use crate::lisp::value::FutureKind;
-            let svc =
-                match &args[0] {
-                    Value::Future {
-                        kind: FutureKind::Container { spec, .. },
-                        ..
-                    } => *spec.clone(),
-                    Value::Future {
-                        kind: FutureKind::Transform { .. } | FutureKind::Join { .. },
-                        ..
-                    } => return Err(LispError::new(
-                        "await: Transform and Join futures must be executed via run-all or resolve",
-                    )),
-                    other => {
-                        return Err(LispError::new(format!(
-                            "await: expected future, got {}",
-                            other.type_name()
-                        )))
-                    }
-                };
+            let svc = match &args[0] {
+                Value::Future {
+                    kind: FutureKind::Container { spec, .. },
+                    ..
+                } => *spec.clone(),
+                Value::Future {
+                    kind: FutureKind::Transform { .. } | FutureKind::Join { .. },
+                    ..
+                } => {
+                    return Err(LispError::new(
+                        "await: Transform and Join futures must be executed via run or resolve",
+                    ))
+                }
+                other => {
+                    return Err(LispError::new(format!(
+                        "await: expected future, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
 
             let mut port: Option<u16> = None;
             let mut timeout_secs = 60.0f64;
@@ -950,7 +945,7 @@ fn resolve_dynamic(
                 return Ok(cached.clone());
             }
 
-            // Resolve :after deps first (needed for :inject).
+            // Resolve :needs deps first (needed for :env).
             let mut after_vals: Vec<Value> = Vec::new();
             for dep_fut in after {
                 let val = resolve_dynamic(dep_fut, resolved, project, compose_dir, registry)?;

@@ -1101,7 +1101,7 @@ mod tests {
             &mut i,
             r#"(define-service svc-test "db" :image "alpine:latest" :network "test-net")"#,
         );
-        let v = eval_ok(&mut i, "(container-start-async svc-test)");
+        let v = eval_ok(&mut i, "(start svc-test)");
         assert_eq!(v.type_name(), "future");
         assert!(format!("{}", v).contains("db"));
     }
@@ -1117,12 +1117,9 @@ mod tests {
             &mut i,
             r#"(define-service svc-app "app" :image "alpine:latest" :network "net")"#,
         );
-        eval_ok(&mut i, "(define db-fut (container-start-async svc-db))");
-        // app-fut declares :after db-fut — should still be a future
-        let v = eval_ok(
-            &mut i,
-            "(container-start-async svc-app :after (list db-fut))",
-        );
+        eval_ok(&mut i, "(define db-fut (start svc-db))");
+        // app-fut declares :needs db-fut — should still be a future
+        let v = eval_ok(&mut i, "(start svc-app :needs (list db-fut))");
         assert_eq!(v.type_name(), "future");
         // after:1 dependency should appear in display
         assert!(format!("{}", v).contains("after:1"), "got: {}", v);
@@ -1131,12 +1128,12 @@ mod tests {
     #[test]
     fn test_run_all_cycle_detection() {
         let mut i = runtime_interp();
-        // Build two futures that depend on each other — run-all must detect the cycle.
-        // We can't directly create circular :after refs via the API (a future must
+        // Build two futures that depend on each other — run must detect the cycle.
+        // We can't directly create circular :needs refs via the API (a future must
         // exist before it can be referenced), so test a self-referential-style cycle
-        // by constructing two futures where A :after B and B :after A indirectly.
-        // Instead, test that run-all rejects a non-list argument.
-        let err = eval_err(&mut i, r#"(run-all "not-a-list")"#);
+        // by constructing two futures where A :needs B and B :needs A indirectly.
+        // Instead, test that run rejects a non-list argument.
+        let err = eval_err(&mut i, r#"(run "not-a-list")"#);
         assert!(err.contains("list"), "got: {}", err);
     }
 
@@ -1174,9 +1171,9 @@ mod tests {
             &mut i,
             r#"(define-service svc1 "s1" :image "alpine:latest" :network "net")
                (define-service svc2 "s2" :image "alpine:latest" :network "net")
-               (define f1 (container-start-async svc1))
-               (define f2 (container-start-async svc2))
-               (define j  (then-all (list f1 f2) (lambda (v1 v2) (list v1 v2))))"#,
+               (define f1 (start svc1))
+               (define f2 (start svc2))
+               (define j  (derive-all (list f1 f2) (lambda (v1 v2) (list v1 v2))))"#,
         );
         let v = eval_ok(&mut i, "j");
         assert_eq!(v.type_name(), "future");
@@ -1196,7 +1193,7 @@ mod tests {
     #[test]
     fn test_then_all_rejects_non_future_in_list() {
         let mut i = runtime_interp();
-        let err = eval_err(&mut i, r#"(then-all (list 1 2) (lambda (a b) a))"#);
+        let err = eval_err(&mut i, r#"(derive-all (list 1 2) (lambda (a b) a))"#);
         assert!(err.contains("expected futures"), "got: {}", err);
     }
 
@@ -1206,19 +1203,19 @@ mod tests {
         eval_ok(
             &mut i,
             r#"(define-service svc "s" :image "alpine:latest" :network "net")
-               (define f (container-start-async svc))"#,
+               (define f (start svc))"#,
         );
-        let err = eval_err(&mut i, r#"(then-all (list f) "not-a-lambda")"#);
+        let err = eval_err(&mut i, r#"(derive-all (list f) "not-a-lambda")"#);
         assert!(err.contains("expected lambda"), "got: {}", err);
     }
 
-    // ── run-all parallel keyword parsing ─────────────────────────────────
+    // ── run parallel keyword parsing ─────────────────────────────────
 
     #[test]
     fn test_run_all_accepts_parallel_keyword() {
         // :parallel on an empty list is valid — returns empty alist (Nil).
         let mut i = runtime_interp();
-        let v = eval_ok(&mut i, "(run-all (list) :parallel)");
+        let v = eval_ok(&mut i, "(run (list) :parallel)");
         assert_eq!(
             v,
             Value::Nil,
@@ -1230,7 +1227,7 @@ mod tests {
     fn test_run_all_accepts_max_parallel_keyword() {
         // :max-parallel implies :parallel; empty list is fine.
         let mut i = runtime_interp();
-        let v = eval_ok(&mut i, "(run-all (list) :max-parallel 4)");
+        let v = eval_ok(&mut i, "(run (list) :max-parallel 4)");
         assert_eq!(v, Value::Nil);
     }
 
@@ -1238,187 +1235,47 @@ mod tests {
     fn test_run_all_max_parallel_without_explicit_parallel_flag() {
         // :max-parallel alone (no explicit :parallel) should also work.
         let mut i = runtime_interp();
-        let v = eval_ok(&mut i, "(run-all (list) :max-parallel 2)");
+        let v = eval_ok(&mut i, "(run (list) :max-parallel 2)");
         assert_eq!(v, Value::Nil);
     }
 
     #[test]
     fn test_run_all_rejects_zero_max_parallel() {
         let mut i = runtime_interp();
-        let err = eval_err(&mut i, "(run-all (list) :max-parallel 0)");
+        let err = eval_err(&mut i, "(run (list) :max-parallel 0)");
         assert!(err.contains("positive"), "got: {}", err);
     }
 
     #[test]
     fn test_run_all_rejects_unknown_keyword() {
         let mut i = runtime_interp();
-        let err = eval_err(&mut i, "(run-all (list) :unknown)");
+        let err = eval_err(&mut i, "(run (list) :unknown)");
         assert!(err.contains("unexpected"), "got: {}", err);
     }
 
     #[test]
     fn test_run_all_parallel_executes_transform_futures() {
         // Transform futures (lambda-only, no container spawn) work in parallel mode.
-        // The upstream Container future is NOT in the run-all list, so its resolved
+        // The upstream Container future is NOT in the run list, so its resolved
         // value defaults to Nil; the transform lambda still executes on the main
         // thread and returns the expected derived value.
         let mut i = runtime_interp();
         eval_ok(
             &mut i,
             r#"(define-service svc "db" :image "alpine:latest" :network "net")
-               (define db-fut  (container-start-async svc))
-               (define url-fut (then db-fut (lambda (x) "postgres://localhost/db")))"#,
+               (define db-fut  (start svc))
+               (define url-fut (derive db-fut (lambda (x) "postgres://localhost/db")))"#,
         );
         // Run only url-fut in parallel mode; db-fut not in list → upstream = Nil.
-        let v = eval_ok(&mut i, "(run-all (list url-fut) :parallel)");
+        let v = eval_ok(&mut i, "(run (list url-fut) :parallel)");
         let items = v.to_vec().unwrap();
         assert_eq!(items.len(), 1, "expected one result pair");
         match &items[0] {
             Value::Pair(p) => {
-                assert_eq!(p.0, Value::Str("db-then".into()));
+                assert_eq!(p.0, Value::Str("db-derive".into()));
                 assert_eq!(p.1, Value::Str("postgres://localhost/db".into()));
             }
             other => panic!("expected pair, got: {}", other),
         }
-    }
-
-    #[test]
-    fn test_define_transform_macro() {
-        // (define-transform db-url db body) binds db-url-fut in the environment.
-        // Stub then to return its lambda so we can inspect it without a real future.
-        let mut i = Interpreter::new();
-        eval_ok(&mut i, "(defmacro then (fut lam) lam)");
-        eval_ok(&mut i, "(define db-fut 'ignored)");
-        eval_ok(
-            &mut i,
-            "(define-transform db-url db (string-append \"url:\" (symbol->string db)))",
-        );
-        // db-url-fut should be a lambda; apply it to verify the param binding.
-        let v = eval_ok(&mut i, "(db-url-fut 'myhost)");
-        assert_eq!(v, Value::Str("url:myhost".into()));
-    }
-
-    #[test]
-    fn test_define_future_with_after_inject() {
-        // (define-future migrate svc :after (db-url) :inject body)
-        // should bind migrate-fut and rewrite :after / :inject correctly.
-        // Stub container-start-async as a function (not macro) that records its args.
-        let mut i = Interpreter::new();
-        eval_ok(&mut i, "(define svc-migrate '())");
-        eval_ok(&mut i, "(define db-url-fut \"pg://host/db\")");
-        // Stub: capture the :after list and :inject lambda into globals for inspection.
-        eval_ok(
-            &mut i,
-            r#"
-            (define captured-after #f)
-            (define captured-inject #f)
-            (define (container-start-async svc . rest)
-              (set! captured-after  (cadr rest))
-              (set! captured-inject (cadddr rest))
-              'stub-handle)
-        "#,
-        );
-        eval_ok(
-            &mut i,
-            r#"
-            (define-future migrate svc-migrate
-              :after  (db-url)
-              :inject (string-append "url:" db-url))
-        "#,
-        );
-        // migrate-fut should be bound
-        assert_eq!(
-            eval_ok(&mut i, "migrate-fut"),
-            Value::Symbol("stub-handle".into())
-        );
-        // :after list should contain db-url-fut's value
-        assert_eq!(
-            eval_ok(&mut i, "(car captured-after)"),
-            Value::Str("pg://host/db".into())
-        );
-        // :inject lambda should receive db-url and produce the right string
-        assert_eq!(
-            eval_ok(&mut i, "(captured-inject \"my-url\")"),
-            Value::Str("url:my-url".into()),
-        );
-    }
-
-    #[test]
-    fn test_define_run_macro() {
-        // (define-run results (db) ()) with empty futures binds results=nil.
-        // Then verify define-results extraction works via a manual alist.
-        let mut i = runtime_interp();
-        // Empty futures — run-all returns nil.
-        eval_ok(&mut i, "(define-run results () ())");
-        assert_eq!(eval_ok(&mut i, "results"), Value::Nil);
-        // Verify -fut suffix: (define-run r () (db)) should call (list db-fut).
-        // Stub run-all to capture its argument.
-        eval_ok(&mut i, "(define captured #f)");
-        eval_ok(&mut i, "(define db-fut \"db-handle\")");
-        eval_ok(
-            &mut i,
-            r#"
-            (defmacro run-all (futs . rest)
-              (list 'begin (list 'set! 'captured futs) (quote (quote stub-alist))))
-        "#,
-        );
-        eval_ok(&mut i, "(define-run r () (db))");
-        assert_eq!(
-            eval_ok(&mut i, "(car captured)"),
-            Value::Str("db-handle".into())
-        );
-    }
-
-    #[test]
-    fn test_define_results_macro() {
-        // (define-results alist db cache) binds db and cache from the alist.
-        let mut i = Interpreter::new();
-        eval_ok(
-            &mut i,
-            r#"
-            (define results
-              (list (cons "db"    "db-handle")
-                    (cons "cache" "cache-handle")))
-        "#,
-        );
-        eval_ok(&mut i, "(define-results results db cache)");
-        assert_eq!(eval_ok(&mut i, "db"), Value::Str("db-handle".into()));
-        assert_eq!(eval_ok(&mut i, "cache"), Value::Str("cache-handle".into()));
-    }
-
-    #[test]
-    fn test_define_future_macro() {
-        // (define-future db svc) should bind db-fut in the environment.
-        let mut i = Interpreter::new();
-        eval_ok(&mut i, "(define svc '())");
-        eval_ok(
-            &mut i,
-            r#"
-            (defmacro container-start-async (svc . rest) (list 'quote 'fake-future))
-        "#,
-        );
-        eval_ok(&mut i, "(define-future db svc)");
-        let v = eval_ok(&mut i, "db-fut");
-        assert_eq!(v, Value::Symbol("fake-future".into()));
-    }
-
-    #[test]
-    fn test_define_futures_macro() {
-        // (define-futures (db svc-db) (cache svc-cache)) binds db-fut and cache-fut.
-        let mut i = Interpreter::new();
-        eval_ok(&mut i, "(define svc-db '())");
-        eval_ok(&mut i, "(define svc-cache '())");
-        eval_ok(
-            &mut i,
-            r#"
-            (defmacro container-start-async (svc . rest) (list 'quote svc))
-        "#,
-        );
-        eval_ok(&mut i, "(define-futures (db svc-db) (cache svc-cache))");
-        assert_eq!(eval_ok(&mut i, "db-fut"), Value::Symbol("svc-db".into()));
-        assert_eq!(
-            eval_ok(&mut i, "cache-fut"),
-            Value::Symbol("svc-cache".into())
-        );
     }
 }

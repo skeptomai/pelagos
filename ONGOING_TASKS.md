@@ -1,6 +1,63 @@
 # Ongoing Tasks
 
-## Open Design Question: stdlib Orchestration Macros (Feb 26, 2026)
+## Current Task: Domain-Oriented Orchestration API (Feb 26, 2026)
+
+### Goal
+
+Replace implementation-vocabulary names (`container-start-async`, `then`,
+`then-all`, `run-all`, `:after`, `:inject`) with domain-vocabulary names
+(`start`, `derive`, `derive-all`, `run`, `:needs`, `:env`). Remove the
+session macros (`define-future`, `define-futures`, `define-transform`,
+`define-results`, `define-run`) — the new API is clean enough to not need
+them.
+
+### Target API (what `compose.reml` looks like after)
+
+```lisp
+(define db       (start svc-db))
+(define cache    (start svc-cache))
+
+(define db-url    (derive db    (format "postgres://...@~a/appdb" (container-ip db))))
+(define cache-url (derive cache (format "redis://~a:6379" (container-ip cache))))
+
+(define migrate (start svc-migrate
+  :needs (list db-url)
+  :env   (lambda (url) `(("DATABASE_URL" . ,url)))))
+
+(define app (start svc-app
+  :needs (list db-url cache-url)
+  :env   (lambda (db-url cache-url) `(("DATABASE_URL" . ,db-url)
+                                      ("CACHE_URL"    . ,cache-url)))))
+
+(define results (run (list db cache db-url cache-url migrate app) :parallel))
+```
+
+### Design decisions
+
+- `start`   = `container-start-async` (renamed); `:after` → `:needs`, `:inject` → `:env`
+- `derive`  = `then` (renamed); same signature `(derive node lambda)`
+- `derive-all` = `then-all` (renamed)
+- `run`     = `run-all` (renamed); takes explicit list — `(run (list ...) opts...)`
+  keeping composability: the list is a first-class value, buildable at runtime
+- Remove session macros from stdlib; `c[ad]+r`, `result-ref`, `assoc`,
+  Result type, `with-cleanup` all stay
+- Keep old names as aliases during transition; hard-remove after tests pass
+
+### Files to change
+
+| File | Change |
+|------|--------|
+| `src/lisp/runtime.rs` | Hard-rename builtins; update keyword parsing |
+| `src/lisp/stdlib.lisp` | Remove `define-future/s`, `define-transform`, `define-results`, `define-run` |
+| `src/lisp/mod.rs` | Update all tests using old names; remove tests for removed macros |
+| `examples/compose/imperative/compose.reml` | Rewrite to new API |
+| `examples/compose/imperative/compose-chain.reml` | Update to `derive`/`launch` |
+| `docs/REML_EXECUTOR_MODEL.md` | Update API table and examples |
+| `docs/USER_GUIDE.md` | Update orchestration section |
+
+---
+
+## Previous: stdlib Orchestration Macros (Feb 26, 2026) — SUPERSEDED
 
 ### Context
 

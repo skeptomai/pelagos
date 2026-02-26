@@ -1,24 +1,13 @@
 ;;; Imperative compose example — full graph model
 ;;;
-;;; The entire dependency graph is declared before any execution begins.
-;;; run-all executes futures in dependency (topological) order.
-;;; Pass :parallel to run independent futures within each tier concurrently.
+;;; The dependency graph is declared as first-class values before any
+;;; execution begins.  `run` topologically sorts and executes the graph;
+;;; pass :parallel to run independent nodes concurrently within each tier.
 ;;;
 ;;; Dependency graph:
 ;;;
-;;;   db-fut ──→ db-url-fut ──→ app-fut
-;;;   cache-fut ─────────────→ app-fut
-;;;
-;;; Data flows through (then ...) transforms rather than imperative steps.
-;;; :inject wires derived values into the service env at execution time.
-;;;
-;;; Naming convention (enforced by macros):
-;;;   (define-future name svc)                        binds name-fut
-;;;   (define-future name svc :after (p…) :inject body)
-;;;                                                   p… name both upstream-fut deps
-;;;                                                   and the inject body's parameters
-;;;   (define-transform name upstream body)           reads upstream-fut, binds name-fut
-;;;   (define-run alist (binds…) (futures…) opts…)   run + extract in one form
+;;;   db ──→ db-url ──→ app
+;;;   cache ──────────→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose.reml -p imperative-demo
@@ -50,48 +39,51 @@
 
 ;; ── Declare the graph — nothing executes yet ─────────────────────────────
 
-;; Tier 1: independent services
-(define-futures
-  (db    svc-db)
-  (cache svc-cache))
+;; Independent services: no dependencies, eligible to start in parallel
+(define db    (start svc-db))
+(define cache (start svc-cache))
 
-;; Derive connection strings from resolved handles
-(define-transform db-url db
-  (format "postgres://app:secret@~a/appdb" (container-ip db)))
+;; Derive connection strings once each container is up
+(define db-url    (derive db    (lambda (h) (format "postgres://app:secret@~a/appdb" (container-ip h)))))
+(define cache-url (derive cache (lambda (h) (format "redis://~a:6379" (container-ip h)))))
 
-(define-transform cache-url cache
-  (format "redis://~a:6379" (container-ip cache)))
+;; Migration: needs db-url injected into its environment
+(define migrate (start svc-migrate
+  :needs (list db-url)
+  :env   (lambda (url) `(("DATABASE_URL" . ,url)))))
 
-;; Migrations: depend on db-url; :inject wires it into the container env
-(define-future migrate svc-migrate
-  :after  (db-url)
-  :inject `(("DATABASE_URL" . ,db-url)))
+;; Application: needs both URLs
+(define app (start svc-app
+  :needs (list db-url cache-url)
+  :env   (lambda (db-url cache-url)
+           `(("DATABASE_URL" . ,db-url)
+             ("CACHE_URL"    . ,cache-url)))))
 
-;; Application: depends on both URLs; :inject wires both into the container env
-(define-future app svc-app
-  :after  (db-url cache-url)
-  :inject `(("DATABASE_URL" . ,db-url)
-            ("CACHE_URL"    . ,cache-url)))
-
-;; ── Execute: tier-parallel run ───────────────────────────────────────────
+;; ── Execute ───────────────────────────────────────────────────────────────
 ;;
 ;; Execution tiers resolved from the graph:
-;;   Tier 1: db ∥ cache  (no dependencies — start concurrently)
-;;   Tier 2: db-url ∥ cache-url  (depend only on tier-1 results)
-;;   Tier 3: migrate  (depends on db-url)
-;;   Tier 4: app  (depends on db-url + cache-url)
+;;   Tier 1: db ∥ cache       (no dependencies)
+;;   Tier 2: db-url ∥ cache-url
+;;   Tier 3: migrate
+;;   Tier 4: app
 ;;
-;; :parallel runs all futures within each tier concurrently.
-;; All dependency ordering is still respected — tiers execute sequentially.
+;; :parallel runs all nodes within each tier concurrently.
+;; The list is a first-class value — it can be built conditionally or
+;; passed from a function before being handed to run.
 
-(define-run results (db cache app)
-  (db cache db-url cache-url migrate app) :parallel)
+(define nodes   (list db cache db-url cache-url migrate app))
+(define results (run nodes :parallel))
 
-(logf "db-url:    ~a" (result-ref results "db-then"))
-(logf "cache-url: ~a" (result-ref results "cache-then"))
+;; ── Post-execution ────────────────────────────────────────────────────────
+
+(define db-handle  (result-ref results "db"))
+(define app-handle (result-ref results "app"))
+
+(logf "db-url:    ~a" (result-ref results "db-derive"))
+(logf "cache-url: ~a" (result-ref results "cache-derive"))
 
 ;; Wait for app to finish, then stop dependencies
-(container-wait app)
-(container-stop cache)
-(container-stop db)
+(container-wait app-handle)
+(container-stop (result-ref results "cache"))
+(container-stop db-handle)
 (log "Done")
