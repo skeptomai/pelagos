@@ -29,14 +29,14 @@
 (define-service svc-migrate "migrate"
   :image   "alpine:latest"
   :network "app-net"
-  :command '("/bin/sh" "-c"
-             "echo \"migrating ${DATABASE_URL}\"; exit 0"))
+  :command "/bin/sh" "-c"
+           "echo \"migrating ${DATABASE_URL}\"; exit 0")
 
 (define-service svc-app "app"
   :image   "alpine:latest"
   :network "app-net"
-  :command '("/bin/sh" "-c"
-             "echo \"db=${DATABASE_URL} cache=${CACHE_URL}\"; sleep 5; echo done"))
+  :command "/bin/sh" "-c"
+           "echo \"db=${DATABASE_URL} cache=${CACHE_URL}\"; sleep 5; echo done")
 
 ;; ── Declare the graph — nothing executes yet ─────────────────────────────
 
