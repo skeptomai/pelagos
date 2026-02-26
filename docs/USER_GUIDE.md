@@ -807,6 +807,30 @@ a second join raises `"already joined"`.
 | Sequential imperative; immediate results | `container-start` |
 | Parallel imperative without declarative graph | `container-start-bg` + `container-join` |
 
+**`define-run`** combines `run` and `define-results` into one form, removing
+the redundancy of listing the same services twice.  The result key for each
+binding is derived automatically from the future variable name:
+
+```lisp
+(define-run :parallel
+  (db-handle    db)
+  (cache-handle cache)
+  (app-handle   app))
+```
+
+This replaces the two-step pattern:
+```lisp
+(define results (run (list db cache app) :parallel))
+(define-results results
+  (db-handle    "db")
+  (cache-handle "cache")
+  (app-handle   "app"))
+```
+
+Use `define-run` when the future variable names match the service names
+(the standard `define-nodes` convention).  Use `run` + `define-results`
+when the names differ or you only need a subset of results.
+
 See `docs/REML_EXECUTOR_MODEL.md` for the full design reference: transitive
 discovery, hybrid static+conditional patterns, threading model, eager execution,
 and error message behaviour.

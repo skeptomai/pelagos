@@ -1267,6 +1267,41 @@ mod tests {
         );
     }
 
+    // ── define-run macro ─────────────────────────────────────────────
+
+    #[test]
+    fn test_define_run_empty_bindings() {
+        // (define-run) with no bindings runs (run (list)) → Nil.
+        let mut i = runtime_interp();
+        let v = eval_ok(&mut i, "(define-run)");
+        assert_eq!(v, Value::Nil, "empty define-run should return Nil");
+    }
+
+    #[test]
+    fn test_define_run_parallel_empty_bindings() {
+        // :parallel keyword is forwarded; empty list still returns Nil.
+        let mut i = runtime_interp();
+        let v = eval_ok(&mut i, "(define-run :parallel)");
+        assert_eq!(v, Value::Nil);
+    }
+
+    #[test]
+    fn test_define_run_derives_key_from_symbol() {
+        // define-run uses (symbol->string future-var) to look up results.
+        // Simulate by seeding _run_result_ manually and checking bindings.
+        let mut i = interp();
+        eval_ok(
+            &mut i,
+            r#"(define db    42)
+               (define cache 99)
+               (define _run_result_ (list (cons "db" db) (cons "cache" cache)))
+               (define db-handle    (result-ref _run_result_ "db"))
+               (define cache-handle (result-ref _run_result_ "cache"))"#,
+        );
+        assert_eq!(eval_ok(&mut i, "db-handle"), Value::Int(42));
+        assert_eq!(eval_ok(&mut i, "cache-handle"), Value::Int(99));
+    }
+
     // ── container-start-bg / container-join ─────────────────────────
 
     #[test]

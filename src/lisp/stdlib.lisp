@@ -198,6 +198,54 @@
      ,@(map (lambda (b) `(define ,(car b) (result-ref ,results-var ,(cadr b))))
             bindings)))
 
+;; (define-run [keywords...] (binding-name future-var) ...)
+;;
+;; Execute a dependency graph and bind the results in one form.  Combines
+;; `run` + `define-results` by deriving each result key from the future
+;; variable name via `symbol->string`.
+;;
+;; Keywords (:parallel, :max-parallel N) are any non-list arguments before
+;; the first (binding-name future-var) pair.
+;;
+;;   (define-run :parallel
+;;     (db-handle    db)
+;;     (cache-handle cache)
+;;     (app-handle   app))
+;;
+;; Expands to:
+;;   (begin
+;;     (define _run_result_ (run (list db cache app) :parallel))
+;;     (define db-handle    (result-ref _run_result_ "db"))
+;;     (define cache-handle (result-ref _run_result_ "cache"))
+;;     (define app-handle   (result-ref _run_result_ "app")))
+;;
+;; Convention: the future variable name must match the service name
+;; (e.g. future `db` from `(define-service svc-db "db" ...)` has
+;; internal name `"db"`).  This is always true when using `define-nodes`.
+;; For unusual naming use `define-results` directly.
+(defmacro define-run opts-and-bindings
+
+  ;; Split into two lists: keyword atoms come first (symbols, numbers),
+  ;; then (binding future-var) pairs.  Stops at the first pair encountered.
+  (define (split-args lst)
+    (let loop ((rest lst) (kws '()))
+      (cond
+        ((null? rest)        (cons (reverse kws) '()))
+        ((pair? (car rest))  (cons (reverse kws) rest))
+        (else                (loop (cdr rest) (cons (car rest) kws))))))
+
+  (let* ((parts    (split-args opts-and-bindings))
+         (kws      (car parts))
+         (bindings (cdr parts))
+         (vars     (map cadr bindings))
+         (names    (map car  bindings))
+         (keys     (map (lambda (b) (symbol->string (cadr b))) bindings)))
+    `(begin
+       (define _run_result_ (run (list ,@vars) ,@kws))
+       ,@(map (lambda (name key)
+                `(define ,name (result-ref _run_result_ ,key)))
+              names keys))))
+
 ;; (define-then name upstream (param) body...)
 ;;
 ;; Combined define + then: define `name` as the node whose value is computed

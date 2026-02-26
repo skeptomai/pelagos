@@ -64,21 +64,18 @@
            `(("DATABASE_URL" . ,db-url)
              ("CACHE_URL"    . ,cache-url)))))
 
-;; ── Execute ───────────────────────────────────────────────────────────────
+;; ── Execute and bind ──────────────────────────────────────────────────────
 ;;
-;; List the containers whose handles you need after execution.  run walks
-;; :needs transitively so db-url and cache-url are discovered and executed
-;; automatically — no need to enumerate intermediate computed values.
-;; :parallel runs independent nodes within each tier concurrently.
+;; define-run runs the graph and binds each result in one form.  The key for
+;; each result is derived from the future variable name (db → "db"), which
+;; matches the service name declared above.  :parallel runs independent nodes
+;; within each tier concurrently; transitive dependencies (db-url, cache-url)
+;; are discovered and executed automatically.
 
-(define results (run (list db cache app) :parallel))
-
-;; ── Post-execution ────────────────────────────────────────────────────────
-
-(define-results results
-  (db-handle    "db")
-  (cache-handle "cache")
-  (app-handle   "app"))
+(define-run :parallel
+  (db-handle    db)
+  (cache-handle cache)
+  (app-handle   app))
 
 ;; Reconstruct URLs from the container IPs — no need to thread intermediate
 ;; computed values through the results alist.

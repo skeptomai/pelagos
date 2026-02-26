@@ -102,9 +102,38 @@ Expands to:
   (then db (lambda (h) (format ...)) :name "db-url"))
 ```
 
+### `(define-run [keywords...] (binding-name future-var) ...)`
+
+Executes the graph **and** binds the results in one form.  Derives each
+result key from `(symbol->string future-var)`, so no string literals are
+needed.  Keywords (`:parallel`, `:max-parallel N`) are any non-list
+arguments before the first binding pair.
+
+```lisp
+(define-run :parallel
+  (db-handle    db)
+  (cache-handle cache)
+  (app-handle   app))
+```
+
+Expands to:
+```lisp
+(begin
+  (define _run_result_ (run (list db cache app) :parallel))
+  (define db-handle    (result-ref _run_result_ "db"))
+  (define cache-handle (result-ref _run_result_ "cache"))
+  (define app-handle   (result-ref _run_result_ "app")))
+```
+
+**Convention:** the future variable name must match the service name
+(`db` → service `"db"`).  This is always true when using `define-nodes`.
+If the names differ, use `run` + `define-results` directly.
+
 ### `(define-results results-var (var "key") ...)`
 
-Destructures the alist returned by `run` into named bindings.
+Destructures the alist returned by `run` into named bindings.  Use this
+when you need custom binding names or a subset of results; otherwise prefer
+`define-run`.
 
 ```lisp
 (define-results results
