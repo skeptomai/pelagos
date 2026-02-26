@@ -191,7 +191,12 @@ pub fn register_runtime_builtins(
                     .recv()
                     .map_err(|_| LispError::new("container-join: background thread panicked"))?
                     .map_err(LispError::new)?;
-                Ok(Value::ContainerHandle { name, pid, ip })
+                Ok(Value::ContainerHandle {
+                    name,
+                    pid,
+                    ip,
+                    deps: vec![],
+                })
             }
             other => Err(LispError::new(format!(
                 "container-join: expected pending-container, got {}",
@@ -449,7 +454,6 @@ pub fn register_runtime_builtins(
 
             struct Entry {
                 id: u64,
-                name: String,
                 kind: FutureKind,
                 /// Dependency IDs extracted from the `after: Vec<Value>` field.
                 after_ids: Vec<u64>,
@@ -464,12 +468,6 @@ pub fn register_runtime_builtins(
                     )));
                 }
             }
-
-            // Track which futures were explicitly listed — only these appear in
-            // the output alist.  Transitive dependencies are executed as needed
-            // but are not surfaced to the caller.
-            let terminal_ids: std::collections::HashSet<u64> =
-                future_list.iter().filter_map(Value::future_id).collect();
 
             // Walk :needs transitively so the caller only needs to list terminal
             // futures; the full dependency graph is discovered automatically.
@@ -506,10 +504,10 @@ pub fn register_runtime_builtins(
                     let after_ids = after.iter().filter_map(Value::future_id).collect();
                     entries.push(Entry {
                         id,
-                        name,
                         kind,
                         after_ids,
                     });
+                    let _ = name; // name lives on the Value::Future; not needed in Entry
                 }
             }
 
@@ -548,10 +546,18 @@ pub fn register_runtime_builtins(
                 return Err(LispError::new("run: dependency cycle detected"));
             }
 
+            // Execution position of each future (tier * n + slot) — used to
+            // compute reverse topological order for dep teardown lists.
+            let exec_pos: std::collections::HashMap<u64, usize> = tiers
+                .iter()
+                .flatten()
+                .enumerate()
+                .map(|(pos, &idx)| (entries[idx].id, pos))
+                .collect();
+
             // Execute tiers; track resolved values for inject/transform.
             let mut resolved: std::collections::HashMap<u64, Value> =
                 std::collections::HashMap::new();
-            let mut pairs: Vec<Value> = Vec::with_capacity(n);
 
             if !parallel {
                 // ── Serial path ──────────────────────────────────────────────
@@ -616,10 +622,7 @@ pub fn register_runtime_builtins(
                                 }
                             }
                         };
-                        resolved.insert(e.id, result.clone());
-                        if terminal_ids.contains(&e.id) {
-                            pairs.push(Value::Pair(Rc::new((Value::Str(e.name.clone()), result))));
-                        }
+                        resolved.insert(e.id, result);
                     }
                 }
             } else {
@@ -736,6 +739,7 @@ pub fn register_runtime_builtins(
                                         name: r.name,
                                         pid: r.pid,
                                         ip: r.ip,
+                                        deps: vec![],
                                     };
                                     tier_results.push((idx, val));
                                 }
@@ -750,13 +754,86 @@ pub fn register_runtime_builtins(
                     // Merge tier results in declaration order (deterministic alist).
                     tier_results.sort_by_key(|(idx, _)| *idx);
                     for (idx, val) in tier_results {
-                        resolved.insert(entries[idx].id, val.clone());
-                        if terminal_ids.contains(&entries[idx].id) {
-                            pairs.push(Value::Pair(Rc::new((
-                                Value::Str(entries[idx].name.clone()),
-                                val,
-                            ))));
+                        resolved.insert(entries[idx].id, val);
+                    }
+                }
+            }
+
+            // ── Post-execution: build output alist with deps ──────────────
+            //
+            // For each terminal Container future, collect its transitive
+            // container dependencies in reverse execution order and attach
+            // them as `deps` on the handle.  Transform/Join futures resolve
+            // to plain values and carry no deps.
+            //
+            // "Transitive container deps" means: walk :needs recursively,
+            // keep only nodes whose kind is Container, sort in reverse
+            // execution order (latest-started first → stopped first).
+
+            fn container_deps(
+                id: u64,
+                entries: &[Entry],
+                id_to_idx: &std::collections::HashMap<u64, usize>,
+                exec_pos: &std::collections::HashMap<u64, usize>,
+                resolved: &std::collections::HashMap<u64, Value>,
+            ) -> Vec<Value> {
+                let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                let mut stack = vec![id];
+                let mut dep_ids: Vec<u64> = Vec::new();
+                while let Some(cur) = stack.pop() {
+                    if !visited.insert(cur) {
+                        continue;
+                    }
+                    if let Some(&idx) = id_to_idx.get(&cur) {
+                        for &dep_id in &entries[idx].after_ids {
+                            stack.push(dep_id);
                         }
+                        // Collect Container futures only (not self, not Transform/Join).
+                        if cur != id {
+                            if let Some(e) = id_to_idx
+                                .get(&cur)
+                                .map(|&i| &entries[i])
+                                .filter(|e| matches!(e.kind, FutureKind::Container { .. }))
+                            {
+                                if resolved.contains_key(&e.id) {
+                                    dep_ids.push(e.id);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Reverse execution order: latest started is stopped first.
+                dep_ids
+                    .sort_by_key(|did| std::cmp::Reverse(exec_pos.get(did).copied().unwrap_or(0)));
+                dep_ids
+                    .into_iter()
+                    .filter_map(|did| resolved.get(&did).cloned())
+                    .collect()
+            }
+
+            let mut pairs: Vec<Value> = Vec::new();
+            for v in &future_list {
+                if let Value::Future { id, name, kind, .. } = v {
+                    if let Some(resolved_val) = resolved.get(id) {
+                        let final_val = if matches!(kind, FutureKind::Container { .. }) {
+                            let deps =
+                                container_deps(*id, &entries, &id_to_idx, &exec_pos, &resolved);
+                            // Rebuild the handle with deps populated.
+                            match resolved_val {
+                                Value::ContainerHandle { name, pid, ip, .. } => {
+                                    Value::ContainerHandle {
+                                        name: name.clone(),
+                                        pid: *pid,
+                                        ip: ip.clone(),
+                                        deps,
+                                    }
+                                }
+                                other => other.clone(),
+                            }
+                        } else {
+                            resolved_val.clone()
+                        };
+                        pairs.push(Value::Pair(Rc::new((Value::Str(name.clone()), final_val))));
                     }
                 }
             }
@@ -913,6 +990,7 @@ pub fn register_runtime_builtins(
     }
 
     // ── container-stop ─────────────────────────────────────────────────────
+    // Stops the container and cascades through its deps in reverse topo order.
     {
         let registry = Arc::clone(&registry);
         native(env, "container-stop", move |args| {
@@ -921,34 +999,38 @@ pub fn register_runtime_builtins(
                     "container-stop: expected 1 argument (container-handle)",
                 ));
             }
-            let (name, pid) = extract_handle("container-stop", &args[0])?;
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-            registry.lock().unwrap().retain(|(n, _)| n != &name);
+            stop_cascade(&args[0], &registry)?;
             Ok(Value::Nil)
         });
     }
 
     // ── container-wait ─────────────────────────────────────────────────────
-    // Polls kill(pid, 0) until the process is gone, then returns the exit code
-    // from the container state file (if available) or 0.
-    native(env, "container-wait", |args| {
-        if args.len() != 1 {
-            return Err(LispError::new(
-                "container-wait: expected 1 argument (container-handle)",
-            ));
-        }
-        let (_, pid) = extract_handle("container-wait", &args[0])?;
-        loop {
-            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-                Err(nix::errno::Errno::ESRCH) => break,
-                _ => std::thread::sleep(Duration::from_millis(100)),
+    // Polls kill(pid, 0) until the process is gone, returns exit code (0),
+    // then cascades container-stop through deps in reverse topo order.
+    {
+        let registry = Arc::clone(&registry);
+        native(env, "container-wait", move |args| {
+            if args.len() != 1 {
+                return Err(LispError::new(
+                    "container-wait: expected 1 argument (container-handle)",
+                ));
             }
-        }
-        Ok(Value::Int(0))
-    });
+            let (_, pid) = extract_handle("container-wait", &args[0])?;
+            loop {
+                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+                    Err(nix::errno::Errno::ESRCH) => break,
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            // Cascade stop through deps — topology-aware teardown.
+            if let Value::ContainerHandle { deps, .. } = &args[0] {
+                for dep in deps {
+                    stop_cascade(dep, &registry)?;
+                }
+            }
+            Ok(Value::Int(0))
+        });
+    }
 
     // ── container-run ──────────────────────────────────────────────────────
     {
@@ -1183,6 +1265,7 @@ fn do_container_start(
         name: r.name,
         pid: r.pid,
         ip: r.ip,
+        deps: vec![],
     })
 }
 
@@ -1482,6 +1565,36 @@ fn apply_inject_env(
         }
     }
     Ok(())
+}
+
+/// Stop a container and cascade through its `deps` in order.
+///
+/// Used by both `container-stop` and `container-wait` to implement
+/// topology-aware teardown: stopping a terminal container automatically
+/// stops everything it depended on, in reverse topological order.
+fn stop_cascade(
+    handle: &Value,
+    registry: &Arc<Mutex<Vec<(String, i32)>>>,
+) -> Result<(), LispError> {
+    match handle {
+        Value::ContainerHandle {
+            name, pid, deps, ..
+        } => {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            registry.lock().unwrap().retain(|(n, _)| n != name);
+            for dep in deps {
+                stop_cascade(dep, registry)?;
+            }
+            Ok(())
+        }
+        other => Err(LispError::new(format!(
+            "container-stop: expected container handle, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// Register a native function closure into `env`.

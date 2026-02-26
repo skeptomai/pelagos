@@ -79,14 +79,14 @@
 (logf "db-url:    ~a" db-url)
 (logf "cache-url: ~a" cache-url)
 
-;; Wait for app to finish; stop dependencies on both clean exit and error.
-;; The cleanup lambda receives (ok exit-code) on normal exit or
-;; (err reason) if container-wait raised — allowing differentiated teardown.
+;; Wait for app to finish.  container-wait cascades container-stop through
+;; app's transitive dependencies (cache, db) automatically — the same
+;; dependency graph that governed startup governs shutdown.
+;; The cleanup lambda receives only the result signal: (ok exit-code) or
+;; (err reason).  No manual stop calls needed.
 (with-cleanup (lambda (result)
                 (if (ok? result)
                   (logf "app exited cleanly (code ~a)" (ok-value result))
-                  (logf "app failed: ~a" (err-reason result)))
-                (container-stop cache-handle)
-                (container-stop db-handle))
+                  (logf "app failed: ~a" (err-reason result))))
   (container-wait app-handle))
 (log "Done")

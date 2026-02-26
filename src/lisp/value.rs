@@ -60,6 +60,10 @@ pub enum Value {
         pid: i32,
         /// Primary bridge IP assigned to the container, if any.
         ip: Option<String>,
+        /// Container handles to stop after this one exits, in reverse
+        /// topological order.  Populated by `run` for terminal Container
+        /// futures; empty for handles created by `container-start` / `resolve`.
+        deps: Vec<Value>,
     },
     /// A container being started in the background via `container-start-bg`.
     ///
