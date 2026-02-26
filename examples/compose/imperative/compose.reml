@@ -1,4 +1,4 @@
-;;; Imperative compose example — full graph model
+;;; Graph model compose example
 ;;;
 ;;; The dependency graph is declared as first-class values before any
 ;;; execution begins.  `run` topologically sorts and executes the graph;
@@ -66,21 +66,18 @@
 
 ;; ── Execute and bind ──────────────────────────────────────────────────────
 ;;
-;; define-run runs the graph and binds each result in one form.  The key for
-;; each result is derived from the future variable name (db → "db"), which
-;; matches the service name declared above.  :parallel runs independent nodes
-;; within each tier concurrently; transitive dependencies (db-url, cache-url)
-;; are discovered and executed automatically.
+;; All futures — containers and transforms alike — resolve to their values.
+;; :parallel runs independent nodes within each tier concurrently.
 
 (define-run :parallel
   (db-handle    db)
   (cache-handle cache)
-  (app-handle   app))
+  (app-handle   app)
+  (db-url       db-url)
+  (cache-url    cache-url))
 
-;; Reconstruct URLs from the container IPs — no need to thread intermediate
-;; computed values through the results alist.
-(logf "db-url:    postgres://app:secret@~a/appdb" (container-ip db-handle))
-(logf "cache-url: redis://~a:6379"                (container-ip cache-handle))
+(logf "db-url:    ~a" db-url)
+(logf "cache-url: ~a" cache-url)
 
 ;; Wait for app to finish, then stop dependencies
 (container-wait app-handle)
