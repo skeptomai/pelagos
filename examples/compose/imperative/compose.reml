@@ -79,8 +79,9 @@
 (logf "db-url:    ~a" db-url)
 (logf "cache-url: ~a" cache-url)
 
-;; Wait for app to finish, then stop dependencies
-(container-wait app-handle)
-(container-stop cache-handle)
-(container-stop db-handle)
+;; Wait for app to finish; stop dependencies on both clean exit and error
+(with-cleanup (lambda (_)
+                (container-stop cache-handle)
+                (container-stop db-handle))
+  (container-wait app-handle))
 (log "Done")
