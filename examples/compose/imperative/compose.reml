@@ -69,21 +69,18 @@
 ;; All futures — containers and transforms alike — resolve to their values.
 ;; :parallel runs independent nodes within each tier concurrently.
 
+;; Only bind what you need.  db and cache execute as transitive deps of app
+;; and are stopped automatically by the cascade — no handles required.
+;; To inspect or manually stop them, add e.g. (db-handle db) here.
 (define-run :parallel
-  (db-handle    db)
-  (cache-handle cache)
-  (app-handle   app)
-  (db-url       db-url)
-  (cache-url    cache-url))
+  (app-handle app)
+  (db-url     db-url)
+  (cache-url  cache-url))
 
 (logf "db-url:    ~a" db-url)
 (logf "cache-url: ~a" cache-url)
 
-;; Wait for app to finish.  container-wait cascades container-stop through
-;; app's transitive dependencies (migrate, cache, db) automatically — the
-;; same dependency graph that governed startup governs shutdown.
-;; The cleanup lambda receives only the result signal: (ok exit-code) or
-;; (err reason).  No manual stop calls needed.
+;; cascade stops migrate, cache, db automatically in reverse startup order
 (with-cleanup (lambda (result)
                 (if (ok? result)
                   (logf "app exited cleanly (code ~a)" (ok-value result))
