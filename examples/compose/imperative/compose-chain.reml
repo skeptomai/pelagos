@@ -26,7 +26,7 @@
 ;;;
 ;;; Dependency graph:
 ;;;
-;;;   db ──→ (then: compute db-url) ──→ migrate ──→ (then: start app) ──→ app
+;;;   db ──→ db-url ──→ migrate ──→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose-chain.reml -p chain-demo
@@ -52,36 +52,38 @@
   :command "/bin/sh" "-c"
            "echo \"db=${DATABASE_URL}\"; sleep 30; echo done")
 
+;; ── Start db eagerly — needed for cleanup and url computation ─────────────
+;;
+;; The chain model doesn't expose intermediate handles to the top-level
+;; scope, so db must be started eagerly if we need its handle in with-cleanup.
+
+(define db (container-start svc-db))
+(define db-url (format "postgres://app:secret@~a/appdb" (container-ip db)))
+(logf "db at ~a" (container-ip db))
+
 ;; ── Declare the chain — nothing executes yet ─────────────────────────────
 ;;
-;; When (resolve ...) is called it walks upstream recursively:
+;; When (resolve ...) is called it walks the chain:
 ;;
-;;   1. resolve db              → ContainerHandle
-;;   2. then: compute db-url    → "postgres://app:secret@<ip>/appdb"
-;;   3. resolve migrate         → ContainerHandle  (:env wires DATABASE_URL)
-;;   4. lambda returns app node → another node! resolve flattens it
-;;   5. resolve app             → ContainerHandle  (:env wires DATABASE_URL)
+;;   1. resolve (start svc-migrate :env ...)  → ContainerHandle
+;;   2. lambda: wait for migrate, then return (start svc-app :env ...)
+;;   3. monadic flatten: resolve (start svc-app ...)  → ContainerHandle
 ;;
-;; Step 4 is the monadic flatten: the lambda returns a *new node* rather
+;; Step 3 is the monadic flatten: the lambda returns a *new node* rather
 ;; than a plain value.  resolve detects this and executes it automatically,
 ;; so the whole pipeline is a single (resolve pipeline) call.
-
-(define db (start svc-db))
+;;
+;; The :env lambdas take zero args — db-url is already in scope from above.
 
 (define pipeline
-  (then db
-    (lambda (db-handle)
-      (let ((db-url (format "postgres://app:secret@~a/appdb" (container-ip db-handle))))
-        ;; Start migrate, injecting the db-url we just computed.
-        (then (start svc-migrate
-                :needs (list db)
-                :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))
-          (lambda (_migrate)
-            ;; migrate finished — now start app with the same db-url.
-            ;; Returning a node here triggers the monadic flatten in resolve.
-            (start svc-app
-              :needs (list db)
-              :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))))))))
+  (then (start svc-migrate
+          :env (lambda () `(("DATABASE_URL" . ,db-url))))
+    (lambda (migrate-handle)
+      ;; Wait for migrations to complete before starting the app.
+      (container-wait migrate-handle)
+      ;; Returning a node here triggers the monadic flatten in resolve.
+      (start svc-app
+        :env (lambda () `(("DATABASE_URL" . ,db-url)))))))
 
 ;; ── Execute: dynamic executor resolves the chain ──────────────────────────
 
@@ -90,9 +92,9 @@
 
 ;; ── Wait and clean up ─────────────────────────────────────────────────────
 ;;
-;; resolve does not populate ContainerHandle.deps, so cascade teardown is
-;; not automatic — db must be stopped explicitly.  (contrast: compose.reml
-;; uses run, which populates deps and stops db automatically.)
+;; db was started eagerly above, so we have its ContainerHandle here.
+;; (contrast: compose.reml uses run, which populates deps and stops
+;; transitive containers automatically via cascade teardown.)
 
 (with-cleanup (lambda (result)
                 (container-stop db)
