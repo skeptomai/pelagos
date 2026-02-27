@@ -1,5 +1,50 @@
 # Ongoing Tasks
 
+## Last completed: UDP port mapping (2026-02-27)
+
+### What was done
+
+**`src/network.rs`**
+- Added `PortProto` enum (`Tcp`, `Udp`, `Both`) with `pub parse(s)` and `as_str()`
+- `port_forwards` type changed to `Vec<(u16, u16, PortProto)>` everywhere
+- State-file format extended to `IP:HOST:CONTAINER:PROTO`; old 3-field lines default to `tcp`
+- `build_prerouting_script`: emits `tcp` and/or `udp` DNAT rules per `PortProto`
+- `start_port_proxies`: dispatches `start_tcp_proxy_listener` (TCP/Both) and `start_udp_proxy` (UDP/Both)
+- `start_udp_proxy`: session-map proxy with per-client outbound socket, 30-second idle eviction,
+  per-session reply thread; FIXME comment + FEATURE_GAPS note about thread-per-port scaling
+- `setup_pasta_network`: emits `-t HOST:CONTAINER` for TCP/Both, `-u HOST:CONTAINER` for UDP/Both
+
+**`src/container.rs`**
+- `with_port_forward` (TCP default), `with_port_forward_udp`, `with_port_forward_both` builder methods
+
+**`src/cli/run.rs`**
+- `parse_port_forwards`: parses `HOST:CONTAINER[/tcp|/udp|/both]` (Docker-compatible syntax)
+
+**Tests**
+- 9 unit tests in `network.rs` (`test_port_proto_parse`, `test_port_proto_as_str`,
+  `test_parse_port_forward_line_with_proto`, `test_parse_port_forward_line_backwards_compat`,
+  `test_parse_port_forward_line_both_proto`, `test_build_prerouting_script_tcp_only`,
+  `test_build_prerouting_script_udp_only`, `test_build_prerouting_script_both`)
+- 6 unit tests in `cli/run.rs` (`test_parse_port_forwards_tcp_default`, `_explicit_tcp`, `_udp`,
+  `_both`, `_multiple`, `_invalid`)
+- 2 integration tests: `test_udp_port_forward_rule_added`, `test_both_port_forward_rule_added`
+
+### Verification done
+- `cargo build` — clean
+- `cargo clippy -- -D warnings` — clean
+- `cargo fmt` — clean
+- `cargo test --lib` — 262 tests pass
+- `cargo test --test integration_tests --no-run` — compiles clean
+- Please run: `sudo -E cargo test --test integration_tests udp_port_forward both_port_forward -- --nocapture`
+
+### Next suggested task
+
+Container healthchecks (`HEALTHCHECK` in Dockerfile / exec-based probes in compose readiness).
+Currently `compose` readiness is TCP-port-only; exec-based health probes
+(`HEALTHCHECK CMD ...`) and HTTP checks are missing.  See `docs/FEATURE_GAPS.md`.
+
+---
+
 ## Last completed: credential helper support (2026-02-27)
 
 ### What to do

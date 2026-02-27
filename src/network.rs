@@ -42,12 +42,14 @@
 //! (`ip netns del`).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::process::Command as SysCmd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ── Ipv4Net ──────────────────────────────────────────────────────────────────
 
@@ -316,6 +318,38 @@ static NS_COUNTER: AtomicU32 = AtomicU32::new(0);
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Container network mode.
+/// Protocol for a port-forward mapping.
+///
+/// Matches Docker's `-p HOST:CONTAINER/tcp|udp|both` syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortProto {
+    /// TCP only (default).
+    Tcp,
+    /// UDP only.
+    Udp,
+    /// Both TCP and UDP.
+    Both,
+}
+
+impl PortProto {
+    fn as_str(self) -> &'static str {
+        match self {
+            PortProto::Tcp => "tcp",
+            PortProto::Udp => "udp",
+            PortProto::Both => "both",
+        }
+    }
+
+    /// Parse a protocol string (`"tcp"`, `"udp"`, `"both"`). Defaults to `Tcp`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "udp" => PortProto::Udp,
+            "both" => PortProto::Both,
+            _ => PortProto::Tcp,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
     /// Share the host's network stack (default — no changes).
@@ -372,7 +406,7 @@ pub struct NetworkSetup {
     /// Whether NAT (MASQUERADE) was enabled for this container.
     pub nat_enabled: bool,
     /// Port forwards configured for this container: `(host_port, container_port)`.
-    pub port_forwards: Vec<(u16, u16)>,
+    pub port_forwards: Vec<(u16, u16, PortProto)>,
     /// Userspace TCP proxy stop flag — set to `true` to stop all proxy threads.
     proxy_stop: Option<Arc<AtomicBool>>,
     /// Name of the network this setup belongs to (e.g. `"remora0"`, `"frontend"`).
@@ -606,7 +640,7 @@ pub fn setup_bridge_network(
     ns_name: &str,
     network_name: &str,
     nat: bool,
-    port_forwards: Vec<(u16, u16)>,
+    port_forwards: Vec<(u16, u16, PortProto)>,
 ) -> io::Result<NetworkSetup> {
     let net_def = load_network_def(network_name)?;
     ensure_bridge(&net_def)?;
@@ -1046,17 +1080,23 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
 
 // ── N4: Port mapping (DNAT) ───────────────────────────────────────────────────
 
-/// Parse one line from [`crate::paths::port_forwards_file()`]: `{ip}:{host_port}:{container_port}`.
-fn parse_port_forward_line(line: &str) -> Option<(Ipv4Addr, u16, u16)> {
-    let mut parts = line.splitn(3, ':');
+/// Parse one line from the port-forwards state file.
+///
+/// Format: `{ip}:{host_port}:{container_port}[:{proto}]`
+/// The proto field defaults to `tcp` when absent (backwards compat).
+fn parse_port_forward_line(line: &str) -> Option<(Ipv4Addr, u16, u16, PortProto)> {
+    let mut parts = line.splitn(4, ':');
     let ip: Ipv4Addr = parts.next()?.parse().ok()?;
     let host_port: u16 = parts.next()?.parse().ok()?;
     let container_port: u16 = parts.next()?.parse().ok()?;
-    Some((ip, host_port, container_port))
+    let proto = parts.next().map(PortProto::parse).unwrap_or(PortProto::Tcp);
+    Some((ip, host_port, container_port, proto))
 }
 
 /// Read all port-forward entries from an already-flocked file.
-fn read_port_forwards_locked(file: &mut std::fs::File) -> io::Result<Vec<(Ipv4Addr, u16, u16)>> {
+fn read_port_forwards_locked(
+    file: &mut std::fs::File,
+) -> io::Result<Vec<(Ipv4Addr, u16, u16, PortProto)>> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
@@ -1100,18 +1140,29 @@ fn read_nat_refcount(network_name: &str) -> u32 {
 /// when the table already exists (e.g. because NAT/MASQUERADE is active).
 /// `flush chain prerouting` wipes the old rules before rewriting — this is
 /// the flush-and-rebuild strategy that avoids needing to track rule handles.
-fn build_prerouting_script(net: &NetworkDef, entries: &[(Ipv4Addr, u16, u16)]) -> String {
+fn build_prerouting_script(
+    net: &NetworkDef,
+    entries: &[(Ipv4Addr, u16, u16, PortProto)],
+) -> String {
     let table = net.nft_table_name();
     let mut s = format!(
         "add table ip {table}\n\
          add chain ip {table} prerouting {{ type nat hook prerouting priority -100; }}\n\
          flush chain ip {table} prerouting\n",
     );
-    for (ip, host_port, container_port) in entries {
-        s.push_str(&format!(
-            "add rule ip {} prerouting tcp dport {} dnat to {}:{}\n",
-            table, host_port, ip, container_port
-        ));
+    for (ip, host_port, container_port, proto) in entries {
+        if matches!(proto, PortProto::Tcp | PortProto::Both) {
+            s.push_str(&format!(
+                "add rule ip {} prerouting tcp dport {} dnat to {}:{}\n",
+                table, host_port, ip, container_port
+            ));
+        }
+        if matches!(proto, PortProto::Udp | PortProto::Both) {
+            s.push_str(&format!(
+                "add rule ip {} prerouting udp dport {} dnat to {}:{}\n",
+                table, host_port, ip, container_port
+            ));
+        }
     }
     s
 }
@@ -1124,7 +1175,7 @@ fn build_prerouting_script(net: &NetworkDef, entries: &[(Ipv4Addr, u16, u16)]) -
 fn enable_port_forwards(
     net: &NetworkDef,
     container_ip: Ipv4Addr,
-    forwards: &[(u16, u16)],
+    forwards: &[(u16, u16, PortProto)],
 ) -> io::Result<()> {
     let pf_path = crate::paths::network_port_forwards_file(&net.name);
     if let Some(parent) = pf_path.parent() {
@@ -1142,15 +1193,15 @@ fn enable_port_forwards(
 
     let mut entries = read_port_forwards_locked(&mut file)?;
 
-    for &(host_port, container_port) in forwards {
-        entries.push((container_ip, host_port, container_port));
+    for &(host_port, container_port, proto) in forwards {
+        entries.push((container_ip, host_port, container_port, proto));
     }
 
     // Overwrite file with all entries.
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-    for (ip, hp, cp) in &entries {
-        writeln!(file, "{}:{}:{}", ip, hp, cp)?;
+    for (ip, hp, cp, proto) in &entries {
+        writeln!(file, "{}:{}:{}:{}", ip, hp, cp, proto.as_str())?;
     }
 
     // Install nftables DNAT rules.
@@ -1168,7 +1219,11 @@ fn enable_port_forwards(
 /// - If entries remain, rebuilds the prerouting chain from the survivors.
 ///
 /// Errors are non-fatal (logged via `log::warn!`).
-fn disable_port_forwards(net: &NetworkDef, container_ip: Ipv4Addr, forwards: &[(u16, u16)]) {
+fn disable_port_forwards(
+    net: &NetworkDef,
+    container_ip: Ipv4Addr,
+    forwards: &[(u16, u16, PortProto)],
+) {
     let pf_path = crate::paths::network_port_forwards_file(&net.name);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -1195,10 +1250,12 @@ fn disable_port_forwards(net: &NetworkDef, container_ip: Ipv4Addr, forwards: &[(
         }
     };
 
-    // Remove all entries belonging to this container.
-    let remaining: Vec<(Ipv4Addr, u16, u16)> = entries
+    // Remove all entries belonging to this container (match on IP + host port).
+    let remaining: Vec<(Ipv4Addr, u16, u16, PortProto)> = entries
         .into_iter()
-        .filter(|(ip, hp, _cp)| !(*ip == container_ip && forwards.iter().any(|&(h, _)| h == *hp)))
+        .filter(|(ip, hp, _cp, _proto)| {
+            !(*ip == container_ip && forwards.iter().any(|&(h, _, _)| h == *hp))
+        })
         .collect();
 
     // Write remaining entries back.
@@ -1206,8 +1263,8 @@ fn disable_port_forwards(net: &NetworkDef, container_ip: Ipv4Addr, forwards: &[(
         log::warn!("port forwards file truncate (non-fatal): {}", e);
         return;
     }
-    for (ip, hp, cp) in &remaining {
-        let _ = writeln!(file, "{}:{}:{}", ip, hp, cp);
+    for (ip, hp, cp, proto) in &remaining {
+        let _ = writeln!(file, "{}:{}:{}:{}", ip, hp, cp, proto.as_str());
     }
 
     // flock released; now update nftables.
@@ -1238,66 +1295,196 @@ fn disable_port_forwards(net: &NetworkDef, container_ip: Ipv4Addr, forwards: &[(
 
 // ── Userspace TCP port proxy ─────────────────────────────────────────────────
 
-/// Start background TCP proxy threads for each port mapping.
+/// Start background proxy threads for each port mapping.
 ///
 /// nftables DNAT rules in the PREROUTING chain handle traffic from external
 /// hosts, but traffic originating from localhost bypasses PREROUTING entirely
 /// (it goes through OUTPUT). Docker solves this with `docker-proxy` — a
-/// userspace TCP relay. This is Remora's equivalent.
+/// userspace relay. This is Remora's equivalent for both TCP and UDP.
 ///
-/// Each port mapping gets a `TcpListener` on `0.0.0.0:{host_port}`. Accepted
-/// connections are relayed bidirectionally to `{container_ip}:{container_port}`.
+/// Each port mapping gets a listener on `0.0.0.0:{host_port}`. For TCP,
+/// accepted connections are relayed bidirectionally. For UDP, packets are
+/// relayed with per-client session sockets and a 30-second idle timeout.
+///
 /// Returns a stop flag that must be set to `true` on teardown.
-fn start_port_proxies(container_ip: Ipv4Addr, forwards: &[(u16, u16)]) -> Arc<AtomicBool> {
+///
+/// # FIXME (scaling)
+/// The current model spawns one thread per port (TCP) or one thread per port
+/// plus one thread per active UDP session. This is fine for development but
+/// scales poorly under high connection counts. A future `remora network proxy`
+/// refactor should replace this with a single tokio async task pool (tokio is
+/// already a dependency). Do not address this now.
+fn start_port_proxies(
+    container_ip: Ipv4Addr,
+    forwards: &[(u16, u16, PortProto)],
+) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
 
-    for &(host_port, container_port) in forwards {
-        let stop = Arc::clone(&stop);
-        let target = SocketAddr::from((container_ip, container_port));
-
-        std::thread::spawn(move || {
-            let listener = match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], host_port))) {
-                Ok(l) => l,
-                Err(e) => {
-                    log::warn!(
-                        "port proxy: cannot bind 0.0.0.0:{}: {} (nftables DNAT still active)",
-                        host_port,
-                        e
-                    );
-                    return;
-                }
-            };
-            // Non-blocking accept so we can check the stop flag periodically.
-            listener
-                .set_nonblocking(true)
-                .expect("set_nonblocking failed");
-
-            log::debug!("port proxy: 0.0.0.0:{} -> {}", host_port, target);
-
-            while !stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((client, _addr)) => {
-                        let target = target;
-                        let stop = Arc::clone(&stop);
-                        std::thread::spawn(move || {
-                            proxy_relay(client, target, &stop);
-                        });
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    Err(e) => {
-                        if !stop.load(Ordering::Relaxed) {
-                            log::warn!("port proxy accept error on port {}: {}", host_port, e);
-                        }
-                        break;
-                    }
-                }
-            }
-        });
+    for &(host_port, container_port, proto) in forwards {
+        if matches!(proto, PortProto::Tcp | PortProto::Both) {
+            let stop = Arc::clone(&stop);
+            let target = SocketAddr::from((container_ip, container_port));
+            std::thread::spawn(move || {
+                start_tcp_proxy_listener(host_port, target, stop);
+            });
+        }
+        if matches!(proto, PortProto::Udp | PortProto::Both) {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                start_udp_proxy(host_port, container_ip, container_port, stop);
+            });
+        }
     }
 
     stop
+}
+
+/// Accept loop for a single TCP port mapping.
+fn start_tcp_proxy_listener(host_port: u16, target: SocketAddr, stop: Arc<AtomicBool>) {
+    let listener = match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], host_port))) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!(
+                "tcp proxy: cannot bind 0.0.0.0:{}: {} (nftables DNAT still active)",
+                host_port,
+                e
+            );
+            return;
+        }
+    };
+    listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
+
+    log::debug!("tcp proxy: 0.0.0.0:{} -> {}", host_port, target);
+
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((client, _addr)) => {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    proxy_relay(client, target, &stop);
+                });
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                if !stop.load(Ordering::Relaxed) {
+                    log::warn!("tcp proxy accept error on port {}: {}", host_port, e);
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// UDP relay for a single port mapping.
+///
+/// Binds a listening socket on `0.0.0.0:{host_port}`. For each unique client
+/// address, a dedicated outbound socket is created and connected to
+/// `{container_ip}:{container_port}`. Replies from the container are forwarded
+/// back to the originating client. Sessions idle for more than 30 seconds are
+/// evicted from the session table.
+fn start_udp_proxy(
+    host_port: u16,
+    container_ip: Ipv4Addr,
+    container_port: u16,
+    stop: Arc<AtomicBool>,
+) {
+    let inbound = match UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], host_port))) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            log::warn!(
+                "udp proxy: cannot bind 0.0.0.0:{}: {} (nftables DNAT still active)",
+                host_port,
+                e
+            );
+            return;
+        }
+    };
+    inbound
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set_read_timeout");
+
+    let target = SocketAddr::from((container_ip, container_port));
+    log::debug!("udp proxy: 0.0.0.0:{} -> {}", host_port, target);
+
+    // session_map: client_addr -> (outbound_socket, last_activity)
+    type SessionMap = HashMap<SocketAddr, (Arc<UdpSocket>, Instant)>;
+    let sessions: Arc<Mutex<SessionMap>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let mut buf = [0u8; 65535];
+
+    while !stop.load(Ordering::Relaxed) {
+        match inbound.recv_from(&mut buf) {
+            Ok((n, client_addr)) => {
+                let data = buf[..n].to_vec();
+
+                let outbound = {
+                    let mut map = sessions.lock().unwrap();
+                    // Evict sessions idle > 30 seconds.
+                    map.retain(|_, (_, last)| last.elapsed() < Duration::from_secs(30));
+
+                    if let Some((sock, last)) = map.get_mut(&client_addr) {
+                        *last = Instant::now();
+                        Arc::clone(sock)
+                    } else {
+                        // New client: create a dedicated outbound socket.
+                        let sock = match UdpSocket::bind("0.0.0.0:0") {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                log::warn!("udp proxy: outbound bind failed: {}", e);
+                                continue;
+                            }
+                        };
+                        if let Err(e) = sock.connect(target) {
+                            log::warn!("udp proxy: connect to {} failed: {}", target, e);
+                            continue;
+                        }
+                        map.insert(client_addr, (Arc::clone(&sock), Instant::now()));
+
+                        // Spawn reply-forwarding thread for this session.
+                        let reply_sock = Arc::clone(&sock);
+                        let inbound_ref = Arc::clone(&inbound);
+                        let stop2 = Arc::clone(&stop);
+                        std::thread::spawn(move || {
+                            let mut rbuf = [0u8; 65535];
+                            reply_sock
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .ok();
+                            while !stop2.load(Ordering::Relaxed) {
+                                match reply_sock.recv(&mut rbuf) {
+                                    Ok(m) => {
+                                        let _ = inbound_ref.send_to(&rbuf[..m], client_addr);
+                                    }
+                                    Err(ref e)
+                                        if e.kind() == io::ErrorKind::WouldBlock
+                                            || e.kind() == io::ErrorKind::TimedOut => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+
+                        sock
+                    }
+                };
+
+                if let Err(e) = outbound.send(&data) {
+                    log::debug!("udp proxy: forward to {} failed: {}", target, e);
+                }
+            }
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
+            Err(e) => {
+                if !stop.load(Ordering::Relaxed) {
+                    log::warn!("udp proxy recv_from error on port {}: {}", host_port, e);
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// Bidirectional TCP relay between a client socket and a container target.
@@ -1373,7 +1560,10 @@ fn copy_until_done(mut reader: TcpStream, mut writer: TcpStream, stop: &AtomicBo
 ///
 /// pasta runs as a background process; call [`teardown_pasta_network`] after
 /// the container exits to kill it and reap the process.
-pub fn setup_pasta_network(child_pid: u32, port_forwards: &[(u16, u16)]) -> io::Result<PastaSetup> {
+pub fn setup_pasta_network(
+    child_pid: u32,
+    port_forwards: &[(u16, u16, PortProto)],
+) -> io::Result<PastaSetup> {
     let mut args: Vec<String> = vec![];
 
     // Use the PID form: `pasta [OPTIONS] PID`.
@@ -1388,9 +1578,15 @@ pub fn setup_pasta_network(child_pid: u32, port_forwards: &[(u16, u16)]) -> io::
     // new user namespace for the drop-to-nobody dance, and then lacks access to the
     // target netns file from within that new user namespace.
 
-    for (host, container) in port_forwards {
-        args.push("-t".to_string());
-        args.push(format!("{}:{}", host, container));
+    for &(host, container, proto) in port_forwards {
+        if matches!(proto, PortProto::Tcp | PortProto::Both) {
+            args.push("-t".to_string());
+            args.push(format!("{}:{}", host, container));
+        }
+        if matches!(proto, PortProto::Udp | PortProto::Both) {
+            args.push("-u".to_string());
+            args.push(format!("{}:{}", host, container));
+        }
     }
     // Tell pasta to configure IP address and routes inside the container's netns.
     // Without this flag pasta only creates the TAP; the container would need to run
@@ -1601,6 +1797,95 @@ mod tests {
         assert!(h1.len() <= 15);
         assert!(h2.len() <= 15);
         assert!(h3.len() <= 15);
+    }
+
+    // ── PortProto tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_port_proto_parse() {
+        assert_eq!(PortProto::parse("tcp"), PortProto::Tcp);
+        assert_eq!(PortProto::parse("udp"), PortProto::Udp);
+        assert_eq!(PortProto::parse("both"), PortProto::Both);
+        // Defaults to Tcp for unknown values (Docker compat).
+        assert_eq!(PortProto::parse(""), PortProto::Tcp);
+        assert_eq!(PortProto::parse("sctp"), PortProto::Tcp);
+    }
+
+    #[test]
+    fn test_port_proto_as_str() {
+        assert_eq!(PortProto::Tcp.as_str(), "tcp");
+        assert_eq!(PortProto::Udp.as_str(), "udp");
+        assert_eq!(PortProto::Both.as_str(), "both");
+    }
+
+    #[test]
+    fn test_parse_port_forward_line_with_proto() {
+        let r = parse_port_forward_line("192.168.1.5:8080:80:udp").unwrap();
+        assert_eq!(r.0, "192.168.1.5".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(r.1, 8080);
+        assert_eq!(r.2, 80);
+        assert_eq!(r.3, PortProto::Udp);
+    }
+
+    #[test]
+    fn test_parse_port_forward_line_backwards_compat() {
+        // Lines without a proto field must default to Tcp.
+        let r = parse_port_forward_line("10.0.0.2:443:443").unwrap();
+        assert_eq!(r.3, PortProto::Tcp);
+    }
+
+    #[test]
+    fn test_parse_port_forward_line_both_proto() {
+        let r = parse_port_forward_line("172.19.0.2:53:53:both").unwrap();
+        assert_eq!(r.3, PortProto::Both);
+    }
+
+    #[test]
+    fn test_build_prerouting_script_tcp_only() {
+        use std::net::Ipv4Addr;
+        let net = NetworkDef {
+            name: "test".to_string(),
+            subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
+            gateway: Ipv4Addr::new(172, 19, 0, 1),
+            bridge_name: "remora0".to_string(),
+        };
+        let ip = Ipv4Addr::new(172, 19, 0, 2);
+        let entries = vec![(ip, 8080u16, 80u16, PortProto::Tcp)];
+        let script = build_prerouting_script(&net, &entries);
+        assert!(script.contains("tcp dport 8080 dnat to 172.19.0.2:80"));
+        assert!(!script.contains("udp"));
+    }
+
+    #[test]
+    fn test_build_prerouting_script_udp_only() {
+        use std::net::Ipv4Addr;
+        let net = NetworkDef {
+            name: "test".to_string(),
+            subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
+            gateway: Ipv4Addr::new(172, 19, 0, 1),
+            bridge_name: "remora0".to_string(),
+        };
+        let ip = Ipv4Addr::new(172, 19, 0, 2);
+        let entries = vec![(ip, 5353u16, 53u16, PortProto::Udp)];
+        let script = build_prerouting_script(&net, &entries);
+        assert!(script.contains("udp dport 5353 dnat to 172.19.0.2:53"));
+        assert!(!script.contains("tcp dport"));
+    }
+
+    #[test]
+    fn test_build_prerouting_script_both() {
+        use std::net::Ipv4Addr;
+        let net = NetworkDef {
+            name: "test".to_string(),
+            subnet: Ipv4Net::from_cidr("172.19.0.0/24").unwrap(),
+            gateway: Ipv4Addr::new(172, 19, 0, 1),
+            bridge_name: "remora0".to_string(),
+        };
+        let ip = Ipv4Addr::new(172, 19, 0, 2);
+        let entries = vec![(ip, 53u16, 53u16, PortProto::Both)];
+        let script = build_prerouting_script(&net, &entries);
+        assert!(script.contains("tcp dport 53 dnat to 172.19.0.2:53"));
+        assert!(script.contains("udp dport 53 dnat to 172.19.0.2:53"));
     }
 
     #[test]

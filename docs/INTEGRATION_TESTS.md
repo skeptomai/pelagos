@@ -489,6 +489,27 @@ Unlike `test_port_forward_rule_added` (which only checks the nftables rule strin
 this proves the full DNAT path works: external traffic → nftables prerouting → DNAT →
 FORWARD → bridge → container netns → container process → response back via conntrack.
 
+### `test_udp_port_forward_rule_added` — N4-UDP
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container with `with_port_forward_udp(19095, 5000)`.
+After 200 ms, queries nftables (`nft list chain ip remora-remora0 prerouting`)
+and asserts the chain contains `udp dport 19095 dnat to <IP>:5000` and does NOT
+contain `tcp dport 19095` (UDP-only mappings must not generate TCP rules).
+
+Failure indicates UDP port mappings are silently ignored or the wrong nft protocol
+token is emitted.  Container is SIGKILLed after the nftables check.
+
+### `test_both_port_forward_rule_added` — N4-UDP
+**Requires:** root, rootfs
+
+Spawns a bridge+NAT container with `with_port_forward_both(19096, 53)`.
+After 200 ms, queries nftables and asserts the prerouting chain contains BOTH
+`tcp dport 19096 dnat to <IP>:53` AND `udp dport 19096 dnat to <IP>:53`.
+
+Failure indicates the `Both` variant does not generate the two required rules,
+which would break dual-protocol services (e.g. DNS, QUIC/HTTP3).
+
 ### `test_bridge_cleanup_after_sigkill` — N2+N3
 **Requires:** root, rootfs
 

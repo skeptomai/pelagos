@@ -230,7 +230,7 @@ fn build_image_run(
     args: &RunArgs,
     image_ref: &str,
     cmd_args: &[String],
-    port_forwards: &[(u16, u16)],
+    port_forwards: &[(u16, u16, remora::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
 ) -> Result<(String, Vec<String>, Command), Box<dyn std::error::Error>> {
@@ -321,7 +321,7 @@ fn build_command(
     args: &RunArgs,
     rootfs_dir: &std::path::Path,
     exe_and_args: &[String],
-    port_forwards: &[(u16, u16)],
+    port_forwards: &[(u16, u16, remora::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
 ) -> Result<Command, Box<dyn std::error::Error>> {
@@ -344,7 +344,7 @@ fn build_command(
 fn apply_cli_options(
     mut cmd: Command,
     args: &RunArgs,
-    port_forwards: &[(u16, u16)],
+    port_forwards: &[(u16, u16, remora::network::PortProto)],
     network_mode: NetworkMode,
     additional_networks: &[String],
 ) -> Result<Command, Box<dyn std::error::Error>> {
@@ -355,8 +355,13 @@ fn apply_cli_options(
     for net_name in additional_networks {
         cmd = cmd.with_additional_network(net_name);
     }
-    for &(host, container) in port_forwards {
-        cmd = cmd.with_port_forward(host, container);
+    for &(host, container, proto) in port_forwards {
+        use remora::network::PortProto;
+        cmd = match proto {
+            PortProto::Tcp => cmd.with_port_forward(host, container),
+            PortProto::Udp => cmd.with_port_forward_udp(host, container),
+            PortProto::Both => cmd.with_port_forward_both(host, container),
+        };
     }
     if args.nat {
         cmd = cmd.with_nat();
@@ -561,12 +566,21 @@ fn parse_network_mode(s: &str) -> Result<NetworkMode, Box<dyn std::error::Error>
     }
 }
 
-fn parse_port_forwards(specs: &[String]) -> Result<Vec<(u16, u16)>, Box<dyn std::error::Error>> {
+#[allow(clippy::type_complexity)]
+fn parse_port_forwards(
+    specs: &[String],
+) -> Result<Vec<(u16, u16, remora::network::PortProto)>, Box<dyn std::error::Error>> {
+    use remora::network::PortProto;
     let mut out = Vec::new();
     for s in specs {
-        let (h, c) = s
+        // Accept HOST:CONTAINER[/tcp|/udp|/both]
+        let (ports_part, proto_str) = match s.rsplit_once('/') {
+            Some((p, pr)) => (p, pr),
+            None => (s.as_str(), "tcp"),
+        };
+        let (h, c) = ports_part
             .split_once(':')
-            .ok_or_else(|| format!("invalid --publish '{}': expected HOST:CONTAINER", s))?;
+            .ok_or_else(|| format!("invalid --publish '{}': expected HOST:CONTAINER[/PROTO]", s))?;
         let host = h
             .trim()
             .parse::<u16>()
@@ -575,7 +589,8 @@ fn parse_port_forwards(specs: &[String]) -> Result<Vec<(u16, u16)>, Box<dyn std:
             .trim()
             .parse::<u16>()
             .map_err(|e| format!("invalid container port '{}': {}", c, e))?;
-        out.push((host, container));
+        let proto = PortProto::parse(proto_str);
+        out.push((host, container, proto));
     }
     Ok(out)
 }
@@ -858,5 +873,54 @@ fn deregister_dns(container_name: &str, network_ips: &[(String, String)]) {
                 e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_port_forwards_tcp_default() {
+        let specs = vec!["8080:80".to_string()];
+        let fwds = parse_port_forwards(&specs).unwrap();
+        assert_eq!(fwds.len(), 1);
+        assert_eq!(fwds[0], (8080, 80, remora::network::PortProto::Tcp));
+    }
+
+    #[test]
+    fn test_parse_port_forwards_explicit_tcp() {
+        let specs = vec!["8080:80/tcp".to_string()];
+        let fwds = parse_port_forwards(&specs).unwrap();
+        assert_eq!(fwds[0], (8080, 80, remora::network::PortProto::Tcp));
+    }
+
+    #[test]
+    fn test_parse_port_forwards_udp() {
+        let specs = vec!["5353:53/udp".to_string()];
+        let fwds = parse_port_forwards(&specs).unwrap();
+        assert_eq!(fwds[0], (5353, 53, remora::network::PortProto::Udp));
+    }
+
+    #[test]
+    fn test_parse_port_forwards_both() {
+        let specs = vec!["53:53/both".to_string()];
+        let fwds = parse_port_forwards(&specs).unwrap();
+        assert_eq!(fwds[0], (53, 53, remora::network::PortProto::Both));
+    }
+
+    #[test]
+    fn test_parse_port_forwards_multiple() {
+        let specs = vec!["80:80/tcp".to_string(), "5353:53/udp".to_string()];
+        let fwds = parse_port_forwards(&specs).unwrap();
+        assert_eq!(fwds.len(), 2);
+        assert_eq!(fwds[0].2, remora::network::PortProto::Tcp);
+        assert_eq!(fwds[1].2, remora::network::PortProto::Udp);
+    }
+
+    #[test]
+    fn test_parse_port_forwards_invalid() {
+        assert!(parse_port_forwards(&["notaport".to_string()]).is_err());
+        assert!(parse_port_forwards(&["abc:80".to_string()]).is_err());
     }
 }

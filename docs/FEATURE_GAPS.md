@@ -78,9 +78,16 @@ OCI Image Layout tar format.  Interoperable with Docker, Podman, skopeo, crane.
 
 ---
 
-#### UDP port mapping
-We only handle TCP DNAT today.  UDP is required for DNS, QUIC/HTTP3, gaming
-servers, VoIP, and many other protocols.
+#### ~~UDP port mapping~~ ✅ COMPLETE
+`-p HOST:CONTAINER/udp` and `-p HOST:CONTAINER/both` map UDP (or both TCP+UDP)
+via nftables DNAT + a userspace UDP relay for localhost traffic.
+The userspace relay uses per-client session sockets with 30-second idle eviction.
+
+> **⚠️ Scaling note (future work):** The current userspace proxy uses one thread
+> per port mapping plus one thread per active UDP session. This is fine for
+> development workloads but scales poorly under high connection counts. A future
+> `remora network proxy` refactor should replace this with a `tokio` async task
+> pool (already a dependency). Do not address this now.
 
 ---
 

@@ -2464,6 +2464,126 @@ mod networking {
         );
     }
 
+    /// N4-UDP: `with_port_forward_udp` installs a UDP DNAT rule in nftables.
+    ///
+    /// Spawns a bridge+NAT container with a UDP port mapping.  The nftables
+    /// prerouting chain must contain an `udp dport` DNAT rule and must NOT
+    /// contain a `tcp dport` rule for the same host port (since we asked for
+    /// UDP only).  After the container exits, the prerouting chain is cleaned up
+    /// and the rule is gone.
+    ///
+    /// Failure would indicate that UDP port mappings are silently ignored,
+    /// or that the wrong protocol token is being emitted in the nft script.
+    #[test]
+    #[serial(nat)]
+    fn test_udp_port_forward_rule_added() {
+        if !is_root() {
+            eprintln!("Skipping test_udp_port_forward_rule_added: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_udp_port_forward_rule_added: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward_udp(19095, 5000)
+            .with_chroot(&rootfs)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Check nftables: the prerouting chain must contain a UDP DNAT rule.
+        let nft_out = std::process::Command::new("nft")
+            .args(["list", "chain", "ip", "remora-remora0", "prerouting"])
+            .output();
+
+        unsafe {
+            libc::kill(child.pid(), libc::SIGKILL);
+        }
+        let _ = child.wait();
+
+        let nft_out = nft_out.expect("nft list chain");
+        let rules = String::from_utf8_lossy(&nft_out.stdout);
+        assert!(
+            rules.contains("udp dport 19095"),
+            "Expected 'udp dport 19095' in prerouting chain, got:\n{}",
+            rules
+        );
+        assert!(
+            !rules.contains("tcp dport 19095"),
+            "UDP-only mapping must not generate a TCP rule, got:\n{}",
+            rules
+        );
+    }
+
+    /// N4-UDP: `with_port_forward_both` installs both TCP and UDP DNAT rules.
+    ///
+    /// The prerouting chain must contain rules for both `tcp dport` and
+    /// `udp dport` when `with_port_forward_both` is used.
+    ///
+    /// Failure indicates that the `both` variant is not generating the two
+    /// required nftables rules.
+    #[test]
+    #[serial(nat)]
+    fn test_both_port_forward_rule_added() {
+        if !is_root() {
+            eprintln!("Skipping test_both_port_forward_rule_added: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_both_port_forward_rule_added: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward_both(19096, 53)
+            .with_chroot(&rootfs)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let nft_out = std::process::Command::new("nft")
+            .args(["list", "chain", "ip", "remora-remora0", "prerouting"])
+            .output();
+
+        unsafe {
+            libc::kill(child.pid(), libc::SIGKILL);
+        }
+        let _ = child.wait();
+
+        let nft_out = nft_out.expect("nft list chain");
+        let rules = String::from_utf8_lossy(&nft_out.stdout);
+        assert!(
+            rules.contains("tcp dport 19096"),
+            "Expected 'tcp dport 19096' in prerouting chain, got:\n{}",
+            rules
+        );
+        assert!(
+            rules.contains("udp dport 19096"),
+            "Expected 'udp dport 19096' in prerouting chain, got:\n{}",
+            rules
+        );
+    }
+
     /// N2+N3: Bridge + NAT cleanup must work even after SIGKILL.
     ///
     /// Spawns a bridge+NAT container (`sleep 60`), records veth name, netns name,

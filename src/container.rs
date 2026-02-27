@@ -641,8 +641,8 @@ pub struct Command {
     network_config: Option<crate::network::NetworkConfig>,
     // Whether to enable NAT (MASQUERADE) for bridge-mode containers.
     nat: bool,
-    // Port-forward rules: (host_port, container_port). Requires Bridge + NAT.
-    port_forwards: Vec<(u16, u16)>,
+    // Port-forward rules: (host_port, container_port, proto). Requires Bridge + NAT.
+    port_forwards: Vec<(u16, u16, crate::network::PortProto)>,
     // DNS servers to write into the container's /etc/resolv.conf.
     dns_servers: Vec<String>,
     // Overlay filesystem (upper + work dirs; lower = chroot_dir).
@@ -1193,7 +1193,22 @@ impl Command {
     ///     .spawn()?;
     /// ```
     pub fn with_port_forward(mut self, host_port: u16, container_port: u16) -> Self {
-        self.port_forwards.push((host_port, container_port));
+        self.port_forwards
+            .push((host_port, container_port, crate::network::PortProto::Tcp));
+        self
+    }
+
+    /// Map `host_port` → `container_port` for UDP traffic.
+    pub fn with_port_forward_udp(mut self, host_port: u16, container_port: u16) -> Self {
+        self.port_forwards
+            .push((host_port, container_port, crate::network::PortProto::Udp));
+        self
+    }
+
+    /// Map `host_port` → `container_port` for both TCP and UDP traffic.
+    pub fn with_port_forward_both(mut self, host_port: u16, container_port: u16) -> Self {
+        self.port_forwards
+            .push((host_port, container_port, crate::network::PortProto::Both));
         self
     }
 
