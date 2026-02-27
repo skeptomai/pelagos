@@ -9509,7 +9509,7 @@ mod image_save_load {
 
         // ── 6. Run a command in the loaded image ──────────────────────────────
         let run = std::process::Command::new(bin)
-            .args(["run", "--rm", reference, "/bin/true"])
+            .args(["run", reference, "/bin/true"])
             .output()
             .expect("remora run");
         assert!(

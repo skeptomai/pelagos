@@ -798,14 +798,15 @@ pub fn cmd_image_load(
         };
 
         let config = parse_image_config(config_json)?;
-        image::save_oci_config(&reference, config_json)?;
         let img_manifest = ImageManifest {
             reference: reference.clone(),
             digest: manifest_digest.to_string(),
             layers: layer_digests,
             config,
         };
+        // save_image creates image_dir; save_oci_config must come after.
         save_image(&img_manifest)?;
+        image::save_oci_config(&reference, config_json)?;
         println!("Loaded {}", reference);
     }
 
