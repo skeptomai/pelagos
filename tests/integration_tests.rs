@@ -9411,3 +9411,117 @@ mod registry_auth {
         cleanup_container(&registry_name);
     }
 }
+
+// ============================================================================
+// image save / load
+// ============================================================================
+
+mod image_save_load {
+    /// Pull alpine, save it to a tar file, remove it from the local store,
+    /// load it back, and verify the image is usable by running a command.
+    ///
+    /// Requires root (image pull uses overlayfs extraction).
+    /// Marked `#[ignore]` — run with:
+    ///   sudo -E cargo test --test integration_tests image_save_load -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_image_save_load_roundtrip() {
+        let bin = env!("CARGO_BIN_EXE_remora");
+        let reference = "docker.io/library/alpine:latest";
+        let tar_path = "/tmp/remora-test-alpine-save.tar";
+
+        // ── 1. Pull alpine ────────────────────────────────────────────────────
+        let pull = std::process::Command::new(bin)
+            .args(["image", "pull", reference])
+            .output()
+            .expect("remora image pull");
+        assert!(
+            pull.status.success(),
+            "pull failed:\n{}",
+            String::from_utf8_lossy(&pull.stderr)
+        );
+
+        // ── 2. Save to tar ────────────────────────────────────────────────────
+        let _ = std::fs::remove_file(tar_path);
+        let save = std::process::Command::new(bin)
+            .args(["image", "save", reference, "-o", tar_path])
+            .output()
+            .expect("remora image save");
+        assert!(
+            save.status.success(),
+            "save failed:\n{}",
+            String::from_utf8_lossy(&save.stderr)
+        );
+        assert!(
+            std::path::Path::new(tar_path).exists(),
+            "tar file not created"
+        );
+
+        // Verify it's a valid OCI tar (has oci-layout entry).
+        let tar_bytes = std::fs::read(tar_path).expect("read tar");
+        let cursor = std::io::Cursor::new(&tar_bytes);
+        let mut ar = tar::Archive::new(cursor);
+        let has_oci_layout = ar
+            .entries()
+            .unwrap()
+            .any(|e| e.unwrap().path().unwrap().to_string_lossy() == "oci-layout");
+        assert!(has_oci_layout, "tar missing oci-layout entry");
+
+        // ── 3. Remove the local image ─────────────────────────────────────────
+        let rm = std::process::Command::new(bin)
+            .args(["image", "rm", reference])
+            .output()
+            .expect("remora image rm");
+        assert!(
+            rm.status.success(),
+            "rm failed:\n{}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+
+        // ── 4. Load from tar ──────────────────────────────────────────────────
+        let load = std::process::Command::new(bin)
+            .args(["image", "load", "-i", tar_path])
+            .output()
+            .expect("remora image load");
+        assert!(
+            load.status.success(),
+            "load failed:\n{}",
+            String::from_utf8_lossy(&load.stderr)
+        );
+        let load_out = String::from_utf8_lossy(&load.stdout);
+        assert!(
+            load_out.contains("Loaded"),
+            "expected 'Loaded' in output, got: {}",
+            load_out
+        );
+
+        // ── 5. Verify image appears in ls ─────────────────────────────────────
+        let ls = std::process::Command::new(bin)
+            .args(["image", "ls"])
+            .output()
+            .expect("remora image ls");
+        let ls_out = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            ls_out.contains("alpine"),
+            "loaded image not found in ls output: {}",
+            ls_out
+        );
+
+        // ── 6. Run a command in the loaded image ──────────────────────────────
+        let run = std::process::Command::new(bin)
+            .args(["run", "--rm", reference, "/bin/true"])
+            .output()
+            .expect("remora run");
+        assert!(
+            run.status.success(),
+            "run after load failed:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        // ── Cleanup ───────────────────────────────────────────────────────────
+        let _ = std::fs::remove_file(tar_path);
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", reference])
+            .output();
+    }
+}

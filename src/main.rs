@@ -320,6 +320,23 @@ pub(crate) enum ImageCmd {
         /// Registry hostname
         registry: String,
     },
+    /// Save a locally stored image to an OCI Image Layout tar archive
+    Save {
+        /// Image reference (e.g. alpine:latest)
+        reference: String,
+        /// Output file path (default: stdout)
+        #[clap(long, short = 'o')]
+        output: Option<String>,
+    },
+    /// Load an image from an OCI Image Layout tar archive
+    Load {
+        /// Input file path (default: stdin)
+        #[clap(long, short = 'i')]
+        input: Option<String>,
+        /// Tag to apply to the loaded image (overrides annotation in archive)
+        #[clap(long)]
+        tag: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -430,6 +447,12 @@ fn main() {
                 password_stdin,
             } => cli::image::cmd_image_login(&registry, username.as_deref(), password_stdin),
             ImageCmd::Logout { registry } => cli::image::cmd_image_logout(&registry),
+            ImageCmd::Save { reference, output } => {
+                cli::image::cmd_image_save(&reference, output.as_deref())
+            }
+            ImageCmd::Load { input, tag } => {
+                cli::image::cmd_image_load(input.as_deref(), tag.as_deref())
+            }
         },
 
         // Network

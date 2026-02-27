@@ -512,3 +512,424 @@ pub(crate) fn parse_image_config(
         labels,
     })
 }
+
+// ---------------------------------------------------------------------------
+// image save
+// ---------------------------------------------------------------------------
+
+/// Save a locally stored image to an OCI Image Layout tar archive.
+///
+/// Output goes to `output` (a file path) or stdout if `None`.
+pub fn cmd_image_save(
+    reference: &str,
+    output: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve reference the same way rm/push does: local form first.
+    let src_ref = resolve_local_reference(reference);
+    let manifest =
+        load_image(&src_ref).map_err(|_| format!("image '{}' not found locally", src_ref))?;
+
+    let config_json = image::load_oci_config(&src_ref).map_err(|_| {
+        format!(
+            "OCI config not found for '{}' — re-pull or rebuild to populate the blob cache",
+            src_ref
+        )
+    })?;
+    let config_bytes = config_json.into_bytes();
+
+    // Collect layer blobs.
+    let mut layer_blobs: Vec<(String, Vec<u8>)> = Vec::new();
+    for digest in &manifest.layers {
+        if !blob_exists(digest) {
+            return Err(format!(
+                "blob not found for layer {} — re-pull or rebuild to populate the blob cache",
+                &digest[..19.min(digest.len())]
+            )
+            .into());
+        }
+        layer_blobs.push((digest.clone(), image::load_blob(digest)?));
+    }
+
+    let tar_bytes = build_oci_tar(&src_ref, &config_bytes, &layer_blobs)?;
+
+    if let Some(path) = output {
+        std::fs::write(path, &tar_bytes).map_err(|e| format!("cannot write '{}': {}", path, e))?;
+        println!(
+            "Saved {} ({} layers) → {}",
+            src_ref,
+            layer_blobs.len(),
+            path
+        );
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&tar_bytes)?;
+    }
+
+    Ok(())
+}
+
+/// Build an in-memory OCI Image Layout tar archive from raw bytes.
+///
+/// `layer_blobs` is `(digest, compressed_bytes)` ordered bottom-to-top.
+/// Returns the raw tar bytes.
+pub(crate) fn build_oci_tar(
+    reference: &str,
+    config_bytes: &[u8],
+    layer_blobs: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use sha2::{Digest as _, Sha256};
+
+    let config_digest = format!("sha256:{:x}", Sha256::digest(config_bytes));
+    let config_hex = config_digest.strip_prefix("sha256:").unwrap();
+
+    // Build OCI manifest JSON.
+    let layer_descriptors: Vec<serde_json::Value> = layer_blobs
+        .iter()
+        .map(|(digest, data)| {
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": digest,
+                "size": data.len()
+            })
+        })
+        .collect();
+
+    let oci_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config_bytes.len()
+        },
+        "layers": layer_descriptors
+    });
+    let manifest_bytes = serde_json::to_vec(&oci_manifest)?;
+    let manifest_digest = format!("sha256:{:x}", Sha256::digest(&manifest_bytes));
+    let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+
+    // Build index.json.
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": manifest_digest,
+            "size": manifest_bytes.len(),
+            "annotations": {
+                "org.opencontainers.image.ref.name": reference
+            }
+        }]
+    });
+    let index_bytes = serde_json::to_vec(&index)?;
+    let oci_layout_bytes = br#"{"imageLayoutVersion":"1.0.0"}"#;
+
+    // Write all entries into an in-memory tar.
+    let mut tar_buf: Vec<u8> = Vec::new();
+    {
+        let mut ar = tar::Builder::new(&mut tar_buf);
+
+        let add =
+            |ar: &mut tar::Builder<&mut Vec<u8>>, path: &str, data: &[u8]| -> std::io::Result<()> {
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_path(path)?;
+                hdr.set_size(data.len() as u64);
+                hdr.set_mode(0o644);
+                hdr.set_cksum();
+                ar.append(&hdr, data)
+            };
+
+        add(&mut ar, "oci-layout", oci_layout_bytes)?;
+        add(&mut ar, "index.json", &index_bytes)?;
+        add(
+            &mut ar,
+            &format!("blobs/sha256/{}", manifest_hex),
+            &manifest_bytes,
+        )?;
+        add(
+            &mut ar,
+            &format!("blobs/sha256/{}", config_hex),
+            config_bytes,
+        )?;
+        for (digest, data) in layer_blobs {
+            let hex = digest.strip_prefix("sha256:").unwrap_or(digest.as_str());
+            add(&mut ar, &format!("blobs/sha256/{}", hex), data)?;
+        }
+        ar.finish()?;
+    }
+
+    Ok(tar_buf)
+}
+
+// ---------------------------------------------------------------------------
+// image load
+// ---------------------------------------------------------------------------
+
+/// Load an image from an OCI Image Layout tar archive.
+///
+/// Input comes from `input` (a file path) or stdin if `None`.
+/// If `tag` is supplied it overrides the reference stored in the archive.
+pub fn cmd_image_load(
+    input: Option<&str>,
+    tag: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+    use std::io::Read as _;
+
+    // Read the entire tar into memory so we can do random-access by path.
+    let tar_bytes: Vec<u8> = if let Some(path) = input {
+        std::fs::read(path).map_err(|e| format!("cannot read '{}': {}", path, e))?
+    } else {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    };
+
+    // Extract all entries into a path → bytes map.
+    let mut entries: HashMap<String, Vec<u8>> = HashMap::new();
+    {
+        let cursor = std::io::Cursor::new(&tar_bytes);
+        let mut ar = tar::Archive::new(cursor);
+        for entry in ar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_string_lossy().into_owned();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            entries.insert(path, data);
+        }
+    }
+
+    // Verify oci-layout.
+    let layout_data = entries
+        .get("oci-layout")
+        .ok_or("missing 'oci-layout' — not a valid OCI Image Layout archive")?;
+    let layout: serde_json::Value = serde_json::from_slice(layout_data)?;
+    if layout.get("imageLayoutVersion").and_then(|v| v.as_str()) != Some("1.0.0") {
+        return Err("unsupported OCI image layout version".into());
+    }
+
+    // Parse index.json.
+    let index_data = entries
+        .get("index.json")
+        .ok_or("missing 'index.json' in archive")?;
+    let index: serde_json::Value = serde_json::from_slice(index_data)?;
+    let manifests = index
+        .get("manifests")
+        .and_then(|v| v.as_array())
+        .ok_or("index.json: missing 'manifests' array")?;
+    if manifests.is_empty() {
+        return Err("index.json: empty manifests array".into());
+    }
+
+    // Load each image described in the index.
+    for manifest_desc in manifests {
+        let manifest_digest = manifest_desc
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or("manifest descriptor missing 'digest'")?;
+        let ref_annotation = manifest_desc
+            .pointer("/annotations/org.opencontainers.image.ref.name")
+            .and_then(|v| v.as_str());
+
+        let manifest_hex = manifest_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(manifest_digest);
+        let manifest_key = format!("blobs/sha256/{}", manifest_hex);
+        let manifest_data = entries
+            .get(&manifest_key)
+            .ok_or_else(|| format!("missing blob: {}", manifest_key))?;
+        let oci_manifest: serde_json::Value = serde_json::from_slice(manifest_data)?;
+
+        // Config blob.
+        let config_desc = oci_manifest
+            .get("config")
+            .ok_or("manifest: missing 'config'")?;
+        let config_digest = config_desc
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or("config descriptor: missing 'digest'")?;
+        let config_hex = config_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(config_digest);
+        let config_key = format!("blobs/sha256/{}", config_hex);
+        let config_data = entries
+            .get(&config_key)
+            .ok_or_else(|| format!("missing blob: {}", config_key))?;
+        let config_json =
+            std::str::from_utf8(config_data).map_err(|_| "config blob is not valid UTF-8")?;
+
+        // Layer blobs.
+        let layer_descs = oci_manifest
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .ok_or("manifest: missing 'layers' array")?;
+
+        let mut layer_digests: Vec<String> = Vec::new();
+        for (i, layer_desc) in layer_descs.iter().enumerate() {
+            let layer_digest = layer_desc
+                .get("digest")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("layer {}: missing 'digest'", i))?;
+            let layer_hex = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
+            let layer_key = format!("blobs/sha256/{}", layer_hex);
+            let layer_data = entries
+                .get(&layer_key)
+                .ok_or_else(|| format!("missing blob: {}", layer_key))?;
+
+            if !blob_exists(layer_digest) {
+                image::save_blob(layer_digest, layer_data)?;
+            }
+            if !layer_exists(layer_digest) {
+                let mut tmp = tempfile::NamedTempFile::new()?;
+                tmp.write_all(layer_data)?;
+                tmp.flush()?;
+                extract_layer(layer_digest, tmp.path())?;
+            }
+            layer_digests.push(layer_digest.to_string());
+        }
+
+        // Determine reference.
+        let reference = if let Some(t) = tag {
+            t.to_string()
+        } else if let Some(r) = ref_annotation {
+            r.to_string()
+        } else {
+            manifest_digest.to_string()
+        };
+
+        let config = parse_image_config(config_json)?;
+        image::save_oci_config(&reference, config_json)?;
+        let img_manifest = ImageManifest {
+            reference: reference.clone(),
+            digest: manifest_digest.to_string(),
+            layers: layer_digests,
+            config,
+        };
+        save_image(&img_manifest)?;
+        println!("Loaded {}", reference);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that `build_oci_tar` produces a valid OCI Image Layout tar.
+    ///
+    /// Calls the pure helper directly (no disk I/O, no root required) and asserts:
+    ///   - `oci-layout` is present with imageLayoutVersion = "1.0.0"
+    ///   - `index.json` contains the expected reference annotation
+    ///   - `blobs/sha256/<hex>` entries exist for config, each layer, and manifest
+    ///   - manifest JSON references the correct config and layer digests
+    #[test]
+    fn test_build_oci_tar() {
+        use sha2::{Digest as _, Sha256};
+        use std::collections::HashMap;
+        use std::io::Read as _;
+
+        let reference = "test-save:latest";
+
+        // Fake config JSON.
+        let config_bytes =
+            br#"{"config":{"Env":["PATH=/usr/bin"],"Cmd":["/bin/sh"]},"rootfs":{"type":"layers","diff_ids":[]}}"#;
+        let config_digest = format!("sha256:{:x}", Sha256::digest(config_bytes.as_ref()));
+
+        // Two fake layer blobs.
+        let layer1_bytes: Vec<u8> = vec![0u8, 1, 2, 3];
+        let layer1_digest = format!("sha256:{:x}", Sha256::digest(&layer1_bytes));
+        let layer2_bytes: Vec<u8> = vec![4u8, 5, 6, 7];
+        let layer2_digest = format!("sha256:{:x}", Sha256::digest(&layer2_bytes));
+
+        let layer_blobs = vec![
+            (layer1_digest.clone(), layer1_bytes.clone()),
+            (layer2_digest.clone(), layer2_bytes.clone()),
+        ];
+
+        let tar_bytes =
+            build_oci_tar(reference, config_bytes.as_ref(), &layer_blobs).expect("build_oci_tar");
+
+        // Extract into a map.
+        let cursor = std::io::Cursor::new(&tar_bytes);
+        let mut ar = tar::Archive::new(cursor);
+        let mut found: HashMap<String, Vec<u8>> = HashMap::new();
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            found.insert(path, data);
+        }
+
+        // oci-layout
+        let layout: serde_json::Value =
+            serde_json::from_slice(found.get("oci-layout").expect("oci-layout")).unwrap();
+        assert_eq!(layout["imageLayoutVersion"].as_str().unwrap(), "1.0.0");
+
+        // index.json reference annotation
+        let index: serde_json::Value =
+            serde_json::from_slice(found.get("index.json").expect("index.json")).unwrap();
+        let ref_name = index
+            .pointer("/manifests/0/annotations/org.opencontainers.image.ref.name")
+            .and_then(|v| v.as_str())
+            .expect("ref.name annotation");
+        assert_eq!(ref_name, reference);
+
+        // Config blob
+        let config_hex = config_digest.strip_prefix("sha256:").unwrap();
+        assert!(
+            found.contains_key(&format!("blobs/sha256/{}", config_hex)),
+            "config blob missing"
+        );
+
+        // Layer blobs
+        for (digest, _) in &layer_blobs {
+            let hex = digest.strip_prefix("sha256:").unwrap();
+            assert!(
+                found.contains_key(&format!("blobs/sha256/{}", hex)),
+                "layer blob {} missing",
+                hex
+            );
+        }
+
+        // Manifest blob
+        let manifest_digest = index
+            .pointer("/manifests/0/digest")
+            .and_then(|v| v.as_str())
+            .expect("manifest digest in index.json");
+        let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap();
+        assert!(
+            found.contains_key(&format!("blobs/sha256/{}", manifest_hex)),
+            "manifest blob missing"
+        );
+
+        // Manifest content references correct config and both layers
+        let manifest: serde_json::Value = serde_json::from_slice(
+            found
+                .get(&format!("blobs/sha256/{}", manifest_hex))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.pointer("/config/digest").and_then(|v| v.as_str()),
+            Some(config_digest.as_str())
+        );
+        assert_eq!(
+            manifest
+                .pointer("/layers/0/digest")
+                .and_then(|v| v.as_str()),
+            Some(layer1_digest.as_str())
+        );
+        assert_eq!(
+            manifest
+                .pointer("/layers/1/digest")
+                .and_then(|v| v.as_str()),
+            Some(layer2_digest.as_str())
+        );
+    }
+}

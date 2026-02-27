@@ -1831,3 +1831,24 @@ Failure at step 1 means the registry isn't actually enforcing auth (test
 environment problem). Failure at steps 2–3 means credential resolution or
 the `~/.docker/config.json` read/write path is broken. Failure at step 4
 means `logout` didn't remove the entry and the credential cache is leaking.
+
+### `image_save_load::test_image_save_load_roundtrip` (`#[ignore]`)
+**Requires:** root, network (Docker Hub for `alpine`), overlay support
+
+Full save/load roundtrip test:
+
+1. **Pull** `docker.io/library/alpine:latest` from Docker Hub.
+2. **Save** it to `/tmp/remora-test-alpine-save.tar` via `remora image save`.
+   Verifies the output file exists and contains an `oci-layout` tar entry
+   (i.e., it is a valid OCI Image Layout archive).
+3. **Remove** the local image with `remora image rm`.
+4. **Load** back from the tar via `remora image load -i <tar>`.
+   Verifies the command prints `"Loaded"`.
+5. **Verify** the image appears in `remora image ls`.
+6. **Run** `/bin/true` inside the loaded image to confirm it is fully usable.
+
+Failure at step 2 means `save` failed to find blobs (re-pull needed to
+populate the blob cache, or a regression in blob store write paths).
+Failure at step 4 means `load` failed to extract layers or write the manifest.
+Failure at step 6 means the overlay mount for the loaded image is broken —
+layers are present in the store but the image config or layer order is wrong.

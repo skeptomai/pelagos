@@ -1,5 +1,159 @@
 # Ongoing Tasks
 
+## Last completed: image save / load (2026-02-27)
+
+### Context
+
+`remora image save` and `remora image load` export/import locally stored images
+as OCI Image Layout tar archives.  The blob store (populated by `image pull` and
+`remora build`) provides all the raw data; the commands just need to package/
+unpackage it into the standard layout.
+
+The format is OCI Image Layout (identical to `docker save` / `docker load`):
+
+```
+oci-layout                        # {"imageLayoutVersion":"1.0.0"}
+index.json                        # OCI image index pointing at the manifest blob
+blobs/sha256/<hex>                # manifest blob
+blobs/sha256/<hex>                # config blob
+blobs/sha256/<hex>                # layer blob (tar.gz) — one per layer
+```
+
+This makes archives interoperable with Docker, Podman, skopeo, crane, etc.
+
+---
+
+### API design
+
+**`remora image save <reference> [-o <file.tar>]`**
+
+```
+1. load_image(reference)         → ImageManifest
+2. load_oci_config(reference)    → config JSON bytes
+3. compute sha256(config_json)   → config digest
+4. for each layer digest in manifest.layers:
+     load_blob(digest)           → layer bytes  (error if missing)
+5. build OCI manifest JSON:
+     { schemaVersion: 2,
+       mediaType: "application/vnd.oci.image.manifest.v1+json",
+       config: { mediaType: "...", digest: "sha256:<hex>", size: N },
+       layers: [ { mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+                   digest: "sha256:<hex>", size: N }, ... ] }
+6. compute sha256(manifest_json) → manifest digest
+7. build index.json:
+     { schemaVersion: 2,
+       manifests: [ { mediaType: "...", digest: "sha256:<hex>", size: N,
+                      annotations: { "org.opencontainers.image.ref.name": reference } } ] }
+8. write tar to -o file (or stdout if omitted):
+     oci-layout
+     index.json
+     blobs/sha256/<config-hex>
+     blobs/sha256/<layer-hex>   (one entry per layer)
+     blobs/sha256/<manifest-hex>
+```
+
+**`remora image load [-i <file.tar>] [--tag <reference>]`**
+
+```
+1. open tar from -i file (or stdin)
+2. find and parse oci-layout  → verify imageLayoutVersion == "1.0.0"
+3. find and parse index.json  → get manifest descriptor
+4. read blobs/sha256/<manifest-hex> → parse OCI manifest
+5. read blobs/sha256/<config-hex>   → config JSON bytes
+6. for each layer descriptor in manifest.layers:
+     read blobs/sha256/<layer-hex>  → blob bytes
+     save_blob(digest, &bytes)      → blob store
+     extract_layer(digest, blob_path) → layer dir
+7. parse config JSON → ImageConfig
+8. reference = --tag if supplied, else annotation "org.opencontainers.image.ref.name",
+               else manifest digest (sha256:<hex>)
+9. save_oci_config(reference, config_json)
+10. save_image(ImageManifest { reference, digest: manifest_digest, layers, config })
+11. println!("Loaded {reference}")
+```
+
+---
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `src/cli/image.rs` | Add `cmd_image_save()`, `cmd_image_load()` |
+| `src/main.rs` | Add `ImageCmd::Save`, `ImageCmd::Load`; wire dispatch |
+| `docs/FEATURE_GAPS.md` | Mark image save/load as COMPLETE |
+| `docs/INTEGRATION_TESTS.md` | Add entries for new tests |
+| `tests/integration_tests.rs` | Add `test_image_save_load_roundtrip` |
+| `ONGOING_TASKS.md` | This file |
+
+No new dependencies needed: `tar` and `sha2`/inline sha256 are already present
+(we use sha256 inline in `auth.rs`; `flate2` and `tar` crates already in deps).
+
+Wait — check Cargo.toml: we have `flate2` and `tar` as deps, but no `sha2`.
+The inline sha256 in auth.rs is for base64 only.  We need sha256 for blob
+digests.  Options:
+- Add `sha2` crate (clean, idiomatic)
+- Use `std::process::Command` to call `sha256sum` (hacky)
+- Reuse the sha256 already computed by the blobs (digests are already stored!)
+
+**Decision:** for `save`, the layer digests are already known (stored in
+`manifest.layers`); for the config blob digest we compute sha256 over the
+config bytes.  We already depend on nothing for sha256 — but `build.rs` uses
+the `sha2` + `hex` crates or computes via `flate2` piping.  Check Cargo.toml.
+
+If `sha2` is already a dep (transitively used by `oci-client`), we can use it
+directly.  Otherwise add it explicitly.
+
+---
+
+### Tests
+
+**Unit (no root, no network):**
+- `test_save_produces_oci_layout` — build a minimal fake ImageManifest + fake
+  blob bytes in a tempdir, call the save logic, extract the tar, verify:
+  - `oci-layout` present and valid JSON
+  - `index.json` contains one manifest entry with correct ref annotation
+  - `blobs/sha256/<hex>` present for config + each layer + manifest
+  - manifest JSON references correct config and layer digests
+
+**Integration (`#[ignore]`, requires root):**
+- `test_image_save_load_roundtrip`:
+  1. `remora image pull alpine:latest` (or use already-pulled image)
+  2. `remora image save alpine:latest -o /tmp/alpine-test.tar`
+  3. `remora image rm alpine:latest`
+  4. `remora image load -i /tmp/alpine-test.tar`
+  5. `remora run alpine:latest /bin/true` — must succeed
+  - Asserts: exit code 0, image re-appears in `image ls`
+
+---
+
+### Verification
+
+1. `cargo test --lib` — all existing + new unit tests pass
+2. `cargo clippy -- -D warnings` + `cargo fmt --check`
+3. Please run: `sudo -E cargo test --test integration_tests image_save -- --ignored --nocapture`
+4. Manual: `remora image save alpine:latest | gzip -d | tar -tv` — inspect layout
+5. Manual: `docker load < alpine-remora.tar` — Docker should accept the archive
+
+### Verification done
+- `cargo build` — clean
+- `cargo clippy -- -D warnings` — clean
+- `cargo fmt` — clean
+- `cargo test --lib` — 254 tests pass
+- `cargo test --bin remora -- cli::image::tests::test_build_oci_tar` — passes
+- `cargo test --test integration_tests --no-run` — compiles clean
+- Please run: `sudo -E cargo test --test integration_tests image_save_load -- --ignored --nocapture`
+
+### Next suggested task
+
+**Credential helper support** (`credHelpers`, `credsStore`) — delegate auth to
+`docker-credential-ecr-login`, OS keychain, etc., so ECR/GCR users don't have
+to pass `--password` or call `image login` with a short-lived token.
+
+Or: **`remora image tag`** — assign a new local reference to an existing image
+without pulling.
+
+---
+
 ## Last completed: Registry Auth + Image Push (2026-02-27)
 
 ### What was done
@@ -100,12 +254,3 @@ fallback → logout → post-logout-pull-fails
 **`.gitignore`** — added `scripts/e2e-creds.env`
 
 ---
-
-## Next suggested task
-
-**`remora image save` / `remora image load`** — export/import images as tar archives
-(see `docs/FEATURE_GAPS.md`).  Prerequisite: the blob store is now populated, so
-save/load can use the same blobs.
-
-Or: **credential helper support** (`credHelpers`, `credsStore`) for ECR/GCR/keychain
-auth without typing passwords.
