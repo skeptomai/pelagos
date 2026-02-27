@@ -1335,6 +1335,16 @@ fn do_container_start_inner(
         .map(|n| scoped_network_name(project, n))
         .collect();
 
+    // Ensure each network exists — create on demand, same as volumes.
+    for net_name in &svc_network_names {
+        crate::network::ensure_network(net_name).map_err(|e| {
+            LispError::new(format!(
+                "container-start: failed to ensure network '{}': {}",
+                net_name, e
+            ))
+        })?;
+    }
+
     if let Some(primary) = svc_network_names.first() {
         cmd = cmd.with_network(NetworkMode::BridgeNamed(primary.clone()));
     }

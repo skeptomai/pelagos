@@ -244,6 +244,66 @@ pub fn load_network_def(name: &str) -> io::Result<NetworkDef> {
     }
 }
 
+/// Ensure a named network exists, creating it if necessary.
+///
+/// If the network config already exists, returns immediately.  Otherwise tries
+/// subnets in `10.99.0.0/24 … 10.99.255.0/24` until a non-overlapping one is
+/// found, then creates and persists the `NetworkDef`.
+///
+/// Used by the Lisp runtime to auto-create networks referenced in service specs,
+/// mirroring what `compose up` does for the declarative compose path.
+pub fn ensure_network(name: &str) -> io::Result<()> {
+    let config = crate::paths::network_config_dir(name).join("config.json");
+    if config.exists() {
+        return Ok(());
+    }
+
+    // Collect subnets already in use.
+    let networks_dir = crate::paths::networks_config_dir();
+    let mut used: Vec<Ipv4Net> = Vec::new();
+    if networks_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&networks_dir) {
+            for entry in entries.flatten() {
+                let cfg = entry.path().join("config.json");
+                if let Ok(data) = std::fs::read_to_string(&cfg) {
+                    if let Ok(existing) = serde_json::from_str::<NetworkDef>(&data) {
+                        used.push(existing.subnet);
+                    }
+                }
+            }
+        }
+    }
+
+    // Find the first non-overlapping /24 in 10.99.x.0.
+    for octet in 0u8..=255 {
+        let cidr = format!("10.99.{}.0/24", octet);
+        let subnet = Ipv4Net::from_cidr(&cidr)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        if used.iter().any(|u| u.overlaps(&subnet)) {
+            continue;
+        }
+        let bridge_name = if name == "remora0" {
+            "remora0".to_string()
+        } else {
+            format!("rm-{}", name)
+        };
+        let net = NetworkDef {
+            name: name.to_string(),
+            gateway: subnet.gateway(),
+            bridge_name,
+            subnet,
+        };
+        net.save()?;
+        log::info!("ensure_network: created '{}' ({})", name, cidr);
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "ensure_network: all subnets in 10.99.x.0/24 exhausted for '{}'",
+        name
+    )))
+}
+
 // Legacy constants — kept for reference but internal code now uses NetworkDef.
 /// Bridge name for the default network.
 pub const BRIDGE_NAME: &str = "remora0";
