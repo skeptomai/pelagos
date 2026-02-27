@@ -2807,60 +2807,6 @@ impl Command {
                     }
                 }
 
-                // Step 4.75: Drop capabilities if specified
-                if let Some(keep_caps) = capabilities {
-                    // Two-step capability drop (mirrors Docker / runc):
-                    //
-                    // 1. PR_CAPBSET_DROP — remove unwanted caps from the
-                    //    bounding set so exec() cannot re-grant them.
-                    // 2. capset() — explicitly set the effective, permitted,
-                    //    and inheritable kernel sets to the desired mask.
-                    //    Without this step, CapEff/CapPrm remain at their
-                    //    current values (full root caps) regardless of what
-                    //    the bounding set says.
-                    const PR_CAPBSET_DROP: i32 = 24;
-                    for cap in 0..38u64 {
-                        let cap_bit = 1u64 << cap;
-                        if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
-                            let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
-                            if result != 0 {
-                                let err = io::Error::last_os_error();
-                                if err.raw_os_error() != Some(libc::EINVAL) {
-                                    return Err(err);
-                                }
-                            }
-                        }
-                    }
-
-                    // capset() — zero (or restrict) the effective, permitted,
-                    // and inheritable sets to exactly keep_caps.
-                    // The v3 header (0x20080522) supports 64-bit cap sets via
-                    // two consecutive cap_user_data structs (lo/hi).
-                    let bits = keep_caps.bits();
-                    let lo = bits as u32;
-                    let hi = (bits >> 32) as u32;
-
-                    #[repr(C)]
-                    struct CapHeader { version: u32, pid: i32 }
-                    #[repr(C)]
-                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
-
-                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
-                    let data = [
-                        CapData { effective: lo, permitted: lo, inheritable: lo },
-                        CapData { effective: hi, permitted: hi, inheritable: hi },
-                    ];
-
-                    let ret = libc::syscall(
-                        libc::SYS_capset,
-                        &header as *const CapHeader,
-                        data.as_ptr(),
-                    );
-                    if ret != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-
                 // Step 4.8: Mask sensitive paths
                 if !masked_paths.is_empty() {
                     let dev_null = CString::new("/dev/null").unwrap();
@@ -2929,6 +2875,58 @@ impl Command {
                         ptr::null(), // data: NULL
                     );
                     if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Step 4.86: Drop capabilities.
+                //
+                // MUST come after all mount operations (masked paths, readonly
+                // paths, readonly rootfs) because those require CAP_SYS_ADMIN.
+                // Two-step drop (mirrors Docker / runc):
+                //
+                // 1. PR_CAPBSET_DROP — remove unwanted caps from the bounding
+                //    set so exec() cannot re-grant them.
+                // 2. capset() — explicitly set the effective, permitted, and
+                //    inheritable kernel sets to the desired mask.  Without this
+                //    step, CapEff/CapPrm remain at their current values (full
+                //    root caps) regardless of what the bounding set says.
+                if let Some(keep_caps) = capabilities {
+                    const PR_CAPBSET_DROP: i32 = 24;
+                    for cap in 0..38u64 {
+                        let cap_bit = 1u64 << cap;
+                        if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
+                            let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+                            if result != 0 {
+                                let err = io::Error::last_os_error();
+                                if err.raw_os_error() != Some(libc::EINVAL) {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+
+                    let bits = keep_caps.bits();
+                    let lo = bits as u32;
+                    let hi = (bits >> 32) as u32;
+
+                    #[repr(C)]
+                    struct CapHeader { version: u32, pid: i32 }
+                    #[repr(C)]
+                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
+
+                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
+                    let data = [
+                        CapData { effective: lo, permitted: lo, inheritable: lo },
+                        CapData { effective: hi, permitted: hi, inheritable: hi },
+                    ];
+
+                    let ret = libc::syscall(
+                        libc::SYS_capset,
+                        &header as *const CapHeader,
+                        data.as_ptr(),
+                    );
+                    if ret != 0 {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -4261,46 +4259,6 @@ impl Command {
                     }
                 }
 
-                if let Some(keep_caps) = capabilities {
-                    const PR_CAPBSET_DROP: i32 = 24;
-                    for cap in 0..38u64 {
-                        let cap_bit = 1u64 << cap;
-                        if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
-                            let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
-                            if result != 0 {
-                                let err = io::Error::last_os_error();
-                                if err.raw_os_error() != Some(libc::EINVAL) {
-                                    return Err(err);
-                                }
-                            }
-                        }
-                    }
-
-                    let bits = keep_caps.bits();
-                    let lo = bits as u32;
-                    let hi = (bits >> 32) as u32;
-
-                    #[repr(C)]
-                    struct CapHeader { version: u32, pid: i32 }
-                    #[repr(C)]
-                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
-
-                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
-                    let data = [
-                        CapData { effective: lo, permitted: lo, inheritable: lo },
-                        CapData { effective: hi, permitted: hi, inheritable: hi },
-                    ];
-
-                    let ret = libc::syscall(
-                        libc::SYS_capset,
-                        &header as *const CapHeader,
-                        data.as_ptr(),
-                    );
-                    if ret != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-
                 if !masked_paths.is_empty() {
                     let dev_null = CString::new("/dev/null").unwrap();
                     for path in &masked_paths {
@@ -4354,6 +4312,48 @@ impl Command {
                         ptr::null(),
                     );
                     if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // Drop capabilities after all mount operations.
+                // Same logic as step 4.86 in the chroot path.
+                if let Some(keep_caps) = capabilities {
+                    const PR_CAPBSET_DROP: i32 = 24;
+                    for cap in 0..38u64 {
+                        let cap_bit = 1u64 << cap;
+                        if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
+                            let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+                            if result != 0 {
+                                let err = io::Error::last_os_error();
+                                if err.raw_os_error() != Some(libc::EINVAL) {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
+
+                    let bits = keep_caps.bits();
+                    let lo = bits as u32;
+                    let hi = (bits >> 32) as u32;
+
+                    #[repr(C)]
+                    struct CapHeader { version: u32, pid: i32 }
+                    #[repr(C)]
+                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
+
+                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
+                    let data = [
+                        CapData { effective: lo, permitted: lo, inheritable: lo },
+                        CapData { effective: hi, permitted: hi, inheritable: hi },
+                    ];
+
+                    let ret = libc::syscall(
+                        libc::SYS_capset,
+                        &header as *const CapHeader,
+                        data.as_ptr(),
+                    );
+                    if ret != 0 {
                         return Err(io::Error::last_os_error());
                     }
                 }
