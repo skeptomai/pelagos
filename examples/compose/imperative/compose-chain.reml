@@ -12,7 +12,7 @@
 ;;;   compose-chain.reml — dynamic: each (then ...) lambda returns the
 ;;;                        *next* node; the graph unfolds as execution
 ;;;                        proceeds.  No upfront graph declaration needed.
-;;;                        resolve does not populate deps → teardown is manual.
+;;;                        resolve does not populate deps → no cascade teardown.
 ;;;
 ;;; When to use each:
 ;;;
@@ -24,9 +24,30 @@
 ;;;             produced by the previous step, and the next node cannot
 ;;;             be described until that value is known.
 ;;;
+;;; Cleanup in the chain model:
+;;;
+;;;   The chain model deliberately hides intermediate ContainerHandles —
+;;;   the lambda receives a handle only for its immediate upstream, and
+;;;   only while it runs.  After resolve returns, those handles are gone.
+;;;
+;;;   Two mechanisms cover cleanup:
+;;;
+;;;     1. Interpreter Drop (implicit): when the Interpreter goes out of
+;;;        scope — whether the script completes normally or exits via error —
+;;;        it sends SIGTERM to every container still in the registry.  This
+;;;        is the safety net that makes the chain model safe to use.
+;;;
+;;;     2. with-cleanup (explicit, this file): fires on both normal exit
+;;;        and error; handles logging and any teardown that *does* need
+;;;        an explicit handle (here: none, because all containers are
+;;;        covered by the implicit registry cleanup).
+;;;
+;;;   Contrast with compose.reml, where run populates ContainerHandle.deps
+;;;   and container-wait cascades teardown explicitly in reverse topo order.
+;;;
 ;;; Dependency graph:
 ;;;
-;;;   db ──→ db-url ──→ migrate ──→ app
+;;;   db ──→ (then: compute db-url) ──→ migrate ──→ (then: start app) ──→ app
 ;;;
 ;;; Usage:
 ;;;   sudo -E remora compose up -f compose-chain.reml -p chain-demo
@@ -52,38 +73,36 @@
   :command "/bin/sh" "-c"
            "echo \"db=${DATABASE_URL}\"; sleep 30; echo done")
 
-;; ── Start db eagerly — needed for cleanup and url computation ─────────────
-;;
-;; The chain model doesn't expose intermediate handles to the top-level
-;; scope, so db must be started eagerly if we need its handle in with-cleanup.
-
-(define db (container-start svc-db))
-(define db-url (format "postgres://app:secret@~a/appdb" (container-ip db)))
-(logf "db at ~a" (container-ip db))
-
 ;; ── Declare the chain — nothing executes yet ─────────────────────────────
 ;;
-;; When (resolve ...) is called it walks the chain:
+;; When (resolve ...) is called it walks upstream recursively:
 ;;
-;;   1. resolve (start svc-migrate :env ...)  → ContainerHandle
-;;   2. lambda: wait for migrate, then return (start svc-app :env ...)
-;;   3. monadic flatten: resolve (start svc-app ...)  → ContainerHandle
+;;   1. resolve db              → ContainerHandle
+;;   2. then: compute db-url    → "postgres://app:secret@<ip>/appdb"
+;;   3. resolve migrate         → ContainerHandle  (:env wires DATABASE_URL)
+;;   4. lambda returns app node → another node! resolve flattens it
+;;   5. resolve app             → ContainerHandle  (:env wires DATABASE_URL)
 ;;
-;; Step 3 is the monadic flatten: the lambda returns a *new node* rather
+;; Step 4 is the monadic flatten: the lambda returns a *new node* rather
 ;; than a plain value.  resolve detects this and executes it automatically,
 ;; so the whole pipeline is a single (resolve pipeline) call.
-;;
-;; The :env lambdas take zero args — db-url is already in scope from above.
+
+(define db (start svc-db))
 
 (define pipeline
-  (then (start svc-migrate
-          :env (lambda () `(("DATABASE_URL" . ,db-url))))
-    (lambda (migrate-handle)
-      ;; Wait for migrations to complete before starting the app.
-      (container-wait migrate-handle)
-      ;; Returning a node here triggers the monadic flatten in resolve.
-      (start svc-app
-        :env (lambda () `(("DATABASE_URL" . ,db-url)))))))
+  (then db
+    (lambda (db-handle)
+      (let ((db-url (format "postgres://app:secret@~a/appdb" (container-ip db-handle))))
+        ;; Start migrate, injecting the db-url we just computed.
+        (then (start svc-migrate
+                :needs (list db)
+                :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))
+          (lambda (_migrate)
+            ;; migrate finished — now start app with the same db-url.
+            ;; Returning a node here triggers the monadic flatten in resolve.
+            (start svc-app
+              :needs (list db)
+              :env   (lambda (_) `(("DATABASE_URL" . ,db-url))))))))))
 
 ;; ── Execute: dynamic executor resolves the chain ──────────────────────────
 
@@ -92,12 +111,18 @@
 
 ;; ── Wait and clean up ─────────────────────────────────────────────────────
 ;;
-;; db was started eagerly above, so we have its ContainerHandle here.
-;; (contrast: compose.reml uses run, which populates deps and stops
-;; transitive containers automatically via cascade teardown.)
+;; resolve does not populate ContainerHandle.deps, so there is no cascade
+;; teardown here — we don't have handles to db or migrate at this scope.
+;;
+;; That's intentional: the chain model trades explicit handle access for a
+;; simpler declaration style.  Cleanup is handled implicitly: when the
+;; Interpreter drops at the end of this script (or on error), it sends
+;; SIGTERM to all containers still in the registry — db, migrate (if still
+;; running), and app — as a safety net.
+;;
+;; with-cleanup here handles logging only; no explicit container-stop needed.
 
 (with-cleanup (lambda (result)
-                (container-stop db)
                 (if (ok? result)
                   (logf "app exited cleanly (code ~a)" (ok-value result))
                   (logf "app failed: ~a" (err-reason result))))
