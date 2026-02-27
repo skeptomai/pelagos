@@ -28,7 +28,9 @@ first-class concerns — territory runc explicitly does not cover.
 |------------|-------|
 | Container runtime | Namespaces (UTS/Mount/IPC/Net/PID/Cgroup), seccomp-BPF, capabilities, no-new-privileges, masked paths |
 | Security-by-default | All four hardening defaults applied unconditionally to every container |
-| OCI image pull | Anonymous pulls from any OCI registry; content-addressable layer store |
+| OCI image pull | Authenticated pulls; `~/.docker/config.json`; env-var creds; content-addressable layer store |
+| OCI image push | `remora image push` — distributes built/pulled images; blob cache for roundtrip |
+| Registry login | `remora image login/logout` — writes `~/.docker/config.json` |
 | Image build | `remora build` — Remfile (Dockerfile-compatible), multi-stage, ARG, ADD (URLs + archives), build cache, `.remignore` |
 | Networking | Loopback, bridge, NAT, TCP port mapping, DNS service discovery, named networks, multi-network containers, pasta (rootless) |
 | Multi-service orchestration | `remora compose up/down/ps/logs` — Lisp DSL + futures graph executor |
@@ -46,23 +48,22 @@ first-class concerns — territory runc explicitly does not cover.
 
 ### Critical (blocks real-world use)
 
-#### Registry authentication
-**What's missing:** Pulling from private registries — ECR, GCR, Docker Hub
-private repos, any registry requiring a token or credentials.  We only support
-anonymous pulls today.
+#### ~~Registry authentication~~ ✅ COMPLETE
+`remora image login <registry>` writes credentials to `~/.docker/config.json`.
+`remora image pull --username <u> --password <p>` authenticates pulls.
+Auth resolution order: CLI flags → `REMORA_REGISTRY_USER`/`REMORA_REGISTRY_PASS`
+env vars → `~/.docker/config.json` → Anonymous.
 
-**What's needed:** Docker credential helper protocol, `~/.docker/config.json`
-parsing, OAuth2 token exchange for ECR/GCR, basic auth for self-hosted registries.
+Credential helpers (`credHelpers`, `credsStore`) are not yet supported.
+ECR users: `--password $(aws ecr get-login-password)`.
 
 ---
 
-#### Image push
-**What's missing:** `remora image push` — distributing images you've built.
-Without push, the build pipeline is local-only; you can't feed CI/CD or share
-images between hosts.
-
-**What's needed:** OCI distribution spec push (chunked upload, manifest PUT),
-auth integration (same as pull).
+#### ~~Image push~~ ✅ COMPLETE
+`remora image push <ref> [--dest <registry/repo:tag>]` distributes locally-stored
+images via the OCI Distribution Spec.  Blobs are cached during pull/build in
+`/var/lib/remora/blobs/`; the OCI config JSON is stored alongside `manifest.json`.
+Auth uses the same resolution order as pull.
 
 ---
 

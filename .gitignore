@@ -3,3 +3,4 @@ alpine-rootfs/**
 *.tar.gz
 test_syscalls
 *.o
+scripts/e2e-creds.env

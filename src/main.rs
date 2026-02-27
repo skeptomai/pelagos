@@ -260,6 +260,18 @@ pub(crate) enum ImageCmd {
     Pull {
         /// Image reference (e.g. alpine, alpine:3.19, docker.io/library/alpine:latest)
         reference: String,
+        /// Registry username
+        #[clap(long, short = 'u')]
+        username: Option<String>,
+        /// Registry password
+        #[clap(long)]
+        password: Option<String>,
+        /// Read password from stdin
+        #[clap(long)]
+        password_stdin: bool,
+        /// Allow insecure (HTTP) registries
+        #[clap(long)]
+        insecure: bool,
     },
     /// List locally stored images
     Ls {
@@ -271,6 +283,42 @@ pub(crate) enum ImageCmd {
     Rm {
         /// Image reference
         reference: String,
+    },
+    /// Push a locally stored image to an OCI registry
+    Push {
+        /// Image reference (local)
+        reference: String,
+        /// Push to a different destination (default: same reference)
+        #[clap(long)]
+        dest: Option<String>,
+        /// Registry username
+        #[clap(long, short = 'u')]
+        username: Option<String>,
+        /// Registry password
+        #[clap(long)]
+        password: Option<String>,
+        /// Read password from stdin
+        #[clap(long)]
+        password_stdin: bool,
+        /// Allow insecure (HTTP) registries
+        #[clap(long)]
+        insecure: bool,
+    },
+    /// Log in to an OCI registry (writes ~/.docker/config.json)
+    Login {
+        /// Registry hostname (e.g. ghcr.io, docker.io)
+        registry: String,
+        /// Registry username
+        #[clap(long, short = 'u')]
+        username: Option<String>,
+        /// Read password from stdin
+        #[clap(long)]
+        password_stdin: bool,
+    },
+    /// Log out of an OCI registry
+    Logout {
+        /// Registry hostname
+        registry: String,
     },
 }
 
@@ -346,9 +394,42 @@ fn main() {
 
         // Image
         CliCommand::Image { cmd } => match cmd {
-            ImageCmd::Pull { reference } => cli::image::cmd_image_pull(&reference),
+            ImageCmd::Pull {
+                reference,
+                username,
+                password,
+                password_stdin,
+                insecure,
+            } => cli::image::cmd_image_pull(
+                &reference,
+                username.as_deref(),
+                password.as_deref(),
+                password_stdin,
+                insecure,
+            ),
             ImageCmd::Ls { format } => cli::image::cmd_image_ls(format == OutputFormat::Json),
             ImageCmd::Rm { reference } => cli::image::cmd_image_rm(&reference),
+            ImageCmd::Push {
+                reference,
+                dest,
+                username,
+                password,
+                password_stdin,
+                insecure,
+            } => cli::image::cmd_image_push(
+                &reference,
+                dest.as_deref(),
+                username.as_deref(),
+                password.as_deref(),
+                password_stdin,
+                insecure,
+            ),
+            ImageCmd::Login {
+                registry,
+                username,
+                password_stdin,
+            } => cli::image::cmd_image_login(&registry, username.as_deref(), password_stdin),
+            ImageCmd::Logout { registry } => cli::image::cmd_image_logout(&registry),
         },
 
         // Network

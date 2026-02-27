@@ -7,7 +7,7 @@ use crate::container::{Command, Namespace, Stdio};
 use crate::image::{self, ImageConfig, ImageManifest};
 use crate::network::NetworkMode;
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -798,7 +798,49 @@ pub fn execute_build(
 
     image::save_image(&manifest)?;
 
+    // Generate and persist the OCI config JSON so `remora image push` can use it.
+    let oci_config_json = generate_oci_config_json(&manifest.config, &manifest.layers);
+    if let Err(e) = image::save_oci_config(&manifest.reference, &oci_config_json) {
+        log::warn!(
+            "failed to save OCI config JSON for '{}': {}",
+            manifest.reference,
+            e
+        );
+    }
+
     Ok(manifest)
+}
+
+/// Generate a minimal OCI image config JSON for a built image.
+///
+/// Uses the diff_id sidecar files saved by `create_layer_from_dir`.  Falls
+/// back to the compressed digest when the sidecar is absent (e.g. for layers
+/// pulled from a registry, where the OCI config JSON is already saved verbatim
+/// by `cmd_image_pull`).
+fn generate_oci_config_json(config: &ImageConfig, layer_digests: &[String]) -> String {
+    let diff_ids: Vec<String> = layer_digests
+        .iter()
+        .map(|d| image::load_blob_diffid(d).unwrap_or_else(|| d.clone()))
+        .collect();
+
+    serde_json::json!({
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "Env": config.env,
+            "Cmd": config.cmd,
+            "Entrypoint": config.entrypoint,
+            "WorkingDir": config.working_dir,
+            "User": config.user,
+            "Labels": config.labels,
+        },
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": diff_ids,
+        },
+        "history": []
+    })
+    .to_string()
 }
 
 /// Execute a RUN instruction: spawn a container, wait, capture upper layer.
@@ -1131,32 +1173,46 @@ fn execute_add_archive(
 pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
     use sha2::{Digest, Sha256};
 
-    // Create a tar.gz in memory to compute the digest.
+    // Build the raw (uncompressed) tar first so we can compute the diff_id
+    // (sha256 of the uncompressed tar stream, required for OCI config JSON).
     // We walk the tree manually instead of using `append_dir_all` because the
     // overlay upper dir may contain absolute symlinks that only resolve inside
     // the container rootfs — following them on the host would fail with ENOENT.
-    let mut tar_gz_bytes = Vec::new();
+    let mut raw_tar_bytes = Vec::new();
     {
-        let gz_encoder =
-            flate2::write::GzEncoder::new(&mut tar_gz_bytes, flate2::Compression::fast());
-        let mut tar_builder = tar::Builder::new(gz_encoder);
+        let mut tar_builder = tar::Builder::new(&mut raw_tar_bytes);
         tar_builder.follow_symlinks(false);
         append_dir_all_no_follow(&mut tar_builder, Path::new("."), source_dir)?;
-        let gz_encoder = tar_builder.into_inner()?;
-        gz_encoder.finish()?;
+        tar_builder.into_inner()?;
     }
+    let diff_id = format!("sha256:{:x}", Sha256::digest(&raw_tar_bytes));
 
-    let mut hasher = Sha256::new();
-    hasher.update(&tar_gz_bytes);
-    let hash = hasher.finalize();
-    let hex = format!("{:x}", hash);
+    // Compress to get the canonical tar.gz blob.
+    let mut tar_gz_bytes = Vec::new();
+    {
+        let mut gz = flate2::write::GzEncoder::new(&mut tar_gz_bytes, flate2::Compression::fast());
+        gz.write_all(&raw_tar_bytes)?;
+        gz.finish()?;
+    }
+    drop(raw_tar_bytes); // free memory early
+
+    let hex = format!("{:x}", Sha256::digest(&tar_gz_bytes));
     let digest = format!("sha256:{}", hex);
 
     // Check if layer already exists (dedup).
     if image::layer_exists(&digest) {
         log::debug!("layer {} already exists, skipping", &hex[..12]);
+        // Still persist blob/diffid if they were missing (e.g. old layer store).
+        if !image::blob_exists(&digest) {
+            image::save_blob(&digest, &tar_gz_bytes)?;
+            image::save_blob_diffid(&digest, &diff_id)?;
+        }
         return Ok(digest);
     }
+
+    // Persist the raw blob for future `remora image push`.
+    image::save_blob(&digest, &tar_gz_bytes)?;
+    image::save_blob_diffid(&digest, &diff_id)?;
 
     // Copy directory contents to the layer store.
     let dest = image::layer_dir(&digest);

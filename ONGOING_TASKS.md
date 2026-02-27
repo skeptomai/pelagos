@@ -1,116 +1,111 @@
 # Ongoing Tasks
 
-## Current: (nothing pending — session wrap-up Feb 27, 2026)
+## Last completed: Registry Auth + Image Push (2026-02-27)
 
-See [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md) for the tracked delta between
-Remora and a full Docker Desktop / Finch equivalent.  Critical gaps (registry
-auth, image push) are the next natural targets.
+### What was done
 
-All work from this session has been committed and pushed.  See "Completed this
-session" below for the full list.
+Implemented full registry authentication and image push support:
+
+**`src/cli/auth.rs`** (new)
+- `resolve_auth(registry, username, password)` — resolution order: CLI flags →
+  `REMORA_REGISTRY_USER`/`REMORA_REGISTRY_PASS` env vars → `~/.docker/config.json` → Anonymous
+- `parse_docker_config(registry)` — reads and decodes `auths[registry].auth` (base64 `user:pass`)
+- `write_docker_config(registry, user, pass)` — `remora image login`
+- `remove_docker_config(registry)` — `remora image logout`
+- Inline pure-Rust base64 encoder/decoder (no new dep)
+- Unit tests: roundtrip, synthetic config.json, env var priority, CLI priority, anonymous fallback
+
+**`src/paths.rs`**
+- `blobs_dir()` — `<data>/blobs/`
+- `blob_path(digest)` — `<data>/blobs/<hex>.tar.gz`
+- `blob_diffid_path(digest)` — `<data>/blobs/<hex>.diffid`
+
+**`src/image.rs`**
+- `blob_exists()`, `save_blob()`, `load_blob()` — blob store CRUD
+- `save_blob_diffid()`, `load_blob_diffid()` — uncompressed-tar sha256 sidecar
+- `oci_config_path()`, `save_oci_config()`, `load_oci_config()` — raw OCI config JSON
+- `ensure_image_dirs()` now creates `blobs_dir()` too
+
+**`src/cli/image.rs`**
+- `cmd_image_pull` now accepts `--username`, `--password`, `--password-stdin`
+- `pull_image` persists raw blob bytes via `save_blob` + `save_oci_config`
+- `cmd_image_push` — loads blobs from store, builds `ImageLayer::oci_v1_gzip`, calls `client.push()`
+- `cmd_image_login` — prompts, writes `~/.docker/config.json`
+- `cmd_image_logout` — removes entry from `~/.docker/config.json`
+- `read_password_from_tty` — no-echo password input via `/dev/tty`
+
+**`src/build.rs`**
+- `create_layer_from_dir` now builds raw tar first → computes diff_id → compresses → saves blob + diffid sidecar
+- `execute_build` calls `generate_oci_config_json` after building, saves to `oci-config.json`
+- `generate_oci_config_json` — produces valid OCI config JSON with `diff_ids` from sidecars
+
+**`src/main.rs`**
+- `ImageCmd::Pull` — added `username`, `password`, `password_stdin` flags
+- `ImageCmd::Push` — new variant with `reference`, `dest`, `username`, `password`, `password_stdin`
+- `ImageCmd::Login` — new variant
+- `ImageCmd::Logout` — new variant
+
+**`src/cli/image.rs`** — `oci_client_config(registry, insecure)` helper
+- Auto-detects localhost / RFC-1918 / 172.16–31.x as insecure
+- Uses `ClientProtocol::HttpsExcept(vec![registry])` for plain-HTTP registries
+- `--insecure` flag added to `image pull` and `image push`
+
+**`docs/FEATURE_GAPS.md`** — marked registry auth + image push as COMPLETE
+
+**`docs/INTEGRATION_TESTS.md`** — documented new tests including the two
+registry auth integration tests
+
+**`tests/integration_tests.rs`** — `mod registry_auth` (two `#[ignore]` tests):
+- `test_local_registry_push_pull_roundtrip` — no-auth push/pull via `registry:2`
+- `test_local_registry_auth_roundtrip` — htpasswd auth enforcement: anon push
+  fails → login → push/pull succeed → logout → pull fails
+
+**`scripts/test-registry-auth-e2e.sh`** — shell E2E against a real registry
+(GHCR / Docker Hub / any); reads `REMORA_E2E_REGISTRY`, `REMORA_E2E_USER`,
+`REMORA_E2E_TOKEN`, `REMORA_E2E_IMAGE`; tests login → push → pull → env-var
+fallback → logout → post-logout-pull-fails
+
+**`src/cli/run.rs`** — fixed `-v host:container:ro` parsing bug
+- `split_once(':')` only splits on first colon, so `host:container:ro` produced
+  `tgt = "container:ro"` (wrong). Changed to `rsplit_once(':')` so `:ro`/`:rw`
+  suffix is correctly stripped; added `test_cli_volume_flag_ro` integration test.
+
+**`tests/integration_tests.rs`** — fixed `test_local_registry_auth_roundtrip`
+- Was using `openssl passwd -apr1` (APR1/MD5) which docker/distribution ≥2.8
+  no longer accepts. Changed to the same hard-coded bcrypt entry (`$2y$05$...`,
+  password `testpassword`) used by oci-client's own integration tests.
+
+### Verification done
+- `cargo build` — clean
+- `cargo clippy -- -D warnings` — clean
+- `cargo fmt` — clean
+- `cargo test --lib` — 254 tests pass
+- `cargo test --test integration_tests --no-run` — compiles clean
+- `sudo -E cargo test --test integration_tests registry_auth -- --ignored --nocapture` — both registry auth tests pass
+- `scripts/test-registry-auth-e2e.sh` against GHCR private + public, Docker Hub private + public — 44/44 pass
+
+**`src/cli/auth.rs`** — fixed Docker Hub registry key lookup
+- `registry_keys("index.docker.io")` now includes `"docker.io"` so creds stored
+  by `remora image login docker.io` are found when pushing `docker.io/...` refs
+
+**`scripts/test-registry-auth-e2e.sh`** — rewrote for multi-registry support
+- Profiles: ghcr, dockerhub, ecr (each skipped if not configured)
+- ECR: token auto-fetched via `aws ecr get-login-password`
+- Per-registry pass/fail totals + global summary
+- 8 tests per registry: anon-push-fails → login → push → pull-back → env-var
+  fallback → CLI-flag fallback → logout → post-logout-pull-fails
+
+**`scripts/e2e-creds.env.example`** — committed credential template (gitignored actual)
+
+**`.gitignore`** — added `scripts/e2e-creds.env`
 
 ---
 
-## Completed this session (Feb 27, 2026)
+## Next suggested task
 
-### BATS end-to-end test suite
+**`remora image save` / `remora image load`** — export/import images as tar archives
+(see `docs/FEATURE_GAPS.md`).  Prerequisite: the blob store is now populated, so
+save/load can use the same blobs.
 
-**Context:** Unit tests (cargo test --lib, 251) and integration tests (sudo
-cargo test --test integration_tests) covered the raw API and the lisp runtime
-path.  `spawn_service` in `src/cli/compose.rs` — the binary-only path taken by
-every `remora compose up` invocation — was not directly exercised by either
-tier.  The hardening properties (seccomp, CapEff=0, NoNewPrivs, PID/UTS
-namespace) were applied there but only testable via a full binary invocation.
-
-**What shipped:**
-
-| File | Purpose |
-|------|---------|
-| `tests/e2e/helpers.bash` | Shared BATS helpers: `require_root`, `compose_up/down`, `service_pid`, `inner_pid`, `proc_status_field`, `wait_container_up` |
-| `tests/e2e/hardening.bats` | Closes the `spawn_service` gap: asserts `Seccomp:2`, `CapEff:0000000000000000`, `NoNewPrivs:1`, NSpid ≥ 2 entries, and UTS namespace isolation on the inner container process started by `remora compose up` |
-| `tests/e2e/lifecycle.bats` | Basic compose lifecycle: state file written, `ps` columns, scoped container name, PID in /proc, `down` removes state |
-| `tests/e2e/fixtures/sleep-probe.reml` | Minimal `alpine:latest` + `/bin/sleep infinity` fixture |
-| `Makefile` | `test-unit`, `test-integration`, `test-e2e`, `test` targets |
-
-**To run:**
-```bash
-sudo pacman -S bats         # one-time install
-sudo -E make test-e2e       # or: sudo -E bats tests/e2e/hardening.bats tests/e2e/lifecycle.bats
-```
-
-**Inner PID resolution:** `spawn_service` stores the intermediate PID
-(parent of the inner container process) in the compose state file.  The
-helpers read `/proc/{intermediate}/task/{intermediate}/children` to locate
-the actual container PID (inner child = PID 1 in the new namespace), then
-inspect its `/proc/{inner}/status` from the host.
-
----
-
-## Previous: Container isolation hardening (Feb 27, 2026)
-
-### Container isolation hardening for compose + lisp runtime
-
-**Context:** `compose up` and the lisp runtime (`container-start`) were spawning
-containers with essentially no security isolation beyond filesystem layering.
-`Command::new()` starts with `Namespace::empty()` and no seccomp, no capability
-dropping, no no-new-privileges, no masked paths.  The hanging compose-chain
-(postgres orphaned workers keeping pipe write-ends open) was the trigger.
-
-**What shipped:**
-
-#### Namespace fix
-- `Namespace::PID | UTS | IPC` added unconditionally in both `spawn_service`
-  (compose.rs) and `do_container_start_inner` (runtime.rs), applied just before
-  `spawn()` so they OR with any flags already accumulated (MOUNT from
-  `with_image_layers`, NET from bridge setup).
-- `Command::namespaces()` getter added to `src/container.rs` so callers can read
-  the current flag set without clobbering it.
-- `std::process::exit()` restored in `main.rs`; `_exit()` was a workaround for
-  the pipe hang, which is now fixed at the source (PID namespace kills orphans).
-
-#### Security hardening defaults
-All four applied unconditionally in both execution paths (compose + lisp):
-- `with_seccomp_default()` — Docker's ~300-syscall allowlist
-- `drop_all_capabilities()` — zeros effective/permitted/inheritable cap sets via
-  `capset()` syscall (bug fixed: previous implementation only called
-  `PR_CAPBSET_DROP` on the bounding set; `CapEff` remained full as root)
-- `with_no_new_privileges(true)` — blocks setuid/setgid escalation
-- `with_masked_paths_default()` — hides `/proc/kcore`, `/sys/firmware`, etc.
-
-#### `:cap-add` service spec support
-Services that need specific capabilities (e.g. `CAP_NET_RAW`) declare them:
-- `cap_add: Vec<String>` added to `ServiceSpec` in `src/compose.rs`
-- `:cap-add` keyword parsed in both the static compose parser and the lisp
-  `define-service` / `service` builtin (`src/lisp/remora.rs`)
-- `parse_capability_mask()` helper in `src/cli/mod.rs`
-- Capability names normalised: `net-raw` → `NET_RAW`; `CAP_` prefix optional
-
-#### Regression tests
-Two new integration tests in `tests/integration_tests.rs`:
-
-| Test | Strategy |
-|------|----------|
-| `test_hardening_combination` | Raw `Command` builder with all four hardening calls; reads `/proc/self/status` from inside container via stdout; asserts `Seccomp:2`, `CapEff:0`, `NoNewPrivs:1`, innermost NSpid ≤ 5, `HOSTNAME=hardening-test` |
-| `test_lisp_container_spawn_hardening` | `Interpreter::new_with_runtime`; starts `sleep 30`; locates inner child via `/proc/{pid}/task/.../children`; reads its `/proc/status` from host; asserts same four properties + UTS namespace isolation; skips if `alpine:latest` not pulled |
-
-Both documented in `docs/INTEGRATION_TESTS.md`.
-
----
-
-## Previous: Eager Async Model (Feb 26, 2026)
-
-**Restored the original async contract**: `container-start-bg` + `container-join`
-let a `.reml` script kick off multiple containers simultaneously without the
-declarative graph, then collect the handles when their values are actually needed.
-
-**New primitives:**
-
-| Primitive | Signature | Description |
-|-----------|-----------|-------------|
-| `container-start` (updated) | `(svc [:env list])` → ContainerHandle | Now accepts `:env` (list of dotted pairs) for dynamic env injection |
-| `container-start-bg` | `(svc [:env list])` → PendingContainer | Spawns in background thread; returns immediately |
-| `container-join` | `(pending)` → ContainerHandle | Blocks until background start completes |
-
-**New example:** `examples/compose/imperative/compose-eager.reml`
-
-**State as of post-v0.14.0:** 251 unit tests passing, both executor models documented.
+Or: **credential helper support** (`credHelpers`, `credsStore`) for ECR/GCR/keychain
+auth without typing passwords.

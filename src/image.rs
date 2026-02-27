@@ -44,6 +44,7 @@ fn ensure_image_dirs() -> io::Result<()> {
         crate::paths::layers_dir(),
         crate::paths::images_dir(),
         crate::paths::build_cache_dir(),
+        crate::paths::blobs_dir(),
     ] {
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
@@ -118,6 +119,59 @@ pub fn layer_dir(digest: &str) -> PathBuf {
 /// Check whether a layer has already been extracted.
 pub fn layer_exists(digest: &str) -> bool {
     layer_dir(digest).is_dir()
+}
+
+/// Return the raw blob path for the given digest.
+pub fn blob_path(digest: &str) -> std::path::PathBuf {
+    crate::paths::blob_path(digest)
+}
+
+/// Check whether a raw blob (tar.gz) is cached for this digest.
+pub fn blob_exists(digest: &str) -> bool {
+    crate::paths::blob_path(digest).exists()
+}
+
+/// Persist the raw compressed blob bytes for the given digest.
+pub fn save_blob(digest: &str, data: &[u8]) -> io::Result<()> {
+    let path = crate::paths::blob_path(digest);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, data)
+}
+
+/// Load the raw compressed blob bytes for the given digest.
+pub fn load_blob(digest: &str) -> io::Result<Vec<u8>> {
+    std::fs::read(crate::paths::blob_path(digest))
+}
+
+/// Persist the uncompressed-tar diff_id for the given blob digest.
+///
+/// The diff_id is the `"sha256:<hex>"` of the raw (uncompressed) tar stream.
+pub fn save_blob_diffid(blob_digest: &str, diff_id: &str) -> io::Result<()> {
+    std::fs::write(crate::paths::blob_diffid_path(blob_digest), diff_id)
+}
+
+/// Load the uncompressed-tar diff_id for the given blob digest.
+///
+/// Returns `None` if the sidecar file was not found.
+pub fn load_blob_diffid(blob_digest: &str) -> Option<String> {
+    std::fs::read_to_string(crate::paths::blob_diffid_path(blob_digest)).ok()
+}
+
+/// Return the path to the raw OCI config JSON for an image reference.
+pub fn oci_config_path(reference: &str) -> std::path::PathBuf {
+    image_dir(reference).join("oci-config.json")
+}
+
+/// Save raw OCI config JSON to the image directory.
+pub fn save_oci_config(reference: &str, config_json: &str) -> io::Result<()> {
+    std::fs::write(oci_config_path(reference), config_json)
+}
+
+/// Load raw OCI config JSON from the image directory.
+pub fn load_oci_config(reference: &str) -> io::Result<String> {
+    std::fs::read_to_string(oci_config_path(reference))
 }
 
 /// Extract a gzipped tar layer into the content-addressable layer store.
@@ -350,6 +404,19 @@ pub fn layer_dirs(manifest: &ImageManifest) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_blob_path_strips_prefix() {
+        let p = blob_path("sha256:deadbeef");
+        assert_eq!(p, crate::paths::blobs_dir().join("deadbeef.tar.gz"));
+    }
+
+    #[test]
+    fn test_blob_exists_false_for_missing() {
+        assert!(!blob_exists(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+    }
 
     #[test]
     fn test_reference_to_dirname() {

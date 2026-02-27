@@ -99,6 +99,30 @@ pub fn build_cache_dir() -> PathBuf {
     data_dir().join("build-cache")
 }
 
+/// Raw compressed blob store: `<data>/blobs/`.
+///
+/// Stores the original `.tar.gz` bytes for each layer, keyed by digest.
+/// Required for `remora image push`.
+pub fn blobs_dir() -> PathBuf {
+    data_dir().join("blobs")
+}
+
+/// Path for a single blob: `<data>/blobs/<hex>.tar.gz`.
+///
+/// `digest` may include the `sha256:` prefix or be a bare hex string.
+pub fn blob_path(digest: &str) -> PathBuf {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    blobs_dir().join(format!("{}.tar.gz", hex))
+}
+
+/// Sidecar file storing the uncompressed-tar `diff_id` for a given blob digest.
+///
+/// Path: `<data>/blobs/<hex>.diffid`
+pub fn blob_diffid_path(digest: &str) -> PathBuf {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    blobs_dir().join(format!("{}.diffid", hex))
+}
+
 // ── Derived from runtime_dir() ──────────────────────────────────────────────
 
 /// Per-container state directories: `<runtime>/containers/`.
@@ -250,6 +274,15 @@ mod tests {
         assert!(volumes_dir().starts_with(&data));
         assert!(rootfs_store_dir().starts_with(&data));
         assert!(counter_file().starts_with(&data));
+        assert!(blobs_dir().starts_with(&data));
+    }
+
+    #[test]
+    fn test_blob_path() {
+        let p = blob_path("sha256:abc123");
+        assert_eq!(p, blobs_dir().join("abc123.tar.gz"));
+        let p2 = blob_path("abc123");
+        assert_eq!(p2, blobs_dir().join("abc123.tar.gz"));
     }
 
     #[test]

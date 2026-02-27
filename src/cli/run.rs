@@ -377,16 +377,26 @@ fn apply_cli_options(
         cmd = cmd.with_readonly_rootfs(true);
     }
     for v in &args.volume {
-        if let Some((src, tgt)) = v.split_once(':') {
+        if let Some((src, rest)) = v.split_once(':') {
+            // Support "src:tgt" and "src:tgt:ro" (Docker compat).
+            let (tgt, readonly) = match rest.rsplit_once(':') {
+                Some((t, "ro")) => (t, true),
+                Some((t, "rw")) => (t, false),
+                _ => (rest, false),
+            };
             if src.starts_with('/') {
-                cmd = cmd.with_bind_mount(src, tgt);
+                if readonly {
+                    cmd = cmd.with_bind_mount_ro(src, tgt);
+                } else {
+                    cmd = cmd.with_bind_mount(src, tgt);
+                }
             } else {
                 let vol = Volume::open(src).or_else(|_| Volume::create(src))?;
                 cmd = cmd.with_volume(&vol, tgt);
             }
         } else {
             return Err(format!(
-                "invalid --volume '{}': expected NAME:/path or /host:/path",
+                "invalid --volume '{}': expected NAME:/path or /host:/path[:ro|:rw]",
                 v
             )
             .into());

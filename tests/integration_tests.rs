@@ -890,6 +890,74 @@ mod filesystem {
         );
     }
 
+    /// test_cli_volume_flag_ro
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Verifies that the CLI `-v host:container:ro` suffix is parsed correctly
+    /// by `remora run` and results in a read-only bind mount inside the
+    /// container.  This exercises the `run.rs` volume-flag parsing path
+    /// (distinct from the `with_bind_mount_ro` API path tested by
+    /// `test_bind_mount_ro`).  Failure means a regression in the
+    /// `rsplit_once(':')` fix that strips `:ro`/`:rw` from the target path.
+    #[test]
+    fn test_cli_volume_flag_ro() {
+        if !is_root() {
+            eprintln!("Skipping test_cli_volume_flag_ro: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cli_volume_flag_ro: alpine-rootfs not found");
+            return;
+        };
+
+        let host_dir = tempfile::tempdir().expect("temp dir");
+        let vol_spec = format!("{}:/mnt/ro:ro", host_dir.path().display());
+
+        // Run via the CLI binary so the -v flag goes through the run.rs parser.
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "-v",
+                &vol_spec,
+                "/bin/ash",
+                "-c",
+                "touch /mnt/ro/x 2>/dev/null; echo exit=$?",
+            ])
+            .output()
+            .expect("remora run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("exit=1"),
+            "Write into :ro mount should fail (exit=1), got: {}",
+            stdout
+        );
+
+        // Also confirm :rw (explicit) allows writes.
+        let rw_spec = format!("{}:/mnt/rw:rw", host_dir.path().display());
+        let out2 = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+            .args([
+                "run",
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "-v",
+                &rw_spec,
+                "/bin/ash",
+                "-c",
+                "touch /mnt/rw/x 2>/dev/null; echo exit=$?",
+            ])
+            .output()
+            .expect("remora run rw");
+        let stdout2 = String::from_utf8_lossy(&out2.stdout);
+        assert!(
+            stdout2.contains("exit=0"),
+            "Write into :rw mount should succeed (exit=0), got: {}",
+            stdout2
+        );
+    }
+
     #[test]
     fn test_tmpfs_mount() {
         if !is_root() {
@@ -8915,4 +8983,431 @@ fn test_lisp_container_spawn_hardening() {
     // (PR_SET_PDEATHSIG = SIGKILL on inner child) when the intermediate exits,
     // so Drop completes in well under a second.
     drop(interp);
+}
+
+// ---------------------------------------------------------------------------
+// Registry auth tests
+// ---------------------------------------------------------------------------
+
+mod registry_auth {
+    use super::*;
+
+    /// Bind to port 0 and return the assigned ephemeral port.
+    fn find_free_port() -> u16 {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind to port 0");
+        l.local_addr().unwrap().port()
+        // l dropped here, releasing the port
+    }
+
+    /// Poll until a TCP connection to `addr` succeeds, or the deadline expires.
+    fn wait_for_tcp(addr: &str, deadline: std::time::Instant) -> bool {
+        use std::net::TcpStream;
+        while std::time::Instant::now() < deadline {
+            if TcpStream::connect(addr).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// Stop and remove a container, ignoring errors (best-effort cleanup).
+    fn cleanup_container(name: &str) {
+        let bin = env!("CARGO_BIN_EXE_remora");
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    /// test_local_registry_push_pull_roundtrip
+    ///
+    /// Requires: root, network access (Docker Hub for `registry:2`), overlay.
+    ///
+    /// Starts a `registry:2` container with no authentication on a random
+    /// localhost port, pushes a locally available image to it with `--insecure`,
+    /// removes the local copy of the re-tagged reference, then pulls it back and
+    /// verifies the round-trip succeeds.  Confirms that push → pull works over
+    /// plain HTTP with the `--insecure` flag and no credentials.
+    ///
+    /// Run with:
+    /// ```bash
+    /// sudo -E cargo test --test integration_tests \
+    ///     registry_auth::test_local_registry_push_pull_roundtrip -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    #[serial]
+    fn test_local_registry_push_pull_roundtrip() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+
+        let bin = env!("CARGO_BIN_EXE_remora");
+        let port = find_free_port();
+        let registry_addr = format!("127.0.0.1:{}", port);
+        let registry_name = format!("test-registry-{}", port);
+
+        // Ensure the registry:2 image is available locally.
+        let pull = std::process::Command::new(bin)
+            .args(["image", "pull", "registry:2"])
+            .status()
+            .expect("remora image pull registry:2");
+        assert!(pull.success(), "failed to pull registry:2");
+
+        // Start registry:2 in detached mode, mapping the ephemeral port.
+        //
+        // NOTE: must use Stdio::null() + status() — NOT .output() — because
+        // remora --detach uses libc::fork() internally.  The watcher child
+        // inherits the stdout/stderr pipe write-ends that .output() creates,
+        // so .output() would block waiting for EOF until the container exits.
+        let port_map = format!("{}:5000", port);
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                &registry_name,
+                "--network",
+                "bridge",
+                "-p",
+                &port_map,
+                "registry:2",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("remora run registry:2");
+        assert!(run_status.success(), "failed to start registry");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            wait_for_tcp(&registry_addr, deadline),
+            "registry did not become reachable on {}",
+            registry_addr
+        );
+
+        // Pull alpine so we have something to push (may already be cached).
+        let _ = std::process::Command::new(bin)
+            .args(["image", "pull", "alpine"])
+            .status();
+
+        let dest_ref = format!("{}/library/alpine:latest", registry_addr);
+
+        // Push alpine to the local registry.
+        let push_out = std::process::Command::new(bin)
+            .args(["image", "push", "alpine", "--dest", &dest_ref, "--insecure"])
+            .output()
+            .expect("remora image push");
+        assert!(
+            push_out.status.success(),
+            "push failed: {}",
+            String::from_utf8_lossy(&push_out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&push_out.stdout).contains("Pushed"),
+            "expected 'Pushed' in push output, got: {}",
+            String::from_utf8_lossy(&push_out.stdout)
+        );
+
+        // Remove the local copy of the re-tagged reference so pull is genuine.
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", &dest_ref])
+            .output();
+
+        // Pull it back from the local registry.
+        let pull2_out = std::process::Command::new(bin)
+            .args(["image", "pull", "--insecure", &dest_ref])
+            .output()
+            .expect("remora image pull from local registry");
+        assert!(
+            pull2_out.status.success(),
+            "pull from local registry failed: {}",
+            String::from_utf8_lossy(&pull2_out.stderr)
+        );
+
+        // Verify the image appears in `image ls`.
+        let ls_out = std::process::Command::new(bin)
+            .args(["image", "ls", "--format", "json"])
+            .output()
+            .expect("image ls");
+        let ls_json = String::from_utf8_lossy(&ls_out.stdout);
+        assert!(
+            ls_json.contains(&registry_addr),
+            "local registry image should appear in image ls, got: {}",
+            ls_json
+        );
+
+        // Cleanup.
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", &dest_ref])
+            .output();
+        cleanup_container(&registry_name);
+    }
+
+    /// test_local_registry_auth_roundtrip
+    ///
+    /// Requires: root, network access (Docker Hub for `registry:2`), overlay.
+    ///
+    /// Starts a `registry:2` container with htpasswd authentication enforced
+    /// using a hard-coded bcrypt entry (bcrypt is the only hash format accepted
+    /// by docker/distribution ≥2.8; APR1/MD5 is no longer supported).
+    /// Verifies four things:
+    ///   1. Push **without** credentials fails (registry returns 401).
+    ///   2. After `remora image login --password-stdin`, push **succeeds**.
+    ///   3. Pull from the authenticated registry also succeeds with credentials.
+    ///   4. After `remora image logout`, pull **fails** (credentials removed).
+    ///
+    /// This is the canonical end-to-end test that credential resolution,
+    /// `login`, and `logout` are wired correctly against a real HTTP
+    /// authentication challenge — not just tested against synthetic data.
+    ///
+    /// Run with:
+    /// ```bash
+    /// sudo -E cargo test --test integration_tests \
+    ///     registry_auth::test_local_registry_auth_roundtrip -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    #[serial]
+    fn test_local_registry_auth_roundtrip() {
+        if !is_root() {
+            eprintln!("Skipping: requires root");
+            return;
+        }
+
+        let bin = env!("CARGO_BIN_EXE_remora");
+        let port = find_free_port();
+        let registry_addr = format!("127.0.0.1:{}", port);
+        let registry_name = format!("test-auth-registry-{}", port);
+        let test_user = "testuser";
+        // This bcrypt hash is from oci-client's own integration tests.
+        // registry:2 (docker/distribution ≥2.8) only accepts bcrypt — APR1/MD5
+        // hashes are no longer supported.
+        let test_pass = "testpassword";
+        // bcrypt of "testpassword", cost=5 (same as oci-client test fixtures)
+        let htpasswd_entry = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
+
+        // ── 1. Build htpasswd file ────────────────────────────────────────────
+        let htpasswd_dir = tempfile::tempdir().expect("tempdir for htpasswd");
+        let htpasswd_path = htpasswd_dir.path().join("htpasswd");
+        std::fs::write(&htpasswd_path, format!("{}\n", htpasswd_entry))
+            .expect("write htpasswd");
+
+        // ── 2. Start authenticated registry:2 ─────────────────────────────────
+        let _ = std::process::Command::new(bin)
+            .args(["image", "pull", "registry:2"])
+            .status();
+
+        // See test_local_registry_push_pull_roundtrip for why we use
+        // Stdio::null() + status() instead of .output() here.
+        let port_map = format!("{}:5000", port);
+        let htpasswd_mount = format!("{}:/auth/htpasswd:ro", htpasswd_path.display());
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                &registry_name,
+                "--network",
+                "bridge",
+                "-p",
+                &port_map,
+                "-v",
+                &htpasswd_mount,
+                "-e",
+                "REGISTRY_AUTH=htpasswd",
+                "-e",
+                "REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm",
+                "-e",
+                "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
+                "registry:2",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("remora run registry:2 with auth");
+        assert!(run_status.success(), "failed to start auth registry");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            wait_for_tcp(&registry_addr, deadline),
+            "auth registry did not become reachable on {}",
+            registry_addr
+        );
+        // Give registry time to initialise htpasswd auth.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Ensure alpine is available to push.
+        let _ = std::process::Command::new(bin)
+            .args(["image", "pull", "alpine"])
+            .status();
+
+        let dest_ref = format!("{}/library/alpine:latest", registry_addr);
+
+        // ── 3. Push WITHOUT credentials — must fail ────────────────────────────
+        let push_anon = std::process::Command::new(bin)
+            .args(["image", "push", "alpine", "--dest", &dest_ref, "--insecure"])
+            .output()
+            .expect("push without creds");
+        assert!(
+            !push_anon.status.success(),
+            "anonymous push to authenticated registry should fail, stdout: {}",
+            String::from_utf8_lossy(&push_anon.stdout)
+        );
+
+        // ── 4a. Push with explicit CLI credentials — tests oci-client + registry auth ──
+        let push_explicit = std::process::Command::new(bin)
+            .args([
+                "image",
+                "push",
+                "alpine",
+                "--dest",
+                &dest_ref,
+                "--insecure",
+                "--username",
+                test_user,
+                "--password",
+                test_pass,
+            ])
+            .output()
+            .expect("push with explicit creds");
+        assert!(
+            push_explicit.status.success(),
+            "push with explicit credentials failed: {} / {}",
+            String::from_utf8_lossy(&push_explicit.stdout),
+            String::from_utf8_lossy(&push_explicit.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&push_explicit.stdout).contains("Pushed"),
+            "expected 'Pushed' (explicit creds), got: {}",
+            String::from_utf8_lossy(&push_explicit.stdout)
+        );
+
+        // ── 4b. Login, verify docker config written, push via config ──────────
+        // Use a temporary HOME so we don't touch the real ~/.docker/config.json.
+        let home_dir = tempfile::tempdir().expect("tempdir for HOME");
+        let home_path = home_dir.path().to_str().unwrap().to_string();
+
+        let mut login_child = std::process::Command::new(bin)
+            .args([
+                "image",
+                "login",
+                "--username",
+                test_user,
+                "--password-stdin",
+                &registry_addr,
+            ])
+            .env("HOME", &home_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("remora image login");
+        {
+            use std::io::Write as _;
+            login_child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(test_pass.as_bytes())
+                .expect("write password");
+        }
+        let login_out = login_child.wait_with_output().expect("login wait");
+        assert!(
+            login_out.status.success(),
+            "login failed: {}",
+            String::from_utf8_lossy(&login_out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&login_out.stdout).contains("Login Succeeded"),
+            "expected 'Login Succeeded', got: {}",
+            String::from_utf8_lossy(&login_out.stdout)
+        );
+
+        // Verify the docker config file was actually written with the right key.
+        let config_path = std::path::PathBuf::from(&home_path)
+            .join(".docker")
+            .join("config.json");
+        let config_content = std::fs::read_to_string(&config_path)
+            .expect("~/.docker/config.json should exist after login");
+        assert!(
+            config_content.contains(&registry_addr),
+            "docker config should contain registry key '{}', got: {}",
+            registry_addr,
+            config_content
+        );
+
+        // Push via docker config (no explicit --username/--password).
+        let push_auth = std::process::Command::new(bin)
+            .args(["image", "push", "alpine", "--dest", &dest_ref, "--insecure"])
+            .env("HOME", &home_path)
+            .output()
+            .expect("push via docker config");
+        assert!(
+            push_auth.status.success(),
+            "push via docker config failed: {} / {}",
+            String::from_utf8_lossy(&push_auth.stdout),
+            String::from_utf8_lossy(&push_auth.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&push_auth.stdout).contains("Pushed"),
+            "expected 'Pushed' (docker config), got: {}",
+            String::from_utf8_lossy(&push_auth.stdout)
+        );
+
+        // Pull also succeeds with credentials.
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", &dest_ref])
+            .env("HOME", &home_path)
+            .output();
+        let pull_auth = std::process::Command::new(bin)
+            .args(["image", "pull", "--insecure", &dest_ref])
+            .env("HOME", &home_path)
+            .output()
+            .expect("pull with creds");
+        assert!(
+            pull_auth.status.success(),
+            "authenticated pull failed: {}",
+            String::from_utf8_lossy(&pull_auth.stderr)
+        );
+
+        // ── 5. Logout — subsequent pull must fail ─────────────────────────────
+        let logout_out = std::process::Command::new(bin)
+            .args(["image", "logout", &registry_addr])
+            .env("HOME", &home_path)
+            .output()
+            .expect("remora image logout");
+        assert!(
+            logout_out.status.success(),
+            "logout failed: {}",
+            String::from_utf8_lossy(&logout_out.stderr)
+        );
+
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", &dest_ref])
+            .env("HOME", &home_path)
+            .output();
+        let pull_anon = std::process::Command::new(bin)
+            .args(["image", "pull", "--insecure", &dest_ref])
+            .env("HOME", &home_path)
+            .output()
+            .expect("pull after logout");
+        assert!(
+            !pull_anon.status.success(),
+            "pull after logout should fail (401), stdout: {}",
+            String::from_utf8_lossy(&pull_anon.stdout)
+        );
+
+        // ── Cleanup ────────────────────────────────────────────────────────────
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", &dest_ref])
+            .output();
+        cleanup_container(&registry_name);
+    }
 }

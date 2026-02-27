@@ -204,6 +204,19 @@ Runs `touch /mnt/ro/newfile` and captures the exit code. Verifies `exit=1` — t
 write is rejected because the mount is read-only. The `MS_BIND | MS_RDONLY` remount
 is required by the Linux kernel (two calls: bind, then remount-ro).
 
+### `test_cli_volume_flag_ro`
+**Requires:** root, rootfs
+
+Verifies that the CLI `-v host:container:ro` and `-v host:container:rw` suffixes are
+parsed correctly and produce the expected mount behaviour. Runs `remora run -v ...:ro`
+and asserts that a write inside the container fails (`exit=1`); then runs with `:rw`
+and asserts the write succeeds (`exit=0`).
+
+This tests the `run.rs` parser path (distinct from `test_bind_mount_ro` which calls
+`with_bind_mount_ro()` directly). Failure means the `rsplit_once(':')` fix that strips
+`:ro`/`:rw` from the mount-target path has regressed, causing the suffix to be treated
+as part of the filesystem path instead of a mount option.
+
 ### `test_tmpfs_mount`
 **Requires:** root, rootfs
 
@@ -1760,3 +1773,61 @@ Asserts same four properties as `test_hardening_combination`.  Skips if
 Failure means the lisp `do_container_start_inner` path diverged from the
 security defaults applied by compose, or that a future refactor of that
 function accidentally removed the hardening block.
+
+### `test_login_logout` (unit test in `src/cli/auth.rs`)
+**Requires:** nothing (no root, no network, uses a tempdir for `HOME`)
+
+Exercises `write_docker_config` and `remove_docker_config` (via `parse_docker_config`).
+
+Steps:
+1. Write a synthetic `~/.docker/config.json` with base64-encoded credentials
+2. Parse with `parse_docker_config` and assert username/password match
+3. Call `write_docker_config` to overwrite an entry
+4. Call `remove_docker_config` and assert the entry is gone
+
+Failure means the login/logout lifecycle is broken; registry auth would silently
+fall back to anonymous even after `remora image login`.
+
+### `registry_auth::test_local_registry_push_pull_roundtrip` (`#[ignore]`)
+**Requires:** root, network (Docker Hub for `registry:2`), overlay support
+
+Starts a `registry:2` OCI registry on a random ephemeral port with no
+authentication, then exercises the push → pull round-trip over plain HTTP:
+
+1. Pull `registry:2` from Docker Hub (if not already cached)
+2. Start `registry:2` with `remora run --detach -p <port>:5000`
+3. Pull `alpine` (source image) to ensure it is in the local store
+4. Push `alpine` to `127.0.0.1:<port>/library/alpine:latest` with `--insecure`
+5. Assert push output contains `"Pushed"`
+6. Remove the local re-tagged reference so the subsequent pull is genuine
+7. Pull from the local registry with `--insecure`; assert success
+8. Assert the image appears in `remora image ls --format json`
+
+Failure indicates that either `--insecure` HTTP negotiation, blob upload, or
+manifest PUT is broken; any regression here would prevent push/pull from
+working against local or air-gapped registries.
+
+### `registry_auth::test_local_registry_auth_roundtrip` (`#[ignore]`)
+**Requires:** root, network (Docker Hub for `registry:2`), overlay support
+
+Starts a `registry:2` container with htpasswd authentication enforced using a
+hard-coded bcrypt entry (docker/distribution ≥2.8 only accepts bcrypt; APR1/MD5
+is no longer supported). Uses a temporary `HOME` directory
+throughout to avoid touching the real `~/.docker/config.json`. Verifies four
+properties end-to-end:
+
+1. **Unauthenticated push fails** — `remora image push alpine --dest <registry>/<ref>
+   --insecure` exits non-zero when the registry returns 401.
+2. **`remora image login` writes credentials** — `--password-stdin` writes a
+   base64-encoded entry into `$TMPHOME/.docker/config.json`; the command prints
+   `"Login Succeeded"`.
+3. **Authenticated push and pull succeed** — after login, push exits 0 and
+   prints `"Pushed"`; after removing the local copy, pull exits 0 and
+   downloads from the registry.
+4. **`remora image logout` removes credentials** — subsequent pull exits
+   non-zero (registry returns 401 again).
+
+Failure at step 1 means the registry isn't actually enforcing auth (test
+environment problem). Failure at steps 2–3 means credential resolution or
+the `~/.docker/config.json` read/write path is broken. Failure at step 4
+means `logout` didn't remove the entry and the credential cache is leaking.
