@@ -9,6 +9,41 @@ session" below for the full list.
 
 ## Completed this session (Feb 27, 2026)
 
+### BATS end-to-end test suite
+
+**Context:** Unit tests (cargo test --lib, 251) and integration tests (sudo
+cargo test --test integration_tests) covered the raw API and the lisp runtime
+path.  `spawn_service` in `src/cli/compose.rs` — the binary-only path taken by
+every `remora compose up` invocation — was not directly exercised by either
+tier.  The hardening properties (seccomp, CapEff=0, NoNewPrivs, PID/UTS
+namespace) were applied there but only testable via a full binary invocation.
+
+**What shipped:**
+
+| File | Purpose |
+|------|---------|
+| `tests/e2e/helpers.bash` | Shared BATS helpers: `require_root`, `compose_up/down`, `service_pid`, `inner_pid`, `proc_status_field`, `wait_container_up` |
+| `tests/e2e/hardening.bats` | Closes the `spawn_service` gap: asserts `Seccomp:2`, `CapEff:0000000000000000`, `NoNewPrivs:1`, NSpid ≥ 2 entries, and UTS namespace isolation on the inner container process started by `remora compose up` |
+| `tests/e2e/lifecycle.bats` | Basic compose lifecycle: state file written, `ps` columns, scoped container name, PID in /proc, `down` removes state |
+| `tests/e2e/fixtures/sleep-probe.reml` | Minimal `alpine:latest` + `/bin/sleep infinity` fixture |
+| `Makefile` | `test-unit`, `test-integration`, `test-e2e`, `test` targets |
+
+**To run:**
+```bash
+sudo pacman -S bats         # one-time install
+sudo -E make test-e2e       # or: sudo -E bats tests/e2e/hardening.bats tests/e2e/lifecycle.bats
+```
+
+**Inner PID resolution:** `spawn_service` stores the intermediate PID
+(parent of the inner container process) in the compose state file.  The
+helpers read `/proc/{intermediate}/task/{intermediate}/children` to locate
+the actual container PID (inner child = PID 1 in the new namespace), then
+inspect its `/proc/{inner}/status` from the host.
+
+---
+
+## Previous: Container isolation hardening (Feb 27, 2026)
+
 ### Container isolation hardening for compose + lisp runtime
 
 **Context:** `compose up` and the lisp runtime (`container-start`) were spawning

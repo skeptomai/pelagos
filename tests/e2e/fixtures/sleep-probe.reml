@@ -1,0 +1,13 @@
+;;; Minimal single-service fixture for e2e hardening + lifecycle tests.
+;;;
+;;; Starts one alpine container that sleeps indefinitely so tests can
+;;; inspect its /proc entries and verify compose lifecycle operations.
+;;;
+;;; Usage:
+;;;   sudo -E remora compose up -f sleep-probe.reml -p <project> --foreground &
+
+(compose-up
+  (compose
+    (service "probe"
+      '(image "alpine:latest")
+      '(command "/bin/sleep" "infinity"))))

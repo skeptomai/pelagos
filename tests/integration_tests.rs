@@ -8755,9 +8755,7 @@ fn test_hardening_combination() {
         ])
         .with_chroot(&rootfs)
         .with_proc_mount()
-        .with_namespaces(
-            Namespace::MOUNT | Namespace::PID | Namespace::UTS | Namespace::IPC,
-        )
+        .with_namespaces(Namespace::MOUNT | Namespace::PID | Namespace::UTS | Namespace::IPC)
         .with_hostname("hardening-test")
         .with_seccomp_default()
         .drop_all_capabilities()
@@ -8820,11 +8818,7 @@ fn test_hardening_combination() {
         "expected HOSTNAME=hardening-test, got: {stdout}"
     );
 
-    assert!(
-        status.success(),
-        "container exited non-zero: {:?}",
-        status
-    );
+    assert!(status.success(), "container exited non-zero: {:?}", status);
 }
 
 /// Verify that the lisp `do_container_start_inner` path applies the same
@@ -8847,7 +8841,9 @@ fn test_lisp_container_spawn_hardening() {
 
     // Skip if the alpine image is not already pulled.
     if remora::image::load_image("alpine:latest").is_err() {
-        eprintln!("SKIP: test_lisp_container_spawn_hardening requires alpine:latest in image store");
+        eprintln!(
+            "SKIP: test_lisp_container_spawn_hardening requires alpine:latest in image store"
+        );
         return;
     }
 
@@ -8881,12 +8877,14 @@ fn test_lisp_container_spawn_hardening() {
         .expect("could not find inner child of container intermediate process");
 
     // Read /proc/{inner}/status from the host.
-    let status = read_proc_status(inner_pid)
-        .expect("could not read inner child's /proc/status");
+    let status = read_proc_status(inner_pid).expect("could not read inner child's /proc/status");
 
     // Seccomp mode 2 = filter active.
     let seccomp = proc_status_field(&status, "Seccomp:").unwrap_or("missing");
-    assert_eq!(seccomp, "2", "expected Seccomp:2 in lisp container, got: {seccomp}");
+    assert_eq!(
+        seccomp, "2",
+        "expected Seccomp:2 in lisp container, got: {seccomp}"
+    );
 
     // CapEff all-zero.
     let capeff = proc_status_field(&status, "CapEff:").unwrap_or("missing");
@@ -8897,13 +8895,15 @@ fn test_lisp_container_spawn_hardening() {
 
     // NoNewPrivs 1.
     let nnp = proc_status_field(&status, "NoNewPrivs:").unwrap_or("missing");
-    assert_eq!(nnp, "1", "expected NoNewPrivs:1 in lisp container, got: {nnp}");
+    assert_eq!(
+        nnp, "1",
+        "expected NoNewPrivs:1 in lisp container, got: {nnp}"
+    );
 
     // UTS namespace differs from host (container has its own hostname namespace).
     let container_uts = std::fs::read_link(format!("/proc/{}/ns/uts", inner_pid))
         .expect("readlink container ns/uts");
-    let host_uts = std::fs::read_link("/proc/self/ns/uts")
-        .expect("readlink host ns/uts");
+    let host_uts = std::fs::read_link("/proc/self/ns/uts").expect("readlink host ns/uts");
     assert_ne!(
         container_uts, host_uts,
         "container UTS namespace should differ from host"

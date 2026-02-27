@@ -2911,21 +2911,36 @@ impl Command {
                     let hi = (bits >> 32) as u32;
 
                     #[repr(C)]
-                    struct CapHeader { version: u32, pid: i32 }
+                    struct CapHeader {
+                        version: u32,
+                        pid: i32,
+                    }
                     #[repr(C)]
-                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
+                    struct CapData {
+                        effective: u32,
+                        permitted: u32,
+                        inheritable: u32,
+                    }
 
-                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
+                    let header = CapHeader {
+                        version: 0x2008_0522,
+                        pid: 0,
+                    };
                     let data = [
-                        CapData { effective: lo, permitted: lo, inheritable: lo },
-                        CapData { effective: hi, permitted: hi, inheritable: hi },
+                        CapData {
+                            effective: lo,
+                            permitted: lo,
+                            inheritable: lo,
+                        },
+                        CapData {
+                            effective: hi,
+                            permitted: hi,
+                            inheritable: hi,
+                        },
                     ];
 
-                    let ret = libc::syscall(
-                        libc::SYS_capset,
-                        &header as *const CapHeader,
-                        data.as_ptr(),
-                    );
+                    let ret =
+                        libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr());
                     if ret != 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -4338,21 +4353,36 @@ impl Command {
                     let hi = (bits >> 32) as u32;
 
                     #[repr(C)]
-                    struct CapHeader { version: u32, pid: i32 }
+                    struct CapHeader {
+                        version: u32,
+                        pid: i32,
+                    }
                     #[repr(C)]
-                    struct CapData  { effective: u32, permitted: u32, inheritable: u32 }
+                    struct CapData {
+                        effective: u32,
+                        permitted: u32,
+                        inheritable: u32,
+                    }
 
-                    let header = CapHeader { version: 0x2008_0522, pid: 0 };
+                    let header = CapHeader {
+                        version: 0x2008_0522,
+                        pid: 0,
+                    };
                     let data = [
-                        CapData { effective: lo, permitted: lo, inheritable: lo },
-                        CapData { effective: hi, permitted: hi, inheritable: hi },
+                        CapData {
+                            effective: lo,
+                            permitted: lo,
+                            inheritable: lo,
+                        },
+                        CapData {
+                            effective: hi,
+                            permitted: hi,
+                            inheritable: hi,
+                        },
                     ];
 
-                    let ret = libc::syscall(
-                        libc::SYS_capset,
-                        &header as *const CapHeader,
-                        data.as_ptr(),
-                    );
+                    let ret =
+                        libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr());
                     if ret != 0 {
                         return Err(io::Error::last_os_error());
                     }
