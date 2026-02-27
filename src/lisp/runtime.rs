@@ -1022,8 +1022,10 @@ pub fn register_runtime_builtins(
                     _ => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
-            // Cascade stop through deps — topology-aware teardown.
-            if let Value::ContainerHandle { deps, .. } = &args[0] {
+            // Deregister the waited container (it exited naturally) and cascade
+            // stop through its deps in reverse topo order.
+            if let Value::ContainerHandle { name, deps, .. } = &args[0] {
+                registry.lock().unwrap().retain(|(n, _)| n != name);
                 for dep in deps {
                     stop_cascade(dep, &registry)?;
                 }
