@@ -27,15 +27,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Step 1: Build image with HEALTHCHECK ==="
+echo "=== Step 1: Pull base image ==="
+$REMORA image pull alpine
+echo ""
+
+echo "=== Step 2: Build image with HEALTHCHECK ==="
 $REMORA build -t "$IMAGE" "$CONTEXT"
 echo ""
 
-echo "=== Step 2: Run detached ==="
+echo "=== Step 3: Run detached ==="
 $REMORA run -d --name "$NAME" "$IMAGE"
 echo ""
 
-echo "=== Step 3: Wait for container pid > 0 ==="
+echo "=== Step 4: Wait for container pid > 0 ==="
 for i in $(seq 1 50); do
     pid=$(python3 -c "import json; d=json.load(open('${STATE_PATH}')); print(d.get('pid',0))" 2>/dev/null || echo 0)
     if [ "$pid" -gt 0 ]; then
@@ -46,7 +50,7 @@ for i in $(seq 1 50); do
 done
 echo ""
 
-echo "=== Step 4: Poll for 'healthy' (up to 15s) ==="
+echo "=== Step 5: Poll for 'healthy' (up to 15s) ==="
 echo "(expecting: starting -> healthy)"
 echo ""
 START=$SECONDS
