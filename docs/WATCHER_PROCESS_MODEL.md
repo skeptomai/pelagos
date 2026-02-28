@@ -260,14 +260,15 @@ work as expected.
 - `/proc/P/ns/pid` — **host PID namespace** — same inode as `/proc/1/ns/pid` because P
   itself is in the host PID namespace (only P's *children* enter the new namespace)
 
-As a result, `remora exec` currently does **not** join the container's PID namespace.
-The exec'd process sees the container's filesystem, network, and UTS, but its PID
-namespace is the host's. Inside an exec'd shell, `ps` will show host PIDs.
+After the fix (GitHub issue #1), `remora exec` **does** join the container's PID
+namespace. `discover_namespaces` checks `/proc/P/ns/pid_for_children` (Linux ≥ 3.8)
+as a fallback when the regular `pid` check finds no difference.
 
-**Future improvement:** to join the container's PID namespace, `discover_namespaces`
-should also check `/proc/P/ns/pid_for_children` (available since Linux 3.8), which
-points to the new PID namespace that C inhabits. This would allow exec'd processes to
-be proper members of the container's PID namespace.
+Because `setns(CLONE_NEWPID)` only updates `pid_for_children` (it does not move the
+calling process), the join requires a **double-fork**: setns → fork → grandchild is
+born into the target PID namespace → grandchild execs. This is implemented in
+`container.rs` step 1.65 as the "Case B" branch (joining an existing PID namespace),
+mirroring how `nsenter --pid` works internally.
 
 ---
 
@@ -300,7 +301,7 @@ address it. This is documented as future work.
 
 | Limitation | Impact | Planned fix |
 |-----------|--------|-------------|
-| `remora exec` does not join container PID namespace | `ps` in exec'd shell shows host PIDs | Check `pid_for_children` in `discover_namespaces` |
+| ~~`remora exec` does not join container PID namespace~~ | ~~`ps` in exec'd shell shows host PIDs~~ | **Fixed** — `pid_for_children` + double-fork (issue #1) |
 | Probe timeout does not SIGKILL the probe child | Hung probes consume a thread until OS reaps them | Explicit SIGKILL on timeout |
 | Thread-per-fd log relay | O(2) threads per container for I/O | epoll-based relay (future) |
 | UDP reply threads are never explicitly reaped | Thread joins on stop flag only; idle sessions may linger until stop | Migrate UDP to async (tokio already used for TCP) |

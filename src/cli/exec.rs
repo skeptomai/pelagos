@@ -284,6 +284,15 @@ fn find_root_pid(pid: i32) -> i32 {
 
 /// Compare `/proc/{pid}/ns/{type}` inodes against `/proc/1/ns/{type}` to discover
 /// which namespaces the container process is in (i.e., different from init).
+///
+/// PID namespace special case: when a PID namespace is active, `pid` may be the
+/// intermediate process P (which lives in the host PID namespace). P's
+/// `/proc/P/ns/pid` matches init, so the normal check misses it. P's children
+/// (the container's PID 1) inhabit the namespace pointed to by
+/// `/proc/P/ns/pid_for_children`. We check that symlink after the main loop and
+/// add it as `Namespace::PID` if it differs from init's PID namespace. Calling
+/// `setns(pid_for_children_fd, CLONE_NEWPID)` in pre_exec followed by `exec()`
+/// then moves the exec'd process into the container's PID namespace.
 pub fn discover_namespaces(
     pid: i32,
 ) -> Result<Vec<(PathBuf, Namespace)>, Box<dyn std::error::Error>> {
@@ -320,6 +329,29 @@ pub fn discover_namespaces(
 
         if container_ino != init_ino {
             result.push((PathBuf::from(container_ns), ns_flag));
+        }
+    }
+
+    // If PID namespace was not found above (because `pid` is the intermediate
+    // process P that lives in the host PID namespace), check pid_for_children.
+    // This symlink points to the namespace that P's children (the container's
+    // PID 1) actually inhabit.
+    let pid_already_found = result.iter().any(|(_, ns)| *ns == Namespace::PID);
+    if !pid_already_found {
+        let pfc_path = format!("/proc/{}/ns/pid_for_children", pid);
+        let init_pid_path = "/proc/1/ns/pid";
+        let pfc_ino = std::fs::metadata(&pfc_path).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        });
+        let init_pid_ino = std::fs::metadata(init_pid_path).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        });
+        if let (Some(pfc), Some(init)) = (pfc_ino, init_pid_ino) {
+            if pfc != init {
+                result.push((PathBuf::from(pfc_path), Namespace::PID));
+            }
         }
     }
 

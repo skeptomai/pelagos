@@ -4648,6 +4648,9 @@ mod exec {
     /// Helper: build an exec Command that joins the container's mount namespace
     /// via pre_exec (setns + fchdir + chroot(".") + chdir("/")) and joins all
     /// other differing namespaces via with_namespace_join().
+    ///
+    /// Mirrors `discover_namespaces` in src/cli/exec.rs including the
+    /// `pid_for_children` fallback for PID namespaces.
     fn build_exec_command(pid: i32, exe: &str, args: &[&str]) -> Command {
         let ns_types: &[(&str, Namespace)] = &[
             ("mnt", Namespace::MOUNT),
@@ -4661,6 +4664,7 @@ mod exec {
 
         let mut cmd = Command::new(exe).args(args);
         let mut has_mount_ns = false;
+        let mut pid_ns_found = false;
 
         for &(ns_name, ns_flag) in ns_types {
             let container_ns = format!("/proc/{}/ns/{}", pid, ns_name);
@@ -4678,8 +4682,30 @@ mod exec {
                     if ns_flag == Namespace::MOUNT {
                         has_mount_ns = true;
                     } else {
+                        if ns_flag == Namespace::PID {
+                            pid_ns_found = true;
+                        }
                         cmd = cmd.with_namespace_join(&container_ns, ns_flag);
                     }
+                }
+            }
+        }
+
+        // pid_for_children fallback: when `pid` is the intermediate process P
+        // (in host PID ns), its children's namespace is in pid_for_children.
+        if !pid_ns_found {
+            let pfc_path = format!("/proc/{}/ns/pid_for_children", pid);
+            let pfc_ino = std::fs::metadata(&pfc_path).map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
+            });
+            let init_pid_ino = std::fs::metadata("/proc/1/ns/pid").map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
+            });
+            if let (Ok(pfc), Ok(init)) = (pfc_ino, init_pid_ino) {
+                if pfc != init {
+                    cmd = cmd.with_namespace_join(&pfc_path, Namespace::PID);
                 }
             }
         }
@@ -4943,6 +4969,121 @@ mod exec {
         // Also verify that /proc/999999/root does not exist, so chroot would fail.
         let root_path = std::path::Path::new("/proc/999999/root");
         assert!(!root_path.exists(), "/proc/999999/root should not exist");
+    }
+
+    /// `remora exec` joins the container's PID namespace via `pid_for_children`.
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts a detached container with a PID namespace (`remora run -d --rootfs`
+    /// always enables Namespace::PID). The container's PID namespace is reachable
+    /// via `/proc/<intermediate_pid>/ns/pid_for_children` — NOT via `ns/pid`, which
+    /// still points at the host PID namespace for the intermediate process.
+    ///
+    /// After the fix, `discover_namespaces` checks `pid_for_children` as a fallback
+    /// when the regular `pid` check finds no difference. We verify the fix by:
+    ///  1. Reading the container's expected PID namespace via `pid_for_children` on the host.
+    ///  2. Running `remora exec <name> readlink /proc/self/ns/pid` inside the container.
+    ///  3. Asserting the two strings are equal.
+    ///
+    /// Failure indicates `discover_namespaces` is not joining the PID namespace, so
+    /// exec'd processes still see the host PID namespace.
+    #[test]
+    #[serial]
+    fn test_exec_joins_pid_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_exec_joins_pid_namespace (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_exec_joins_pid_namespace (no rootfs)");
+                return;
+            }
+        };
+
+        let bin = env!("CARGO_BIN_EXE_remora");
+        let name = "remora-exec-pid-ns-test";
+
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        // Start a container with PID namespace (--rootfs always enables Namespace::PID).
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "30",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("remora run -d");
+        assert!(run_status.success(), "remora run -d failed");
+
+        // Poll until the watcher writes the real PID.
+        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut started = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["pid"].as_i64().unwrap_or(0) > 0 {
+                        started = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(started, "container did not start within 10s");
+
+        let state_data = std::fs::read_to_string(&state_path).expect("read state.json");
+        let state: serde_json::Value = serde_json::from_str(&state_data).expect("parse state.json");
+        let intermediate_pid = state["pid"].as_i64().expect("state.pid") as i32;
+
+        // Read the container's PID namespace from the host via pid_for_children.
+        let pfc_link = format!("/proc/{}/ns/pid_for_children", intermediate_pid);
+        let container_pid_ns = std::fs::read_link(&pfc_link)
+            .expect("read pid_for_children link")
+            .to_string_lossy()
+            .into_owned();
+
+        // Exec into the container and capture the exec'd process's PID namespace.
+        let exec_out = std::process::Command::new(bin)
+            .args(["exec", name, "readlink", "/proc/self/ns/pid"])
+            .output()
+            .expect("remora exec readlink /proc/self/ns/pid");
+
+        let _ = std::process::Command::new(bin)
+            .args(["stop", name])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        assert!(
+            exec_out.status.success(),
+            "remora exec readlink failed: {}",
+            String::from_utf8_lossy(&exec_out.stderr)
+        );
+
+        let exec_pid_ns = String::from_utf8_lossy(&exec_out.stdout).trim().to_string();
+
+        assert_eq!(
+            exec_pid_ns, container_pid_ns,
+            "exec'd process should be in the container's PID namespace ({}), \
+             but is in namespace ({}). \
+             This means discover_namespaces did not join pid_for_children.",
+            container_pid_ns, exec_pid_ns
+        );
     }
 }
 

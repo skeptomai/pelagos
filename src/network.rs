@@ -2070,7 +2070,10 @@ mod tests {
         drop(rt2);
         server_stop2.store(true, Ordering::Relaxed);
 
-        assert_eq!(&response, payload, "proxy should relay bytes unchanged in both directions");
+        assert_eq!(
+            &response, payload,
+            "proxy should relay bytes unchanged in both directions"
+        );
     }
 
     /// Verify that simultaneous connections through the proxy are all served.
@@ -2115,7 +2118,10 @@ mod tests {
             })
             .collect();
 
-        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap_or(false)).collect();
+        let results: Vec<bool> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .collect();
         drop(rt);
         server_stop.store(true, Ordering::Relaxed);
 
@@ -2125,7 +2131,11 @@ mod tests {
             .filter(|(_, &ok)| !ok)
             .map(|(i, _)| i)
             .collect();
-        assert!(failures.is_empty(), "concurrent relay failed for connections: {:?}", failures);
+        assert!(
+            failures.is_empty(),
+            "concurrent relay failed for connections: {:?}",
+            failures
+        );
     }
 
     /// Verify that dropping the runtime releases the listener port.
