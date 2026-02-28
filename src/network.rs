@@ -1123,9 +1123,7 @@ fn parse_port_forward_line(line: &str) -> Option<(String, Ipv4Addr, u16, u16, Po
 }
 
 /// Read all port-forward entries from an already-flocked file.
-fn read_port_forwards_locked(
-    file: &mut std::fs::File,
-) -> io::Result<Vec<PortForwardEntry>> {
+fn read_port_forwards_locked(file: &mut std::fs::File) -> io::Result<Vec<PortForwardEntry>> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
@@ -1242,7 +1240,13 @@ fn enable_port_forwards(
         .collect();
 
     for &(host_port, container_port, proto) in forwards {
-        live.push((ns_name.to_string(), container_ip, host_port, container_port, proto));
+        live.push((
+            ns_name.to_string(),
+            container_ip,
+            host_port,
+            container_port,
+            proto,
+        ));
     }
 
     // Overwrite file with live + new entries in new format.
