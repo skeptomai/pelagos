@@ -9780,7 +9780,9 @@ mod healthcheck_tests {
             .output();
 
         // Run a long-lived container in detached mode.
-        let run = std::process::Command::new(bin)
+        // NOTE: must use Stdio::null() + .status(), not .output() — the watcher child
+        // inherits the pipe write-ends from .output() and blocks until the container exits.
+        let run_status = std::process::Command::new(bin)
             .args([
                 "run",
                 "-d",
@@ -9792,12 +9794,35 @@ mod healthcheck_tests {
                 "-c",
                 "sleep 30",
             ])
-            .output()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
             .expect("remora run");
+        assert!(run_status.success(), "remora run -d failed");
+
+        // Poll until state.json has a non-zero pid. The parent writes state.json
+        // immediately (pid=0) before forking; the watcher child updates it with the
+        // real container PID once the process spawns. We must wait for that second
+        // write, otherwise remora exec sees pid=0 and reports "not running".
+        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last_state = String::from("(not yet written)");
+        while std::time::Instant::now() < deadline {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if v["pid"].as_i64().unwrap_or(0) > 0 {
+                        last_state.clear();
+                        break;
+                    }
+                }
+                last_state = data;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         assert!(
-            run.status.success(),
-            "run failed: {}",
-            String::from_utf8_lossy(&run.stderr)
+            last_state.is_empty(),
+            "container pid still 0 after 10s — watcher likely crashed; last state.json:\n{}",
+            last_state
         );
 
         // /bin/true should exit 0
@@ -9857,7 +9882,9 @@ mod healthcheck_tests {
             .output();
 
         // Run a long-lived container in detached mode.
-        let run = std::process::Command::new(bin)
+        // NOTE: must use Stdio::null() + .status(), not .output() — the watcher child
+        // inherits the pipe write-ends from .output() and blocks until the container exits.
+        let run_status = std::process::Command::new(bin)
             .args([
                 "run",
                 "-d",
@@ -9869,19 +9896,30 @@ mod healthcheck_tests {
                 "-c",
                 "sleep 60",
             ])
-            .output()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
             .expect("remora run");
+        assert!(run_status.success(), "remora run -d failed");
+
+        // Poll until state.json appears (watcher child writes it after container starts).
+        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::path::Path::new(&state_path).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         assert!(
-            run.status.success(),
-            "run failed: {}",
-            String::from_utf8_lossy(&run.stderr)
+            std::path::Path::new(&state_path).exists(),
+            "state.json not created within 10s"
         );
 
         // Patch state.json to inject health_config so the watcher's health monitor
         // picks it up on next state poll. Note: this test patches after-the-fact so
         // we rely on the monitor being started externally (e.g. remora run --health-cmd).
         // For now this test exercises the state.json format and polling logic.
-        let state_path = format!("/run/remora/{}/state.json", name);
         let state_data = std::fs::read_to_string(&state_path).expect("read state.json");
         let mut state: serde_json::Value = serde_json::from_str(&state_data).unwrap();
         state["health_config"] = serde_json::json!({
@@ -9962,7 +10000,9 @@ mod healthcheck_tests {
             .args(["rm", "-f", name])
             .output();
 
-        let run = std::process::Command::new(bin)
+        // NOTE: must use Stdio::null() + .status(), not .output() — the watcher child
+        // inherits the pipe write-ends from .output() and blocks until the container exits.
+        let run_status = std::process::Command::new(bin)
             .args([
                 "run",
                 "-d",
@@ -9974,15 +10014,25 @@ mod healthcheck_tests {
                 "-c",
                 "sleep 60",
             ])
-            .output()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
             .expect("remora run");
-        assert!(
-            run.status.success(),
-            "run failed: {}",
-            String::from_utf8_lossy(&run.stderr)
-        );
+        assert!(run_status.success(), "remora run -d failed");
 
-        let state_path = format!("/run/remora/{}/state.json", name);
+        // Poll until state.json appears.
+        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::path::Path::new(&state_path).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            std::path::Path::new(&state_path).exists(),
+            "state.json not created within 10s"
+        );
 
         // Write unhealthy state to simulate what the monitor would write after
         // retries are exhausted.
