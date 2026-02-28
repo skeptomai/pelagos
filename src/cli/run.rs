@@ -280,9 +280,10 @@ fn build_image_run(
     let mut cmd = Command::new(exe)
         .args(rest)
         .with_image_layers(layers)
-        // Match the rootfs path: UTS (hostname isolation) + PID (container gets
-        // its own PID namespace; entry point becomes PID 1 inside it).
-        .with_namespaces(Namespace::UTS | Namespace::PID);
+        // Add UTS (hostname isolation) + PID namespace.  Use add_namespaces so
+        // we OR into the flags already set by with_image_layers (MOUNT) rather
+        // than replacing them.
+        .add_namespaces(Namespace::UTS | Namespace::PID);
 
     // Apply image config defaults: environment.
     for env_str in &manifest.config.env {

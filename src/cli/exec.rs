@@ -84,7 +84,13 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         // path-based resolution uses the host root (unchanged by setns).
         // fchdir(root_fd) + chroot(".") is the correct way to enter the
         // container's root — same technique as nsenter(1).
-        let root_path = format!("/proc/{}/root", pid);
+        //
+        // IMPORTANT: with PID namespace enabled, state.pid = P (intermediate
+        // process), which never called pivot_root — so /proc/P/root is the HOST
+        // root.  Use find_root_pid() to find C (P's only child), which did
+        // pivot_root and whose /proc/C/root is the container overlay root.
+        let root_pid = find_root_pid(pid);
+        let root_path = format!("/proc/{}/root", root_pid);
         let root_file =
             std::fs::File::open(&root_path).map_err(|e| format!("open {}: {}", root_path, e))?;
         let root_fd = root_file.as_raw_fd();
@@ -115,7 +121,8 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         });
     } else {
         // No mount namespace to join — access rootfs via procfs.
-        cmd = cmd.with_chroot(format!("/proc/{}/root", pid));
+        let root_pid = find_root_pid(pid);
+        cmd = cmd.with_chroot(format!("/proc/{}/root", root_pid));
         // For non-mount-ns exec, use the normal with_cwd mechanism.
         if let Some(ref w) = exec_workdir {
             cmd = cmd.with_cwd(w);
@@ -211,7 +218,9 @@ pub fn exec_in_container(pid: i32, args: &[String]) -> Option<bool> {
         let mnt_ns_file = std::fs::File::open(&mnt_ns_path).ok()?;
         let mnt_ns_fd = mnt_ns_file.as_raw_fd();
 
-        let root_path = format!("/proc/{}/root", pid);
+        // See cmd_exec for the PID-namespace / intermediate-process explanation.
+        let root_pid = find_root_pid(pid);
+        let root_path = format!("/proc/{}/root", root_pid);
         let root_file = std::fs::File::open(&root_path).ok()?;
         let root_fd = root_file.as_raw_fd();
 
@@ -237,13 +246,40 @@ pub fn exec_in_container(pid: i32, args: &[String]) -> Option<bool> {
             Ok(())
         });
     } else {
-        cmd = cmd.with_chroot(format!("/proc/{}/root", pid));
+        let root_pid = find_root_pid(pid);
+        cmd = cmd.with_chroot(format!("/proc/{}/root", root_pid));
     }
 
     match cmd.spawn() {
         Ok(mut child) => child.wait().map(|s| s.success()).ok(),
         Err(_) => None,
     }
+}
+
+/// Given a PID, return the PID of the process that actually performed chroot/pivot_root.
+///
+/// With PID namespace enabled, `state.pid` is the intermediate process P, which
+/// never calls pivot_root (that is done by C, PID 1 inside the container).  P has
+/// exactly one child (C), so `/proc/P/root` still points at the HOST root — not the
+/// container's overlay.  We detect this by checking `/proc/{pid}/task/{pid}/children`:
+/// if there is exactly one child, that child is C and its `/proc/{child}/root` is the
+/// correct container root.
+///
+/// Without PID namespace `state.pid` IS the container process, which may or may not
+/// have children.  In that case we use `pid` directly (and if it has children those
+/// processes are also inside the container, so either PID's root is correct).
+fn find_root_pid(pid: i32) -> i32 {
+    let path = format!("/proc/{}/task/{}/children", pid, pid);
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let children: Vec<i32> = content
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if children.len() == 1 {
+            return children[0];
+        }
+    }
+    pid
 }
 
 /// Compare `/proc/{pid}/ns/{type}` inodes against `/proc/1/ns/{type}` to discover

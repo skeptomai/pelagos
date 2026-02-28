@@ -779,6 +779,12 @@ impl Command {
         self
     }
 
+    /// OR additional namespace flags into the current set without clearing existing flags.
+    pub fn add_namespaces(mut self, namespaces: Namespace) -> Self {
+        self.namespaces |= namespaces;
+        self
+    }
+
     /// Return the current namespace flags.
     pub fn namespaces(&self) -> Namespace {
         self.namespaces
