@@ -44,7 +44,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::process::Command as SysCmd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -407,8 +407,11 @@ pub struct NetworkSetup {
     pub nat_enabled: bool,
     /// Port forwards configured for this container: `(host_port, container_port)`.
     pub port_forwards: Vec<(u16, u16, PortProto)>,
-    /// Userspace TCP proxy stop flag — set to `true` to stop all proxy threads.
-    proxy_stop: Option<Arc<AtomicBool>>,
+    /// Tokio multi-threaded runtime owning all async TCP proxy tasks.
+    /// Dropped via `shutdown_background()` during teardown.
+    proxy_tcp_runtime: Option<tokio::runtime::Runtime>,
+    /// Stop flag for UDP proxy threads (std threads).
+    proxy_udp_stop: Option<Arc<AtomicBool>>,
     /// Name of the network this setup belongs to (e.g. `"remora0"`, `"frontend"`).
     pub network_name: String,
 }
@@ -421,7 +424,8 @@ impl std::fmt::Debug for NetworkSetup {
             .field("container_ip", &self.container_ip)
             .field("nat_enabled", &self.nat_enabled)
             .field("port_forwards", &self.port_forwards)
-            .field("proxy_active", &self.proxy_stop.is_some())
+            .field("proxy_tcp_active", &self.proxy_tcp_runtime.is_some())
+            .field("proxy_udp_active", &self.proxy_udp_stop.is_some())
             .field("network_name", &self.network_name)
             .finish()
     }
@@ -700,12 +704,13 @@ pub fn setup_bridge_network(
         enable_port_forwards(ns_name, &net_def, container_ip, &port_forwards)?;
     }
 
-    // 9. Start userspace TCP proxy for port forwards (handles localhost traffic
-    //    that nftables DNAT in PREROUTING cannot intercept).
-    let proxy_stop = if !port_forwards.is_empty() {
-        Some(start_port_proxies(container_ip, &port_forwards))
+    // 9. Start userspace port proxies (handles localhost traffic that nftables
+    //    DNAT in PREROUTING cannot intercept).  TCP uses an async tokio runtime;
+    //    UDP uses std threads unchanged.
+    let (proxy_tcp_runtime, proxy_udp_stop) = if !port_forwards.is_empty() {
+        start_port_proxies(container_ip, &port_forwards)
     } else {
-        None
+        (None, None)
     };
 
     Ok(NetworkSetup {
@@ -714,7 +719,8 @@ pub fn setup_bridge_network(
         container_ip,
         nat_enabled: nat,
         port_forwards,
-        proxy_stop,
+        proxy_tcp_runtime,
+        proxy_udp_stop,
         network_name: network_name.to_string(),
     })
 }
@@ -728,10 +734,13 @@ pub fn setup_bridge_network(
 ///   table when the last NAT container exits.
 ///
 /// Errors are non-fatal (logged via `log::warn!`).
-pub fn teardown_network(setup: &NetworkSetup) {
-    // Stop userspace TCP proxies first so they don't try to connect to a
-    // vanishing container IP after the veth is deleted.
-    if let Some(ref stop) = setup.proxy_stop {
+pub fn teardown_network(mut setup: NetworkSetup) {
+    // Shut down TCP proxy runtime (cancels all accept loops and relay tasks).
+    if let Some(rt) = setup.proxy_tcp_runtime.take() {
+        rt.shutdown_background();
+    }
+    // Stop UDP proxy threads.
+    if let Some(ref stop) = setup.proxy_udp_stop {
         stop.store(true, Ordering::Relaxed);
     }
     if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
@@ -826,7 +835,8 @@ pub fn attach_network_to_netns(
         container_ip,
         nat_enabled: false,
         port_forwards: Vec::new(),
-        proxy_stop: None,
+        proxy_tcp_runtime: None,
+        proxy_udp_stop: None,
         network_name: network_name.to_string(),
     })
 }
@@ -1354,89 +1364,151 @@ fn disable_port_forwards(ns_name: &str, net: &NetworkDef) {
     }
 }
 
-// ── Userspace TCP port proxy ─────────────────────────────────────────────────
+// ── Userspace port proxy ──────────────────────────────────────────────────────
 
-/// Start background proxy threads for each port mapping.
+/// Start port proxies for each port mapping.
 ///
 /// nftables DNAT rules in the PREROUTING chain handle traffic from external
 /// hosts, but traffic originating from localhost bypasses PREROUTING entirely
 /// (it goes through OUTPUT). Docker solves this with `docker-proxy` — a
 /// userspace relay. This is Remora's equivalent for both TCP and UDP.
 ///
-/// Each port mapping gets a listener on `0.0.0.0:{host_port}`. For TCP,
-/// accepted connections are relayed bidirectionally. For UDP, packets are
-/// relayed with per-client session sockets and a 30-second idle timeout.
+/// TCP uses a tokio multi-threaded runtime: all accept loops and relay tasks
+/// run as async tasks distributed across `min(available_parallelism, 4)` worker
+/// threads.  O(1) threads relative to connection count.
 ///
-/// Returns a stop flag that must be set to `true` on teardown.
+/// UDP still uses std threads: one thread per port plus one thread per active
+/// client session (30-second idle eviction).
 ///
-/// # FIXME (scaling)
-/// The current model spawns one thread per port (TCP) or one thread per port
-/// plus one thread per active UDP session. This is fine for development but
-/// scales poorly under high connection counts. A future `remora network proxy`
-/// refactor should replace this with a single tokio async task pool (tokio is
-/// already a dependency). Do not address this now.
+/// Returns `(tcp_runtime, udp_stop)`. The caller stores both in `NetworkSetup`;
+/// teardown calls `rt.shutdown_background()` for TCP and sets the stop flag
+/// for UDP.
 fn start_port_proxies(
     container_ip: Ipv4Addr,
     forwards: &[(u16, u16, PortProto)],
-) -> Arc<AtomicBool> {
-    let stop = Arc::new(AtomicBool::new(false));
+) -> (Option<tokio::runtime::Runtime>, Option<Arc<AtomicBool>>) {
+    let tcp_forwards: Vec<(u16, u16)> = forwards
+        .iter()
+        .filter(|(_, _, p)| matches!(p, PortProto::Tcp | PortProto::Both))
+        .map(|&(h, c, _)| (h, c))
+        .collect();
 
-    for &(host_port, container_port, proto) in forwards {
-        if matches!(proto, PortProto::Tcp | PortProto::Both) {
-            let stop = Arc::clone(&stop);
-            let target = SocketAddr::from((container_ip, container_port));
-            std::thread::spawn(move || {
-                start_tcp_proxy_listener(host_port, target, stop);
-            });
-        }
-        if matches!(proto, PortProto::Udp | PortProto::Both) {
+    let udp_forwards: Vec<(u16, u16)> = forwards
+        .iter()
+        .filter(|(_, _, p)| matches!(p, PortProto::Udp | PortProto::Both))
+        .map(|&(h, c, _)| (h, c))
+        .collect();
+
+    let tcp_runtime = if !tcp_forwards.is_empty() {
+        Some(start_tcp_proxies_async(container_ip, &tcp_forwards))
+    } else {
+        None
+    };
+
+    let udp_stop = if !udp_forwards.is_empty() {
+        let stop = Arc::new(AtomicBool::new(false));
+        for (host_port, container_port) in udp_forwards {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 start_udp_proxy(host_port, container_ip, container_port, stop);
             });
         }
-    }
+        Some(stop)
+    } else {
+        None
+    };
 
-    stop
+    (tcp_runtime, udp_stop)
 }
 
-/// Accept loop for a single TCP port mapping.
-fn start_tcp_proxy_listener(host_port: u16, target: SocketAddr, stop: Arc<AtomicBool>) {
-    let listener = match TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], host_port))) {
-        Ok(l) => l,
-        Err(e) => {
-            log::warn!(
-                "tcp proxy: cannot bind 0.0.0.0:{}: {} (nftables DNAT still active)",
-                host_port,
-                e
-            );
-            return;
-        }
-    };
-    listener
-        .set_nonblocking(true)
-        .expect("set_nonblocking failed");
+/// Build a tokio multi-threaded runtime and spawn one async accept-loop task
+/// per TCP port mapping.  Worker threads: `min(available_parallelism, 4)`.
+///
+/// The caller owns the returned `Runtime`.  Dropping it (or calling
+/// `shutdown_background`) cancels all accept loops and in-flight relay tasks
+/// and terminates the worker threads.
+fn start_tcp_proxies_async(
+    container_ip: Ipv4Addr,
+    tcp_forwards: &[(u16, u16)],
+) -> tokio::runtime::Runtime {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_io()
+        .enable_time()
+        .thread_name("remora-tcp-proxy")
+        .build()
+        .expect("tokio tcp proxy runtime");
+
+    for &(host_port, container_port) in tcp_forwards {
+        let target = SocketAddr::from((container_ip, container_port));
+        rt.spawn(tcp_accept_loop(host_port, target));
+    }
+
+    rt
+}
+
+/// Async accept loop for a single TCP port mapping.
+///
+/// Binds a `TcpListener` on `0.0.0.0:{host_port}` and spawns a `tcp_relay`
+/// task for each accepted connection.  Runs until the runtime is dropped.
+async fn tcp_accept_loop(host_port: u16, target: SocketAddr) {
+    let listener =
+        match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], host_port))).await {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!(
+                    "tcp proxy: cannot bind 0.0.0.0:{}: {} (nftables DNAT still active)",
+                    host_port,
+                    e
+                );
+                return;
+            }
+        };
 
     log::debug!("tcp proxy: 0.0.0.0:{} -> {}", host_port, target);
 
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((client, _addr)) => {
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    proxy_relay(client, target, &stop);
-                });
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                tokio::spawn(tcp_relay(stream, target));
             }
             Err(e) => {
-                if !stop.load(Ordering::Relaxed) {
-                    log::warn!("tcp proxy accept error on port {}: {}", host_port, e);
-                }
+                log::warn!("tcp proxy accept error on port {}: {}", host_port, e);
                 break;
             }
         }
+    }
+}
+
+/// Async bidirectional TCP relay between a client socket and a container target.
+///
+/// Connects to `target` with a 5-second timeout, then runs
+/// `copy_bidirectional` until either side closes or the runtime is dropped.
+async fn tcp_relay(mut client: tokio::net::TcpStream, target: SocketAddr) {
+    let mut upstream = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(target),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            log::debug!("tcp proxy: cannot connect to {}: {}", target, e);
+            return;
+        }
+        Err(_) => {
+            log::debug!("tcp proxy: connect to {} timed out", target);
+            return;
+        }
+    };
+
+    if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+        log::debug!("tcp proxy relay error: {}", e);
     }
 }
 
@@ -1546,70 +1618,6 @@ fn start_udp_proxy(
             }
         }
     }
-}
-
-/// Bidirectional TCP relay between a client socket and a container target.
-///
-/// Uses two threads (one per direction). Terminates when either side closes
-/// or the stop flag is set.
-fn proxy_relay(client: TcpStream, target: SocketAddr, stop: &AtomicBool) {
-    let upstream = match TcpStream::connect_timeout(&target, std::time::Duration::from_secs(5)) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("port proxy: cannot connect to {}: {}", target, e);
-            return;
-        }
-    };
-
-    // Set read timeouts so threads check the stop flag periodically.
-    let timeout = Some(std::time::Duration::from_millis(200));
-    let _ = client.set_read_timeout(timeout);
-    let _ = upstream.set_read_timeout(timeout);
-
-    let client_r = client;
-    let upstream_r = upstream;
-    let client_w = match client_r.try_clone() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let upstream_w = match upstream_r.try_clone() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let stop_flag = stop as *const AtomicBool as usize; // share across threads
-    let t1 = std::thread::spawn(move || {
-        let stop = unsafe { &*(stop_flag as *const AtomicBool) };
-        copy_until_done(client_r, upstream_w, stop);
-    });
-    let t2 = std::thread::spawn(move || {
-        let stop = unsafe { &*(stop_flag as *const AtomicBool) };
-        copy_until_done(upstream_r, client_w, stop);
-    });
-
-    let _ = t1.join();
-    let _ = t2.join();
-}
-
-/// Copy bytes from `reader` to `writer` until EOF, error, or stop flag.
-fn copy_until_done(mut reader: TcpStream, mut writer: TcpStream, stop: &AtomicBool) {
-    let mut buf = [0u8; 8192];
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        match reader.read(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                if std::io::Write::write_all(&mut writer, &buf[..n]).is_err() {
-                    break;
-                }
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => break,
-        }
-    }
-    let _ = writer.shutdown(std::net::Shutdown::Write);
 }
 
 // ── N5: pasta user-mode networking ───────────────────────────────────────────

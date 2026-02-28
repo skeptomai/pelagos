@@ -4818,7 +4818,7 @@ impl Child {
         for net in self.secondary_networks.drain(..) {
             crate::network::teardown_secondary_network(&net);
         }
-        if let Some(ref net) = self.network.take() {
+        if let Some(net) = self.network.take() {
             crate::network::teardown_network(net);
         }
         if let Some(ref mut p) = self.pasta.take() {

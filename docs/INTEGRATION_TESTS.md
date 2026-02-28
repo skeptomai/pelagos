@@ -1269,8 +1269,22 @@ Spawns a container with a port forward that exits immediately, waits for it,
 then verifies the proxy port is no longer bound (a fresh `TcpListener::bind`
 on the same port should succeed).
 
-Failure indicates the proxy stop flag is not set during teardown, leaving
-orphaned listener threads holding the port.
+Failure indicates the proxy runtime is not shut down during teardown, leaving
+orphaned listener tasks holding the port.
+
+---
+
+### `test_port_proxy_multiple_connections`
+**Requires:** root, alpine-rootfs
+
+Spawns a container with port 19192→8080 running a static-response server
+(`while true; do echo PONG | nc -l -p 8080; done`). Makes 5 sequential
+connections from the host through the async proxy; each connection reads the
+response and verifies it contains "PONG".
+
+Failure indicates the tokio accept loop exits prematurely after the first relay
+task completes, or that `copy_bidirectional` does not propagate server-side EOF
+cleanly (causing subsequent connections to hang or return empty data).
 
 ---
 

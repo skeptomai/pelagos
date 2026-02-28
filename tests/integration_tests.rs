@@ -6419,6 +6419,93 @@ mod port_proxy {
             bind_result.err()
         );
     }
+
+    /// test_port_proxy_multiple_connections
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Spawns a container with port 19192→8080 running a static-response server
+    /// (`while true; do echo PONG | nc -l -p 8080; done`). Connects 5 times
+    /// sequentially from the host through the async proxy, each time reading the
+    /// response.
+    ///
+    /// This validates that the tokio accept loop correctly handles multiple
+    /// successive connections — i.e. the loop does not exit after the first
+    /// relay task completes, and `copy_bidirectional` propagates EOF cleanly
+    /// so the next accept can proceed.
+    ///
+    /// Failure indicates the async accept loop exits prematurely or
+    /// `copy_bidirectional` hangs without propagating the server-side EOF.
+    #[test]
+    #[serial(nat)]
+    fn test_port_proxy_multiple_connections() {
+        if !is_root() {
+            eprintln!("Skipping test_port_proxy_multiple_connections: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_port_proxy_multiple_connections: alpine-rootfs not found");
+            return;
+        };
+
+        // Static-response server: sends "PONG\n" to each connecting client, then
+        // closes. The while loop restarts nc so subsequent connections are served.
+        // Uses only busybox-compatible nc flags (-l -p).
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "while true; do echo PONG | nc -l -p 8080 2>/dev/null; done",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(19192, 8080)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn container");
+
+        // Wait for nc to start listening.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        const N: usize = 5;
+        let mut failures = Vec::new();
+
+        for i in 0..N {
+            use std::io::Read;
+            match std::net::TcpStream::connect("127.0.0.1:19192") {
+                Ok(mut stream) => {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .ok();
+                    let mut buf = String::new();
+                    let _ = stream.read_to_string(&mut buf);
+                    if !buf.contains("PONG") {
+                        failures.push(format!("conn {}: got {:?}", i, buf));
+                    }
+                    // Drop stream first so FIN reaches nc, which then exits.
+                    // Sleep afterwards gives the shell loop time to restart nc.
+                    drop(stream);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                Err(e) => {
+                    failures.push(format!("conn {}: connect failed: {}", i, e));
+                }
+            }
+        }
+
+        unsafe { libc::kill(child.pid(), libc::SIGKILL) };
+        let _ = child.wait();
+
+        assert!(
+            failures.is_empty(),
+            "Port proxy multiple-connection test failed:\n{}",
+            failures.join("\n")
+        );
+    }
 }
 
 // ==========================================================================

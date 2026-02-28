@@ -18,7 +18,7 @@ seccompiler = "0.5.0"  # Pure Rust seccomp-BPF for syscall filtering (used by Fi
 serde = { version = "1", features = ["derive"] }  # JSON serialization for OCI config.json / state.json
 serde_json = "1"  # JSON parsing for OCI bundle config and state files
 oci-client = "0.16"  # OCI registry client for image pulls
-tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }  # Async runtime (used only for image pulls)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util"] }  # Async runtime: image pulls + async TCP port proxy
 flate2 = "1"  # Gzip decompression for OCI layer tarballs
 tar = "0.4"  # Tar extraction for OCI layers
 tempfile = "3"  # Temp files for layer downloads

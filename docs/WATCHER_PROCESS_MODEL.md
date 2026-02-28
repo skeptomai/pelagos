@@ -118,26 +118,34 @@ dies or is killed by the OS).
 
 When the container has port mappings (`-p HOST:CONTAINER[/tcp|udp|both]`),
 `setup_bridge_network` calls `start_port_proxies` **before the container is forked**.
-All proxy threads therefore live in the **watcher process**, not the container.
+All proxy tasks/threads therefore live in the **watcher process**, not the container.
 The nftables DNAT rules handle non-localhost traffic; the userspace proxy handles
 traffic from `localhost` (which nftables PREROUTING cannot intercept).
 
-**Per TCP-mapped port — 1 persistent thread:**
+#### TCP proxy — tokio multi-threaded runtime
 
-| Thread | Purpose | Lifetime |
-|--------|----------|----------|
-| **TCP listener** (`start_tcp_proxy_listener`) | Accept loop on `0.0.0.0:{host_port}`; dispatches each connection to a relay pair | Until stop flag set at container teardown |
+TCP port forwarding uses a single tokio multi-threaded runtime
+(`new_multi_thread`, `min(available_parallelism, 4)` worker threads named
+`remora-tcp-proxy`). All accept loops and relay tasks are async tasks on this
+pool. Connection count does **not** affect OS thread count.
 
-**Per active TCP connection — 2 transient threads (spawned by `proxy_relay`):**
+**Per watcher (all TCP-mapped ports share one runtime) — W worker threads:**
 
-| Thread | Purpose | Lifetime |
-|--------|----------|----------|
-| **TCP relay → container** | Copies bytes: client socket → container socket | Until either half closes or stop flag set |
-| **TCP relay → client** | Copies bytes: container socket → client socket | Until either half closes or stop flag set |
+| Threads | Purpose | Lifetime |
+|---------|----------|----------|
+| **W tokio worker threads** | Drive all async TCP accept loops and relay tasks | Until `Runtime::shutdown_background()` at container teardown |
 
-These threads are spawned inside `proxy_relay`, which itself is called from the TCP
-listener thread for each accepted connection. They terminate when either side closes
-the connection or when the stop flag is set.
+**Per TCP-mapped port — 1 persistent async task:**
+
+| Task | Purpose | Lifetime |
+|------|----------|----------|
+| **`tcp_accept_loop`** | Async accept on `0.0.0.0:{host_port}`; spawns a `tcp_relay` task per connection | Until runtime is dropped |
+
+**Per active TCP connection — 1 transient async task:**
+
+| Task | Purpose | Lifetime |
+|------|----------|----------|
+| **`tcp_relay`** | `tokio::io::copy_bidirectional` between client and container | Until either side closes |
 
 **Per UDP-mapped port — 1 persistent thread:**
 
@@ -158,27 +166,32 @@ entries idle longer than 30 seconds.
 
 ### Thread count formula
 
+Let W = `min(available_parallelism, 4)` (tokio TCP worker threads; 0 if no TCP ports).
+
 ```
 total = 3 (static)
-      + 1 (health monitor, if HEALTHCHECK)
-      + N_tcp_ports          (TCP listener threads)
-      + 2 × active_tcp_conns (TCP relay pairs, transient)
+      + 1  (health monitor, if HEALTHCHECK)
+      + W  (TCP proxy worker threads, if any TCP ports; shared across all TCP ports)
       + N_udp_ports          (UDP proxy threads)
       + active_udp_sessions  (UDP reply threads, transient)
 ```
 
-At rest with one TCP port and one UDP port and no HEALTHCHECK: **5 threads** (main +
-stdout + stderr + 1 TCP listener + 1 UDP proxy).
+Active TCP connections do **not** add threads — they are async tasks on the W workers.
+
+At rest with one TCP port and one UDP port, no HEALTHCHECK, 4-core machine:
+**8 threads** (3 static + 4 TCP workers + 1 UDP proxy).
+
+At rest with one TCP port, no UDP, no HEALTHCHECK: **7 threads**.
+Under 1000 simultaneous TCP connections on the same port: still **7 threads**.
 
 ### Scalability note
 
-The thread-per-fd relay approach is simple and correct for modest workloads. For N
-simultaneously running containers, the watcher processes consume O(N) threads across N
-separate processes (each watcher is its own process). Under high TCP connection counts,
-the relay-pair-per-connection model grows linearly. A future refactor replacing the
-userspace proxy with a single tokio async task pool (tokio is already a dependency)
-would reduce this to O(1) threads per port. This is documented as future work in
-`src/network.rs`.
+The TCP proxy is now O(W) threads regardless of connection count, where W ≤ 4.
+Under high TCP connection counts all relay tasks are multiplexed cooperatively across
+the W worker threads by the tokio async executor.
+
+The UDP proxy retains the thread-per-session model: O(active UDP sessions) threads.
+A future refactor could migrate UDP to an async model as well.
 
 ---
 
@@ -290,6 +303,5 @@ address it. This is documented as future work.
 | `remora exec` does not join container PID namespace | `ps` in exec'd shell shows host PIDs | Check `pid_for_children` in `discover_namespaces` |
 | Probe timeout does not SIGKILL the probe child | Hung probes consume a thread until OS reaps them | Explicit SIGKILL on timeout |
 | Thread-per-fd log relay | O(2) threads per container for I/O | epoll-based relay (future) |
-| TCP relay-pair-per-connection model | O(2 × connections) threads per TCP-mapped port under load | Replace with single tokio async proxy (tokio already a dep) |
-| UDP reply threads are never explicitly reaped | Thread joins on stop flag only; idle sessions may linger until stop | Explicit join/kill on session eviction |
+| UDP reply threads are never explicitly reaped | Thread joins on stop flag only; idle sessions may linger until stop | Migrate UDP to async (tokio already used for TCP) |
 | Watcher death does not propagate to PID 1 | Container orphaned if watcher dies | `PR_SET_CHILD_SUBREAPER` on watcher |
