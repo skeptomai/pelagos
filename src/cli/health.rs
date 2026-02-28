@@ -5,7 +5,7 @@
 //! updates `state.json` with the current [`HealthStatus`].
 
 use super::{check_liveness, read_state, write_state, HealthConfig, HealthStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,9 +101,16 @@ fn run_probe(pid: i32, config: &HealthConfig) -> bool {
     let args = config.cmd.clone();
     let timeout = Duration::from_secs(config.timeout_secs.max(1));
 
+    // Shared slot: the probe thread writes the child's host PID here as soon
+    // as it successfully spawns the process, before blocking on wait().
+    // On timeout we read the PID and SIGKILL it so the child does not linger.
+    let child_pid = Arc::new(AtomicI32::new(0));
+    let child_pid_clone = Arc::clone(&child_pid);
+
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
     std::thread::spawn(move || {
-        let result = super::exec::exec_in_container(pid, &args).unwrap_or(false);
+        let result = super::exec::exec_in_container_with_pid_sink(pid, &args, child_pid_clone)
+            .unwrap_or(false);
         let _ = tx.send(result);
     });
 
@@ -111,6 +118,11 @@ fn run_probe(pid: i32, config: &HealthConfig) -> bool {
         Ok(passed) => passed,
         Err(_) => {
             log::warn!("health: probe timed out after {}s", config.timeout_secs);
+            let cpid = child_pid.load(Ordering::Relaxed);
+            if cpid > 0 {
+                log::warn!("health: killing timed-out probe child (pid={})", cpid);
+                unsafe { libc::kill(cpid, libc::SIGKILL) };
+            }
             false
         }
     }

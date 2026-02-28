@@ -10488,4 +10488,98 @@ mod healthcheck_tests {
         assert_eq!(loaded.start_period_secs, 5);
         assert_eq!(loaded.retries, 4);
     }
+
+    /// Verify that a health probe child process spawned inside the container
+    /// can be found by PID and killed — the key mechanism that
+    /// `run_probe` uses when `recv_timeout` fires.
+    ///
+    /// Before the fix, `exec_in_container` was a black box; on timeout the
+    /// probe child kept running forever.  The fix adds
+    /// `exec_in_container_with_pid_sink` which stores the child's host PID
+    /// before blocking on `wait()`.  The health monitor reads that PID and
+    /// sends `SIGKILL`.
+    ///
+    /// This test drives the library-level mechanism:
+    /// 1. Start a container running `sleep 60` with a PID namespace.
+    /// 2. Spawn a "probe" (`sleep 300`) inside the container's chroot using
+    ///    `remora::container::Command`; record its PID.
+    /// 3. Verify the probe child is alive.
+    /// 4. Send `SIGKILL` to the probe child (as `run_probe` does on timeout).
+    /// 5. Verify the probe child is dead.
+    ///
+    /// Failure means either the spawned child's PID is not a real killable
+    /// host process, or the SIGKILL did not propagate — either way the
+    /// timeout-kill in `run_probe` would be ineffective.
+    #[test]
+    #[serial]
+    fn test_probe_child_pid_is_killable() {
+        if !is_root() {
+            eprintln!("Skipping test_probe_child_pid_is_killable (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_probe_child_pid_is_killable (no rootfs)");
+                return;
+            }
+        };
+
+        // Start a background container.
+        let mut container = Command::new("/bin/sleep")
+            .args(["60"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
+            .with_proc_mount()
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn container");
+
+        let container_pid = container.pid();
+
+        // Spawn a "probe" process — a long sleep inside the container's rootfs.
+        // This mirrors what exec_in_container_with_pid_sink does before wait().
+        let mut probe = Command::new("sleep")
+            .args(["300"])
+            .with_chroot(format!("/proc/{}/root", container_pid))
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("spawn probe");
+
+        let probe_pid = probe.pid();
+        assert!(probe_pid > 0, "probe PID should be positive");
+
+        // Verify the probe child is alive.
+        let alive = unsafe { libc::kill(probe_pid, 0) == 0 };
+        assert!(
+            alive,
+            "probe child (pid={}) should be alive before kill",
+            probe_pid
+        );
+
+        // Simulate the run_probe timeout-kill path.
+        unsafe { libc::kill(probe_pid, libc::SIGKILL) };
+
+        // Reap the probe child.  After SIGKILL the wait() should return
+        // almost immediately.  A process that SIGKILL cannot kill would block
+        // here and trigger the test timeout instead of the assertion below.
+        let probe_status = probe.wait().expect("wait on probe child");
+
+        // Clean up before asserting.
+        unsafe { libc::kill(container_pid, libc::SIGKILL) };
+        let _ = container.wait();
+
+        // wait() returning at all means the child is dead and reaped.
+        // Double-check: after reaping, kill(pid, 0) must return ESRCH.
+        let still_alive = unsafe { libc::kill(probe_pid, 0) == 0 };
+        assert!(
+            !still_alive,
+            "probe child (pid={}) still visible after wait(); \
+             timed-out probe children would linger indefinitely",
+            probe_pid
+        );
+        let _ = probe_status; // success/failure irrelevant — killed by signal
+    }
 }

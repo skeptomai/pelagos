@@ -4,6 +4,10 @@ use super::{check_liveness, parse_user, read_state, ContainerStatus};
 use remora::container::{Command, Namespace, Stdio};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicI32, Ordering},
+    Arc,
+};
 
 #[derive(Debug, clap::Args)]
 pub struct ExecArgs {
@@ -252,6 +256,83 @@ pub fn exec_in_container(pid: i32, args: &[String]) -> Option<bool> {
 
     match cmd.spawn() {
         Ok(mut child) => child.wait().map(|s| s.success()).ok(),
+        Err(_) => None,
+    }
+}
+
+/// Like [`exec_in_container`] but stores the spawned child's host PID into
+/// `child_pid_sink` (via `Relaxed` store) before blocking on `wait()`.
+///
+/// This lets a caller that enforces a timeout read the PID and send `SIGKILL`
+/// to the child if the wait does not complete in time.  The sink is set to
+/// `0` if spawn fails.
+pub fn exec_in_container_with_pid_sink(
+    pid: i32,
+    args: &[String],
+    child_pid_sink: Arc<AtomicI32>,
+) -> Option<bool> {
+    if args.is_empty() || pid <= 0 {
+        return None;
+    }
+
+    let ns_entries = discover_namespaces(pid).ok()?;
+
+    let mut cmd = Command::new(&args[0]).args(&args[1..]);
+    cmd = cmd
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        .stderr(Stdio::Null);
+
+    let mut has_mount_ns = false;
+    for (path, ns) in &ns_entries {
+        if *ns == Namespace::MOUNT {
+            has_mount_ns = true;
+        } else {
+            cmd = cmd.with_namespace_join(path, *ns);
+        }
+    }
+
+    if has_mount_ns {
+        let mnt_ns_path = format!("/proc/{}/ns/mnt", pid);
+        let mnt_ns_file = std::fs::File::open(&mnt_ns_path).ok()?;
+        let mnt_ns_fd = mnt_ns_file.as_raw_fd();
+
+        let root_pid = find_root_pid(pid);
+        let root_path = format!("/proc/{}/root", root_pid);
+        let root_file = std::fs::File::open(&root_path).ok()?;
+        let root_fd = root_file.as_raw_fd();
+
+        cmd = cmd.with_pre_exec(move || {
+            let _keep_mnt = &mnt_ns_file;
+            let _keep_root = &root_file;
+            unsafe {
+                if libc::setns(mnt_ns_fd, libc::CLONE_NEWNS) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fchdir(root_fd) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let dot = std::ffi::CString::new(".").unwrap();
+                if libc::chroot(dot.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let root_c = std::ffi::CString::new("/").unwrap();
+                if libc::chdir(root_c.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    } else {
+        let root_pid = find_root_pid(pid);
+        cmd = cmd.with_chroot(format!("/proc/{}/root", root_pid));
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            child_pid_sink.store(child.pid(), Ordering::Relaxed);
+            child.wait().map(|s| s.success()).ok()
+        }
         Err(_) => None,
     }
 }

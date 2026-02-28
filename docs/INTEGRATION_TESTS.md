@@ -991,6 +991,22 @@ either the subreaper prctl was not called, or the kernel did not honour it.
 A failing test indicates containers would become orphaned on an unexpected
 watcher crash (OOM kill, etc.).
 
+### `healthcheck_tests::test_probe_child_pid_is_killable`
+**Requires:** root, rootfs
+
+Verifies that a health-probe child process can be SIGKILL'd from outside, which
+is the mechanism `run_probe` uses to clean up a timed-out probe.
+
+Starts a container, then spawns a second `Command::new("sleep").args(["300"])`
+inside the container's rootfs (via `with_chroot("/proc/{pid}/root")`).  Records
+the spawned probe's host PID, sends `SIGKILL` to it, calls `probe.wait()` to
+reap the zombie, then asserts `kill(probe_pid, 0)` returns `ESRCH` — confirming
+the PID slot was released.
+
+Failure means that after SIGKILL + wait the process still appears alive (e.g.
+because zombie reaping didn't work), which would prevent the health monitor from
+detecting that a timed-out probe child was successfully cleaned up.
+
 ---
 
 ## Minimal /dev Tests (`dev` module)
