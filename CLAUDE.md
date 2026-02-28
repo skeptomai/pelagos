@@ -2,6 +2,20 @@
 
 ## ⚠️ CRITICAL RULES FOR CLAUDE ⚠️
 
+### File Placement Rules
+**NEVER create files in `/tmp` or any other ephemeral location.** All project
+artifacts belong in the repository:
+
+- **Scripts** → `scripts/` (with a descriptive name, e.g. `scripts/test-healthcheck.sh`)
+- **Documentation / design docs** → `docs/`
+- **Plans and task notes** → `ONGOING_TASKS.md` (with references to relevant `docs/` files)
+- **Test build contexts** → `scripts/<feature>-context/` (e.g. `scripts/hc-test-context/Remfile`)
+
+Files dropped in `/tmp` are lost on reboot and never committed — they provide no regression
+value and violate the principle that every artifact ships with the code.
+
+---
+
 ### Write Plans to ONGOING_TASKS.md
 **Before presenting any implementation plan to the user, write the full plan to
 `ONGOING_TASKS.md` in the project root.** This ensures plans survive context resets.
