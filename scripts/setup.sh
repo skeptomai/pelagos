@@ -74,14 +74,19 @@ chown root:remora /var/lib/remora
 chmod 0755 /var/lib/remora
 ok "/var/lib/remora (root:remora 0755)"
 
-# Image store subdirs: root:remora 0775
+# Image store subdirs: root:remora 2775 (setgid + group-writable)
 # These are written by image pull and build — group members can write.
 # Content-addressed (sha256 digest as directory name) so group-write is safe.
+# The setgid bit (2xxx) ensures that subdirectories created by root also
+# inherit the 'remora' group, so group members can write into them.
+# We also recursively chown any existing subdirs that were created by a
+# previous root pull before the setgid bit was in place.
 for subdir in images layers build-cache; do
     mkdir -p "/var/lib/remora/$subdir"
-    chown root:remora "/var/lib/remora/$subdir"
-    chmod 0775 "/var/lib/remora/$subdir"
-    ok "/var/lib/remora/$subdir (root:remora 0775)"
+    chown -R root:remora "/var/lib/remora/$subdir"
+    chmod -R g+rwX "/var/lib/remora/$subdir"
+    chmod g+s "/var/lib/remora/$subdir"
+    ok "/var/lib/remora/$subdir (root:remora 2775, setgid, existing subdirs repaired)"
 done
 
 # Runtime subdirs: root:root 0755
