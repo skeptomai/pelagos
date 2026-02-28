@@ -501,6 +501,24 @@ pub struct TmpfsMount {
     pub options: String,
 }
 
+/// A kernel filesystem mount (proc, sysfs, devpts, mqueue, cgroup, etc.).
+///
+/// Used by the OCI bundle handler to mount special filesystems that are specified
+/// in `config.json` rather than being auto-detected by remora.
+#[derive(Debug, Clone)]
+pub struct KernelMount {
+    /// Filesystem type passed to `mount(2)` (e.g. `"proc"`, `"sysfs"`, `"devpts"`).
+    pub fs_type: String,
+    /// Source argument passed to `mount(2)` (often same as `fs_type` or `"none"`).
+    pub source: String,
+    /// Absolute path inside the container where the fs is mounted.
+    pub target: PathBuf,
+    /// `MS_*` mount flags (e.g. `MS_NOSUID | MS_NOEXEC`).
+    pub flags: libc::c_ulong,
+    /// Optional data string (e.g. `"newinstance,ptmxmode=0666"` for devpts).
+    pub data: String,
+}
+
 /// Overlay filesystem configuration — lower layer is `chroot_dir`; upper and work
 /// are user-supplied. The merged mount point is managed by Remora.
 #[derive(Debug, Clone)]
@@ -633,6 +651,7 @@ pub struct Command {
     // Filesystem mounts
     bind_mounts: Vec<BindMount>,
     tmpfs_mounts: Vec<TmpfsMount>,
+    kernel_mounts: Vec<KernelMount>,
     // Resource limits
     rlimits: Vec<ResourceLimit>,
     // Cgroup-based resource management
@@ -693,6 +712,7 @@ impl Command {
             readonly_paths: Vec::new(),
             bind_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
+            kernel_mounts: Vec::new(),
             rlimits: Vec::new(),
             cgroup_config: None,
             network_config: None,
@@ -1607,6 +1627,31 @@ impl Command {
         self
     }
 
+    /// Mount a kernel filesystem (proc, sysfs, devpts, mqueue, cgroup2, …) at `target`.
+    ///
+    /// Used by the OCI bundle handler to honour arbitrary `mounts` entries from
+    /// `config.json`. `flags` should be `MS_*` constants from `libc`; `data` is
+    /// passed verbatim to the kernel (e.g. `"newinstance,ptmxmode=0666"` for devpts).
+    ///
+    /// The mount is performed inside the container's mount namespace, after chroot/pivot_root.
+    pub fn with_kernel_mount<P: Into<PathBuf>>(
+        mut self,
+        fs_type: impl Into<String>,
+        source: impl Into<String>,
+        target: P,
+        flags: libc::c_ulong,
+        data: impl Into<String>,
+    ) -> Self {
+        self.kernel_mounts.push(KernelMount {
+            fs_type: fs_type.into(),
+            source: source.into(),
+            target: target.into(),
+            flags,
+            data: data.into(),
+        });
+        self
+    }
+
     /// Mount a named volume at `target` inside the container.
     ///
     /// This is syntactic sugar for [`with_bind_mount`] using the volume's host path.
@@ -1770,6 +1815,7 @@ impl Command {
         let devices = self.devices.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
+        let kernel_mounts = self.kernel_mounts.clone();
         let hostname = self.hostname.clone();
         let use_id_helpers = self.use_id_helpers;
         // Loopback/Pasta mode: bring up lo inside pre_exec (after unshare(NEWNET)).
@@ -2841,6 +2887,30 @@ impl Command {
                     }
                 }
 
+                // Mount kernel filesystems (proc, sysfs, devpts, mqueue, cgroup2, …)
+                // specified by OCI config.json `mounts` entries.
+                for km in &kernel_mounts {
+                    std::fs::create_dir_all(&km.target)
+                        .map_err(|e| io::Error::other(format!("kernel mount mkdir {}: {}", km.target.display(), e)))?;
+                    let tgt_c = CString::new(km.target.as_os_str().as_encoded_bytes()).unwrap();
+                    let src_c = CString::new(km.source.as_bytes()).unwrap();
+                    let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
+                    let dat_c = CString::new(km.data.as_bytes()).unwrap();
+                    let dat_ptr: *const libc::c_void = if km.data.is_empty() {
+                        ptr::null()
+                    } else {
+                        dat_c.as_ptr() as *const libc::c_void
+                    };
+                    let result = libc::mount(src_c.as_ptr(), tgt_c.as_ptr(), fst_c.as_ptr(), km.flags, dat_ptr);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "mount {} ({}) at {}: {}",
+                            km.fs_type, km.source, km.target.display(),
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
                 // Step 4.7: Apply sysctl settings (write to /proc/sys/)
                 for (key, value) in &sysctl {
                     // Convert "net.ipv4.ip_forward" -> "/proc/sys/net/ipv4/ip_forward"
@@ -3411,6 +3481,7 @@ impl Command {
         let devices = self.devices.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
+        let kernel_mounts = self.kernel_mounts.clone();
         let hostname = self.hostname.clone();
         let use_id_helpers = self.use_id_helpers;
         let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
@@ -4352,6 +4423,30 @@ impl Command {
                         return Err(io::Error::other(format!(
                             "tmpfs mount {}: {}",
                             tm.target.display(),
+                            io::Error::last_os_error()
+                        )));
+                    }
+                }
+
+                // Mount kernel filesystems (proc, sysfs, devpts, mqueue, cgroup2, …)
+                // specified by OCI config.json `mounts` entries.
+                for km in &kernel_mounts {
+                    std::fs::create_dir_all(&km.target)
+                        .map_err(|e| io::Error::other(format!("kernel mount mkdir {}: {}", km.target.display(), e)))?;
+                    let tgt_c = CString::new(km.target.as_os_str().as_encoded_bytes()).unwrap();
+                    let src_c = CString::new(km.source.as_bytes()).unwrap();
+                    let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
+                    let dat_c = CString::new(km.data.as_bytes()).unwrap();
+                    let dat_ptr: *const libc::c_void = if km.data.is_empty() {
+                        ptr::null()
+                    } else {
+                        dat_c.as_ptr() as *const libc::c_void
+                    };
+                    let result = libc::mount(src_c.as_ptr(), tgt_c.as_ptr(), fst_c.as_ptr(), km.flags, dat_ptr);
+                    if result != 0 {
+                        return Err(io::Error::other(format!(
+                            "mount {} ({}) at {}: {}",
+                            km.fs_type, km.source, km.target.display(),
                             io::Error::last_os_error()
                         )));
                     }

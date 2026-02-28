@@ -566,16 +566,77 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
     // OCI mounts (processed in order)
     for mount in &config.mounts {
         let dest = &mount.destination;
-        let is_ro = mount.options.iter().any(|o| o == "ro" || o == "readonly");
         let mount_type = mount.mount_type.as_deref().unwrap_or("bind");
+        let is_ro = mount.options.iter().any(|o| o == "ro" || o == "readonly");
+
+        // Parse MS_* flags from option strings.
+        let mut flags: libc::c_ulong = 0;
+        let mut extra_data_parts: Vec<&str> = Vec::new();
+        for opt in &mount.options {
+            match opt.as_str() {
+                "nosuid"    => flags |= libc::MS_NOSUID,
+                "noexec"    => flags |= libc::MS_NOEXEC,
+                "nodev"     => flags |= libc::MS_NODEV,
+                "ro" | "readonly" => flags |= libc::MS_RDONLY,
+                "relatime"  => flags |= libc::MS_RELATIME,
+                "noatime"   => flags |= libc::MS_NOATIME,
+                "nodiratime" => flags |= libc::MS_NODIRATIME,
+                "strictatime" => flags |= libc::MS_STRICTATIME,
+                "shared"    => flags |= libc::MS_SHARED,
+                "slave"     => flags |= libc::MS_SLAVE,
+                "private"   => flags |= libc::MS_PRIVATE,
+                "unbindable" => flags |= libc::MS_UNBINDABLE,
+                "bind"      => flags |= libc::MS_BIND,
+                "rbind"     => flags |= libc::MS_BIND | libc::MS_REC,
+                other       => extra_data_parts.push(other),
+            }
+        }
+        let extra_data = extra_data_parts.join(",");
 
         match mount_type {
             "tmpfs" => {
+                // For tmpfs, pass the option string (size=, mode=, etc.) as data;
+                // the with_tmpfs builder adds MS_NOSUID|MS_NODEV itself.
                 let opts: Vec<&str> = mount.options.iter().map(|s| s.as_str()).collect();
                 cmd = cmd.with_tmpfs(dest, &opts.join(","));
             }
+            "proc" => {
+                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | flags;
+                let src = mount.source.as_deref().unwrap_or("proc");
+                cmd = cmd.with_kernel_mount("proc", src, dest, f, "");
+            }
+            "sysfs" => {
+                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | flags;
+                let src = mount.source.as_deref().unwrap_or("sysfs");
+                cmd = cmd.with_kernel_mount("sysfs", src, dest, f, "");
+            }
+            "devpts" => {
+                let f = libc::MS_NOSUID | libc::MS_NOEXEC | flags;
+                let src = mount.source.as_deref().unwrap_or("devpts");
+                let data = if extra_data.is_empty() {
+                    "newinstance,ptmxmode=0666,mode=0620".to_string()
+                } else {
+                    format!("newinstance,{}", extra_data)
+                };
+                cmd = cmd.with_kernel_mount("devpts", src, dest, f, data);
+            }
+            "mqueue" => {
+                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | flags;
+                let src = mount.source.as_deref().unwrap_or("mqueue");
+                cmd = cmd.with_kernel_mount("mqueue", src, dest, f, "");
+            }
+            "cgroup" => {
+                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
+                let src = mount.source.as_deref().unwrap_or("cgroup");
+                cmd = cmd.with_kernel_mount("cgroup", src, dest, f, &extra_data);
+            }
+            "cgroup2" => {
+                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
+                let src = mount.source.as_deref().unwrap_or("cgroup2");
+                cmd = cmd.with_kernel_mount("cgroup2", src, dest, f, "");
+            }
+            // "bind" or anything unrecognised → bind mount
             _ => {
-                // bind mount
                 if let Some(ref source) = mount.source {
                     if is_ro {
                         cmd = cmd.with_bind_mount_ro(source, dest);

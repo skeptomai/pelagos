@@ -698,6 +698,14 @@ Creates a `config.json` with `linux.seccomp` using a default-allow policy that d
 Failure indicates that `linux.seccomp` parsing from OCI config, the `filter_from_oci()`
 function in `src/seccomp.rs`, or the `with_seccomp_program()` wiring is broken.
 
+### `test_oci_kernel_mounts`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with proc, sysfs, devpts, mqueue mounts (matching standard runc/containerd
+output) and runs `ls /proc/self` inside. Failure indicates the OCI mount-type dispatch
+(`oci.rs`) or the `KernelMount` pre_exec loop (`container.rs`) is broken. Primary gate for
+`opencontainers/runtime-tools` conformance since nearly every test bundle uses these mounts.
+
 ### `test_oci_create_bundle_flag`
 **Requires:** root, rootfs
 

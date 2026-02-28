@@ -3627,6 +3627,75 @@ mod oci_lifecycle {
         oci_run_to_completion(&id, bundle_dir.path(), 5);
     }
 
+    /// test_oci_kernel_mounts
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates an OCI bundle whose config.json includes standard kernel filesystem mounts
+    /// (proc, sysfs, devpts, mqueue) matching what containerd/runc generate by default.
+    /// The container runs `ls /proc/self` to confirm /proc is mounted and readable.
+    /// Failure indicates the mount-type dispatch in `oci.rs` or the KernelMount pre_exec
+    /// loop in `container.rs` is broken, or the kernel rejected a mount syscall.
+    #[test]
+    fn test_oci_kernel_mounts() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_kernel_mounts: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_kernel_mounts: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&rootfs, bundle_dir.path().join("rootfs")).unwrap();
+        let config = r#"{
+      "ociVersion": "1.0.2",
+      "root": {"path": "rootfs"},
+      "process": {
+        "args": ["/bin/ls", "/proc/self"],
+        "cwd": "/",
+        "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+      },
+      "linux": {
+        "namespaces": [{"type": "mount"}, {"type": "uts"}, {"type": "pid"}]
+      },
+      "mounts": [
+        {"destination": "/proc",       "type": "proc",   "source": "proc",
+         "options": ["nosuid","noexec","nodev"]},
+        {"destination": "/sys",        "type": "sysfs",  "source": "sysfs",
+         "options": ["nosuid","noexec","nodev","ro"]},
+        {"destination": "/dev",        "type": "tmpfs",  "source": "tmpfs",
+         "options": ["nosuid","strictatime","mode=755","size=65536k"]},
+        {"destination": "/dev/pts",    "type": "devpts", "source": "devpts",
+         "options": ["nosuid","noexec","gid=5","mode=0620"]},
+        {"destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
+         "options": ["nosuid","noexec","nodev"]}
+      ]
+    }"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+        let id = format!("test-oci-kmnt-{}", std::process::id());
+        let (_, stderr, ok) = run_remora(&[
+            "create", "--bundle", bundle_dir.path().to_str().unwrap(), &id,
+        ]);
+        assert!(ok, "remora create (kernel mounts) failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") { break; }
+            if std::time::Instant::now() > deadline {
+                run_remora(&["delete", &id]);
+                panic!("container with kernel mounts did not stop within 5s");
+            }
+        }
+        run_remora(&["delete", &id]);
+    }
+
     /// test_oci_create_bundle_flag
     ///
     /// Requires: root, alpine-rootfs.
