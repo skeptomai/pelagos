@@ -953,6 +953,22 @@ uses to reject exec into stopped containers.
 
 Failure indicates a kernel or procfs anomaly where dead PIDs still appear alive.
 
+### `test_exec_joins_pid_namespace`
+**Requires:** root, rootfs
+
+Starts a detached container with `remora run -d --rootfs alpine /bin/sleep 30`.
+The `--rootfs` path always enables `Namespace::PID`, so `state.pid` is the
+intermediate process P whose `/proc/P/ns/pid` is the host PID namespace, but
+`/proc/P/ns/pid_for_children` points to the container's PID namespace.
+
+Runs `remora exec <name> readlink /proc/self/ns/pid` and asserts the output
+matches `readlink /proc/{intermediate_pid}/ns/pid_for_children` read from the host.
+
+Failure indicates `discover_namespaces` is not using the `pid_for_children` fallback
+or the double-fork in `container.rs` step 1.65 is not putting the exec'd process in
+the target PID namespace. A failing test means `ps` inside exec'd shells shows host
+PIDs instead of container-scoped PIDs.
+
 ---
 
 ## Minimal /dev Tests (`dev` module)

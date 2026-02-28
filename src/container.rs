@@ -2208,16 +2208,27 @@ impl Command {
 
                 // Step 1.65: PID namespace double-fork.
                 //
-                // unshare(CLONE_NEWPID) puts our CHILDREN into a new PID namespace —
-                // we ourselves stay in the parent namespace.  This means:
-                //   (a) we are NOT PID 1 in the new namespace
-                //   (b) the first child we fork becomes PID 1
-                //   (c) when that PID 1 exits, the kernel marks the namespace defunct
-                //   (d) every subsequent fork() fails with ENOMEM
+                // Two cases handled here:
                 //
-                // Fix: fork once more so the child IS PID 1 in the new namespace.
-                // The intermediate process (us) just waits and propagates the exit
-                // status.  PR_SET_PDEATHSIG ensures PID 1 is killed if we die.
+                // A. Creating a new PID namespace (namespaces contains Namespace::PID):
+                //    unshare(CLONE_NEWPID) puts our CHILDREN into a new PID namespace —
+                //    we ourselves stay in the parent namespace.  This means:
+                //      (a) we are NOT PID 1 in the new namespace
+                //      (b) the first child we fork becomes PID 1
+                //      (c) when that PID 1 exits, the kernel marks the namespace defunct
+                //      (d) every subsequent fork() fails with ENOMEM
+                //    Fix: fork once more so the child IS PID 1 in the new namespace.
+                //
+                // B. Joining an existing PID namespace (join_ns_fds contains PID):
+                //    setns(CLONE_NEWPID) only updates pid_for_children for the calling
+                //    process — it does NOT move the calling process into the namespace.
+                //    exec() alone does not trigger the transition; only a subsequent
+                //    fork() puts children into the new namespace.  So we must double-fork:
+                //    setns → fork → grandchild is in the target namespace → grandchild execs.
+                //
+                // In both cases the intermediate (us, inner_pid > 0) waits for the child
+                // and propagates the exit status.  PR_SET_PDEATHSIG on the child ensures
+                // it dies if the intermediate is killed.
                 if namespaces.contains(Namespace::PID) {
                     let inner_pid = libc::fork();
                     if inner_pid < 0 {
@@ -2260,6 +2271,44 @@ impl Command {
                     }
                     // Child: we are now PID 1 in the new PID namespace.
                     // Ensure we die if the intermediate (our parent) is killed.
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                } else if let Some(&(pid_join_fd, _)) =
+                    join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
+                {
+                    // Case B: joining an existing PID namespace via setns.
+                    // setns changes pid_for_children; the grandchild (born after the fork
+                    // below) is the first process created under the new pid_for_children
+                    // and therefore enters the target PID namespace.
+                    if libc::setns(pid_join_fd, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let inner_pid = libc::fork();
+                    if inner_pid < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if inner_pid > 0 {
+                        for fd in 3..1024 {
+                            libc::close(fd);
+                        }
+                        let mut status: libc::c_int = 0;
+                        loop {
+                            let r = libc::waitpid(inner_pid, &mut status, 0);
+                            if r == inner_pid {
+                                break;
+                            }
+                            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                            if e != libc::EINTR {
+                                libc::_exit(1);
+                            }
+                        }
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        } else {
+                            libc::_exit(128 + libc::WTERMSIG(status));
+                        }
+                    }
+                    // Grandchild: now in the target PID namespace.
+                    // Die if our parent (the intermediate) dies unexpectedly.
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 }
 
@@ -2988,8 +3037,14 @@ impl Command {
                 }
 
                 // Step 6: Join existing namespaces AFTER chroot and filesystem setup
-                // This ensures paths are resolved correctly before namespace transitions
-                for (fd, _ns) in &join_ns_fds {
+                // This ensures paths are resolved correctly before namespace transitions.
+                // PID namespace entries are skipped here — they are handled at step 1.65
+                // via double-fork (see below).
+                for (fd, ns) in &join_ns_fds {
+                    if *ns == Namespace::PID {
+                        // Handled at step 1.65 via double-fork.
+                        continue;
+                    }
                     let result = libc::setns(*fd, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
@@ -3762,7 +3817,7 @@ impl Command {
                 }
 
                 // PID namespace double-fork (same as spawn() Step 1.65).
-                // See spawn() for detailed explanation.
+                // See spawn() for detailed explanation of both cases.
                 if namespaces.contains(Namespace::PID) {
                     let inner_pid = libc::fork();
                     if inner_pid < 0 {
@@ -3787,6 +3842,39 @@ impl Command {
                                 if e != libc::EINTR {
                                     libc::_exit(1);
                                 }
+                            }
+                        }
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        } else {
+                            libc::_exit(128 + libc::WTERMSIG(status));
+                        }
+                    }
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                } else if let Some(&(pid_join_fd, _)) =
+                    join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
+                {
+                    // Joining an existing PID namespace — setns then double-fork.
+                    if libc::setns(pid_join_fd, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let inner_pid = libc::fork();
+                    if inner_pid < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if inner_pid > 0 {
+                        for fd in 3..1024 {
+                            libc::close(fd);
+                        }
+                        let mut status: libc::c_int = 0;
+                        loop {
+                            let r = libc::waitpid(inner_pid, &mut status, 0);
+                            if r == inner_pid {
+                                break;
+                            }
+                            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                            if e != libc::EINTR {
+                                libc::_exit(1);
                             }
                         }
                         if libc::WIFEXITED(status) {
@@ -4426,7 +4514,11 @@ impl Command {
                     cb()?;
                 }
 
-                for (fd, _ns) in &join_ns_fds {
+                for (fd, ns) in &join_ns_fds {
+                    if *ns == Namespace::PID {
+                        // Handled at step 1.65 (double-fork) — skip here.
+                        continue;
+                    }
                     let result = libc::setns(*fd, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
