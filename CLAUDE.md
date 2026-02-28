@@ -25,6 +25,19 @@ value and violate the principle that every artifact ships with the code.
 - The file includes: context, API design, pre_exec sequence changes, exact file changes,
   test descriptions, verification steps, and notes/risks
 
+### `remora image pull` Does NOT Require Root
+**`remora image pull` works without sudo** for users in the `remora` group.
+Never tell the user that image pulls require root — that is a documentation bug.
+
+If a non-root pull fails with "Permission denied":
+1. The shell session may predate group membership → `newgrp remora` or new login
+2. Existing dirs may have been created by root before `setup.sh` → `sudo ./scripts/setup.sh` repairs them
+
+Operations that **do** require root: `run`, `exec`, `compose`, `stop`, `rm`
+(they create namespaces, configure network, mount filesystems).
+
+---
+
 ### ❌ NEVER RUN SUDO COMMANDS
 **YOU CANNOT RUN SUDO** - The user MUST run sudo commands themselves.
 

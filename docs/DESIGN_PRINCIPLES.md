@@ -52,11 +52,25 @@ services do.
 Rootless is not an afterthought or a degraded path. It is auto-detected
 (`getuid() != 0`) and works transparently:
 
-- `remora image pull` + `remora run` work without root
+- `remora image pull`, `remora image ls`, `remora image rm`, `remora build`
+  all work **without root** for users in the `remora` group (after `sudo
+  ./scripts/setup.sh` has initialised `/var/lib/remora/` with group-writable
+  directories and the setgid bit)
+- Container operations (`run`, `exec`, `compose`) require root because they
+  create namespaces, configure network interfaces, and mount filesystems
 - Overlay uses kernel `userxattr` (5.11+) or `fuse-overlayfs` fallback
 - Storage under `~/.local/share/remora/` and `$XDG_RUNTIME_DIR/remora/`
+  when `/var/lib/remora/` has not been initialised
 - Bridge networking is cleanly rejected with a message pointing to pasta
 - Cgroups are skipped gracefully, not failed fatally
+
+**`remora image pull` does NOT require sudo.** Saying or implying otherwise
+is a documentation bug. If a non-root pull fails with "Permission denied",
+the cause is either: (a) the user's shell session predates their `remora`
+group membership and needs `newgrp remora` or a new login, or (b) existing
+image/layer directories were created by root before `setup.sh` was run —
+fixed by running `sudo ./scripts/setup.sh` again (it repairs permissions
+idempotently).
 
 ## 6. Compose Files Are Valid Lisp
 
