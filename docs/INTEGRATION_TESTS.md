@@ -698,6 +698,25 @@ Creates a `config.json` with `linux.seccomp` using a default-allow policy that d
 Failure indicates that `linux.seccomp` parsing from OCI config, the `filter_from_oci()`
 function in `src/seccomp.rs`, or the `with_seccomp_program()` wiring is broken.
 
+### `test_oci_cap_all_known_names_round_trip` (unit)
+**Requires:** nothing (unit test in `src/oci.rs`)
+
+Asserts that all 41 Linux capability names (with `CAP_` prefix) map to a non-None value
+via `oci_cap_to_flag`. Failure means an OCI bundle specifying that capability will silently
+drop it rather than applying it to the container's capability set.
+
+### `test_oci_cap_without_prefix` (unit)
+**Requires:** nothing (unit test in `src/oci.rs`)
+
+Verifies that `oci_cap_to_flag` accepts names both with and without the `CAP_` prefix,
+and returns `None` for genuinely unknown names.
+
+### `test_oci_signal_names` (unit)
+**Requires:** nothing (unit test in `src/oci.rs`)
+
+Verifies the signal name→number table covers all signal names sent by `opencontainers/runtime-tools`
+including `SIGWINCH`, `SIGCHLD`, `SIGCONT`, `SIGSTOP`, `SIGQUIT`, `SIGSYS`, and numeric forms.
+
 ### `test_oci_kernel_mounts`
 **Requires:** root, rootfs
 

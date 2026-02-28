@@ -258,6 +258,9 @@ pub struct OciState {
     pub status: String,
     pub pid: i32,
     pub bundle: String,
+    /// Annotations from config.json, echoed back per the OCI Runtime Spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<std::collections::HashMap<String, String>>,
     /// Bridge IP address, populated when using bridge networking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_ip: Option<String>,
@@ -311,22 +314,51 @@ pub fn config_from_bundle(bundle: &Path) -> io::Result<OciConfig> {
 /// Remora `Capability` bitflag. Returns `None` for unknown names.
 fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
     use crate::container::Capability;
-    // Strip optional "CAP_" prefix for case-insensitive matching.
+    // Strip optional "CAP_" prefix — OCI bundles may include it or omit it.
     let n = name.strip_prefix("CAP_").unwrap_or(name);
     match n {
-        "CHOWN" => Some(Capability::CHOWN),
-        "DAC_OVERRIDE" => Some(Capability::DAC_OVERRIDE),
-        "FOWNER" => Some(Capability::FOWNER),
-        "FSETID" => Some(Capability::FSETID),
-        "KILL" => Some(Capability::KILL),
-        "SETGID" => Some(Capability::SETGID),
-        "SETUID" => Some(Capability::SETUID),
-        "NET_BIND_SERVICE" => Some(Capability::NET_BIND_SERVICE),
-        "NET_RAW" => Some(Capability::NET_RAW),
-        "SYS_CHROOT" => Some(Capability::SYS_CHROOT),
-        "SYS_ADMIN" => Some(Capability::SYS_ADMIN),
-        "SYS_PTRACE" => Some(Capability::SYS_PTRACE),
-        _ => None,
+        "CHOWN"              => Some(Capability::CHOWN),
+        "DAC_OVERRIDE"       => Some(Capability::DAC_OVERRIDE),
+        "DAC_READ_SEARCH"    => Some(Capability::DAC_READ_SEARCH),
+        "FOWNER"             => Some(Capability::FOWNER),
+        "FSETID"             => Some(Capability::FSETID),
+        "KILL"               => Some(Capability::KILL),
+        "SETGID"             => Some(Capability::SETGID),
+        "SETUID"             => Some(Capability::SETUID),
+        "SETPCAP"            => Some(Capability::SETPCAP),
+        "LINUX_IMMUTABLE"    => Some(Capability::LINUX_IMMUTABLE),
+        "NET_BIND_SERVICE"   => Some(Capability::NET_BIND_SERVICE),
+        "NET_BROADCAST"      => Some(Capability::NET_BROADCAST),
+        "NET_ADMIN"          => Some(Capability::NET_ADMIN),
+        "NET_RAW"            => Some(Capability::NET_RAW),
+        "IPC_LOCK"           => Some(Capability::IPC_LOCK),
+        "IPC_OWNER"          => Some(Capability::IPC_OWNER),
+        "SYS_MODULE"         => Some(Capability::SYS_MODULE),
+        "SYS_RAWIO"          => Some(Capability::SYS_RAWIO),
+        "SYS_CHROOT"         => Some(Capability::SYS_CHROOT),
+        "SYS_PTRACE"         => Some(Capability::SYS_PTRACE),
+        "SYS_PACCT"          => Some(Capability::SYS_PACCT),
+        "SYS_ADMIN"          => Some(Capability::SYS_ADMIN),
+        "SYS_BOOT"           => Some(Capability::SYS_BOOT),
+        "SYS_NICE"           => Some(Capability::SYS_NICE),
+        "SYS_RESOURCE"       => Some(Capability::SYS_RESOURCE),
+        "SYS_TIME"           => Some(Capability::SYS_TIME),
+        "SYS_TTY_CONFIG"     => Some(Capability::SYS_TTY_CONFIG),
+        "MKNOD"              => Some(Capability::MKNOD),
+        "LEASE"              => Some(Capability::LEASE),
+        "AUDIT_WRITE"        => Some(Capability::AUDIT_WRITE),
+        "AUDIT_CONTROL"      => Some(Capability::AUDIT_CONTROL),
+        "SETFCAP"            => Some(Capability::SETFCAP),
+        "MAC_OVERRIDE"       => Some(Capability::MAC_OVERRIDE),
+        "MAC_ADMIN"          => Some(Capability::MAC_ADMIN),
+        "SYSLOG"             => Some(Capability::SYSLOG),
+        "WAKE_ALARM"         => Some(Capability::WAKE_ALARM),
+        "BLOCK_SUSPEND"      => Some(Capability::BLOCK_SUSPEND),
+        "AUDIT_READ"         => Some(Capability::AUDIT_READ),
+        "PERFMON"            => Some(Capability::PERFMON),
+        "BPF"                => Some(Capability::BPF),
+        "CHECKPOINT_RESTORE" => Some(Capability::CHECKPOINT_RESTORE),
+        _                    => None,
     }
 }
 
@@ -1028,6 +1060,7 @@ pub fn cmd_create(
                 status: "created".to_string(),
                 pid: container_pid,
                 bundle: bundle.to_string_lossy().into_owned(),
+                annotations: config.annotations.clone(),
                 bridge_ip: None,
             };
             write_state(id, &state)?;
@@ -1119,20 +1152,42 @@ pub fn cmd_state(id: &str) -> io::Result<()> {
 pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
     let state = read_state(id)?;
 
-    let sig: i32 = match signal {
-        "SIGTERM" | "TERM" | "15" => libc::SIGTERM,
-        "SIGKILL" | "KILL" | "9" => libc::SIGKILL,
-        "SIGHUP" | "HUP" | "1" => libc::SIGHUP,
-        "SIGINT" | "INT" | "2" => libc::SIGINT,
-        "SIGUSR1" | "USR1" | "10" => libc::SIGUSR1,
-        "SIGUSR2" | "USR2" | "12" => libc::SIGUSR2,
+    // Accept signal as name (with or without "SIG" prefix) or number.
+    let sig: i32 = match signal.to_ascii_uppercase().trim_start_matches("SIG") {
+        "HUP"    | "1"  => libc::SIGHUP,
+        "INT"    | "2"  => libc::SIGINT,
+        "QUIT"   | "3"  => libc::SIGQUIT,
+        "ILL"    | "4"  => libc::SIGILL,
+        "TRAP"   | "5"  => libc::SIGTRAP,
+        "ABRT"   | "6"  => libc::SIGABRT,
+        "BUS"    | "7"  => libc::SIGBUS,
+        "FPE"    | "8"  => libc::SIGFPE,
+        "KILL"   | "9"  => libc::SIGKILL,
+        "USR1"   | "10" => libc::SIGUSR1,
+        "SEGV"   | "11" => libc::SIGSEGV,
+        "USR2"   | "12" => libc::SIGUSR2,
+        "PIPE"   | "13" => libc::SIGPIPE,
+        "ALRM"   | "14" => libc::SIGALRM,
+        "TERM"   | "15" => libc::SIGTERM,
+        "CHLD"   | "17" => libc::SIGCHLD,
+        "CONT"   | "18" => libc::SIGCONT,
+        "STOP"   | "19" => libc::SIGSTOP,
+        "TSTP"   | "20" => libc::SIGTSTP,
+        "TTIN"   | "21" => libc::SIGTTIN,
+        "TTOU"   | "22" => libc::SIGTTOU,
+        "URG"    | "23" => libc::SIGURG,
+        "XCPU"   | "24" => libc::SIGXCPU,
+        "XFSZ"   | "25" => libc::SIGXFSZ,
+        "VTALRM" | "26" => libc::SIGVTALRM,
+        "PROF"   | "27" => libc::SIGPROF,
+        "WINCH"  | "28" => libc::SIGWINCH,
+        "IO" | "POLL" | "29" => libc::SIGIO,
+        "PWR"    | "30" => libc::SIGPWR,
+        "SYS"    | "31" => libc::SIGSYS,
         s => s.parse::<i32>().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "unknown signal '{}' — use a name (SIGTERM) or number (15)",
-                    s
-                ),
+                format!("unknown signal '{}' — use a name (SIGTERM) or number (15)", signal),
             )
         })?,
     };
@@ -1178,4 +1233,103 @@ pub fn cmd_delete(id: &str) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_oci_cap_all_known_names_round_trip() {
+        // Every OCI capability name used in Docker's default profile must map to a flag.
+        let known = [
+            "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
+            "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
+            "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST",
+            "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK", "CAP_IPC_OWNER",
+            "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE",
+            "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE",
+            "CAP_SYS_RESOURCE", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD",
+            "CAP_LEASE", "CAP_AUDIT_WRITE", "CAP_AUDIT_CONTROL", "CAP_SETFCAP",
+            "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG", "CAP_WAKE_ALARM",
+            "CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF",
+            "CAP_CHECKPOINT_RESTORE",
+        ];
+        for name in &known {
+            assert!(
+                oci_cap_to_flag(name).is_some(),
+                "oci_cap_to_flag returned None for {}", name
+            );
+        }
+    }
+
+    #[test]
+    fn test_oci_cap_without_prefix() {
+        // OCI bundles may omit the CAP_ prefix.
+        assert!(oci_cap_to_flag("CHOWN").is_some());
+        assert!(oci_cap_to_flag("NET_ADMIN").is_some());
+        assert!(oci_cap_to_flag("BPF").is_some());
+        assert!(oci_cap_to_flag("UNKNOWN_CAP").is_none());
+    }
+
+    #[test]
+    fn test_oci_signal_names() {
+        // The signal parsing in cmd_kill must accept names from runtime-tools.
+        let cases: &[(&str, i32)] = &[
+            ("SIGTERM", libc::SIGTERM),
+            ("TERM",    libc::SIGTERM),
+            ("15",      libc::SIGTERM),
+            ("SIGKILL", libc::SIGKILL),
+            ("9",       libc::SIGKILL),
+            ("SIGHUP",  libc::SIGHUP),
+            ("SIGWINCH", libc::SIGWINCH),
+            ("SIGCHLD", libc::SIGCHLD),
+            ("SIGCONT", libc::SIGCONT),
+            ("SIGSTOP", libc::SIGSTOP),
+            ("SIGQUIT", libc::SIGQUIT),
+            ("SIGUSR1", libc::SIGUSR1),
+            ("SIGUSR2", libc::SIGUSR2),
+            ("SIGPIPE", libc::SIGPIPE),
+            ("SIGALRM", libc::SIGALRM),
+            ("SIGSEGV", libc::SIGSEGV),
+            ("SIGABRT", libc::SIGABRT),
+            ("SIGSYS",  libc::SIGSYS),
+        ];
+        for (name, expected) in cases {
+            let got = match name.to_ascii_uppercase().trim_start_matches("SIG") {
+                "HUP"    | "1"  => libc::SIGHUP,
+                "INT"    | "2"  => libc::SIGINT,
+                "QUIT"   | "3"  => libc::SIGQUIT,
+                "ILL"    | "4"  => libc::SIGILL,
+                "TRAP"   | "5"  => libc::SIGTRAP,
+                "ABRT"   | "6"  => libc::SIGABRT,
+                "BUS"    | "7"  => libc::SIGBUS,
+                "FPE"    | "8"  => libc::SIGFPE,
+                "KILL"   | "9"  => libc::SIGKILL,
+                "USR1"   | "10" => libc::SIGUSR1,
+                "SEGV"   | "11" => libc::SIGSEGV,
+                "USR2"   | "12" => libc::SIGUSR2,
+                "PIPE"   | "13" => libc::SIGPIPE,
+                "ALRM"   | "14" => libc::SIGALRM,
+                "TERM"   | "15" => libc::SIGTERM,
+                "CHLD"   | "17" => libc::SIGCHLD,
+                "CONT"   | "18" => libc::SIGCONT,
+                "STOP"   | "19" => libc::SIGSTOP,
+                "TSTP"   | "20" => libc::SIGTSTP,
+                "TTIN"   | "21" => libc::SIGTTIN,
+                "TTOU"   | "22" => libc::SIGTTOU,
+                "URG"    | "23" => libc::SIGURG,
+                "XCPU"   | "24" => libc::SIGXCPU,
+                "XFSZ"   | "25" => libc::SIGXFSZ,
+                "VTALRM" | "26" => libc::SIGVTALRM,
+                "PROF"   | "27" => libc::SIGPROF,
+                "WINCH"  | "28" => libc::SIGWINCH,
+                "IO" | "POLL" | "29" => libc::SIGIO,
+                "PWR"    | "30" => libc::SIGPWR,
+                "SYS"    | "31" => libc::SIGSYS,
+                s => s.parse::<i32>().unwrap_or(-1),
+            };
+            assert_eq!(got, *expected, "signal '{}' mapped to {} not {}", name, got, expected);
+        }
+    }
 }

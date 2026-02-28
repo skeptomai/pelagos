@@ -377,30 +377,49 @@ bitflags! {
     /// ```
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Capability: u64 {
-        /// CAP_CHOWN - Make arbitrary changes to file UIDs and GIDs
-        const CHOWN = 1 << 0;
-        /// CAP_DAC_OVERRIDE - Bypass file read, write, and execute permission checks
-        const DAC_OVERRIDE = 1 << 1;
-        /// CAP_FOWNER - Bypass permission checks on operations that require filesystem UID
-        const FOWNER = 1 << 3;
-        /// CAP_FSETID - Don't clear set-user-ID and set-group-ID mode bits
-        const FSETID = 1 << 4;
-        /// CAP_KILL - Bypass permission checks for sending signals
-        const KILL = 1 << 5;
-        /// CAP_SETGID - Make arbitrary manipulations of process GIDs
-        const SETGID = 1 << 6;
-        /// CAP_SETUID - Make arbitrary manipulations of process UIDs
-        const SETUID = 1 << 7;
-        /// CAP_NET_BIND_SERVICE - Bind a socket to privileged ports (< 1024)
-        const NET_BIND_SERVICE = 1 << 10;
-        /// CAP_NET_RAW - Use RAW and PACKET sockets
-        const NET_RAW = 1 << 13;
-        /// CAP_SYS_CHROOT - Use chroot()
-        const SYS_CHROOT = 1 << 18;
-        /// CAP_SYS_ADMIN - Perform a range of system administration operations
-        const SYS_ADMIN = 1 << 21;
-        /// CAP_SYS_PTRACE - Trace arbitrary processes using ptrace
-        const SYS_PTRACE = 1 << 19;
+        // Bit positions match the Linux capability numbers exactly.
+        // See linux/capability.h; the u64 bitmask is split lo/hi for capset(2).
+        const CHOWN              = 1 <<  0; // CAP_CHOWN
+        const DAC_OVERRIDE       = 1 <<  1; // CAP_DAC_OVERRIDE
+        const DAC_READ_SEARCH    = 1 <<  2; // CAP_DAC_READ_SEARCH
+        const FOWNER             = 1 <<  3; // CAP_FOWNER
+        const FSETID             = 1 <<  4; // CAP_FSETID
+        const KILL               = 1 <<  5; // CAP_KILL
+        const SETGID             = 1 <<  6; // CAP_SETGID
+        const SETUID             = 1 <<  7; // CAP_SETUID
+        const SETPCAP            = 1 <<  8; // CAP_SETPCAP
+        const LINUX_IMMUTABLE    = 1 <<  9; // CAP_LINUX_IMMUTABLE
+        const NET_BIND_SERVICE   = 1 << 10; // CAP_NET_BIND_SERVICE
+        const NET_BROADCAST      = 1 << 11; // CAP_NET_BROADCAST
+        const NET_ADMIN          = 1 << 12; // CAP_NET_ADMIN
+        const NET_RAW            = 1 << 13; // CAP_NET_RAW
+        const IPC_LOCK           = 1 << 14; // CAP_IPC_LOCK
+        const IPC_OWNER          = 1 << 15; // CAP_IPC_OWNER
+        const SYS_MODULE         = 1 << 16; // CAP_SYS_MODULE
+        const SYS_RAWIO          = 1 << 17; // CAP_SYS_RAWIO
+        const SYS_CHROOT         = 1 << 18; // CAP_SYS_CHROOT
+        const SYS_PTRACE         = 1 << 19; // CAP_SYS_PTRACE
+        const SYS_PACCT          = 1 << 20; // CAP_SYS_PACCT
+        const SYS_ADMIN          = 1 << 21; // CAP_SYS_ADMIN
+        const SYS_BOOT           = 1 << 22; // CAP_SYS_BOOT
+        const SYS_NICE           = 1 << 23; // CAP_SYS_NICE
+        const SYS_RESOURCE       = 1 << 24; // CAP_SYS_RESOURCE
+        const SYS_TIME           = 1 << 25; // CAP_SYS_TIME
+        const SYS_TTY_CONFIG     = 1 << 26; // CAP_SYS_TTY_CONFIG
+        const MKNOD              = 1 << 27; // CAP_MKNOD
+        const LEASE              = 1 << 28; // CAP_LEASE
+        const AUDIT_WRITE        = 1 << 29; // CAP_AUDIT_WRITE
+        const AUDIT_CONTROL      = 1 << 30; // CAP_AUDIT_CONTROL
+        const SETFCAP            = 1 << 31; // CAP_SETFCAP
+        const MAC_OVERRIDE       = 1 << 32; // CAP_MAC_OVERRIDE
+        const MAC_ADMIN          = 1 << 33; // CAP_MAC_ADMIN
+        const SYSLOG             = 1 << 34; // CAP_SYSLOG
+        const WAKE_ALARM         = 1 << 35; // CAP_WAKE_ALARM
+        const BLOCK_SUSPEND      = 1 << 36; // CAP_BLOCK_SUSPEND
+        const AUDIT_READ         = 1 << 37; // CAP_AUDIT_READ
+        const PERFMON            = 1 << 38; // CAP_PERFMON
+        const BPF                = 1 << 39; // CAP_BPF
+        const CHECKPOINT_RESTORE = 1 << 40; // CAP_CHECKPOINT_RESTORE
     }
 }
 
@@ -3042,7 +3061,7 @@ impl Command {
                 //    root caps) regardless of what the bounding set says.
                 if let Some(keep_caps) = capabilities {
                     const PR_CAPBSET_DROP: i32 = 24;
-                    for cap in 0..38u64 {
+                    for cap in 0..41u64 {
                         let cap_bit = 1u64 << cap;
                         if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
                             let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
@@ -4552,7 +4571,7 @@ impl Command {
                 // Same logic as step 4.86 in the chroot path.
                 if let Some(keep_caps) = capabilities {
                     const PR_CAPBSET_DROP: i32 = 24;
-                    for cap in 0..38u64 {
+                    for cap in 0..41u64 {
                         let cap_bit = 1u64 << cap;
                         if !keep_caps.contains(Capability::from_bits_truncate(cap_bit)) {
                             let result = libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
