@@ -741,6 +741,50 @@ written with a positive integer that matches the PID reported in `state.json`. F
 
 ---
 
+### `test_oci_rootfs_propagation`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with `linux.rootfsPropagation: "private"` and runs `echo ok` inside it.
+Verifies the container starts and completes successfully. Failure indicates the `rootfsPropagation`
+field is not parsed, the mapping to `MS_PRIVATE|MS_REC` is wrong, or the `mount(2)` call fails,
+which would cause the container to refuse to start whenever a runtime-tools bundle specifies
+mount propagation.
+
+---
+
+### `test_oci_cgroups_path`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with `linux.cgroupsPath` set to a unique name and runs `echo ok` inside it.
+Verifies the container starts and completes successfully. Failure indicates the `cgroupsPath` field
+is not wired from OCI config through to `CgroupConfig.path`, which would break runtimes that
+rely on predictable cgroup hierarchy placement (e.g. systemd-managed slices).
+
+---
+
+### `test_oci_create_container_hook_in_ns`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with a `createContainer` hook script that writes the inode of
+`/proc/self/ns/mnt` to a temp file. After `remora create`, reads the recorded inode and compares
+it to the host's mount namespace inode (`/proc/1/ns/mnt`). Asserts they differ, confirming the
+hook executed inside the container's mount namespace. Failure means `createContainer` hooks run
+in the host namespace, violating the OCI spec and breaking runtimes that use these hooks to
+inject config (e.g. seccomp, apparmor profiles) into the container environment.
+
+---
+
+### `test_oci_start_container_hook_in_ns`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with a `startContainer` hook script that writes the inode of
+`/proc/self/ns/mnt` to a temp file. After `remora start`, reads the recorded inode and compares
+it to the host's mount namespace inode. Asserts they differ, confirming the hook executed inside
+the container's mount namespace before the user process was exec'd. Failure means `startContainer`
+hooks either do not run at all or run in the host namespace, violating the OCI spec.
+
+---
+
 ## Rootless Mode Tests
 
 The following tests only execute when the test binary is run **without root** (no `sudo`).

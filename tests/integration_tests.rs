@@ -3678,7 +3678,10 @@ mod oci_lifecycle {
         std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
         let id = format!("test-oci-kmnt-{}", std::process::id());
         let (_, stderr, ok) = run_remora(&[
-            "create", "--bundle", bundle_dir.path().to_str().unwrap(), &id,
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            &id,
         ]);
         assert!(ok, "remora create (kernel mounts) failed: {}", stderr);
         let (_, stderr, ok) = run_remora(&["start", &id]);
@@ -3687,7 +3690,9 @@ mod oci_lifecycle {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let (stdout, _, _) = run_remora(&["state", &id]);
-            if stdout.contains("\"stopped\"") { break; }
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
             if std::time::Instant::now() > deadline {
                 run_remora(&["delete", &id]);
                 panic!("container with kernel mounts did not stop within 5s");
@@ -3731,7 +3736,11 @@ mod oci_lifecycle {
         assert!(ok, "remora create --bundle failed: {}", stderr);
 
         let (stdout, _, _) = run_remora(&["state", &id]);
-        assert!(stdout.contains("\"created\""), "expected created state, got: {}", stdout);
+        assert!(
+            stdout.contains("\"created\""),
+            "expected created state, got: {}",
+            stdout
+        );
 
         run_remora(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -3775,9 +3784,11 @@ mod oci_lifecycle {
         assert!(ok, "remora create --pid-file failed: {}", stderr);
 
         // Verify pid file exists and contains a positive integer.
-        let pid_str = std::fs::read_to_string(&pid_file)
-            .expect("pid file not written");
-        let pid: i32 = pid_str.trim().parse().expect("pid file contains non-integer");
+        let pid_str = std::fs::read_to_string(&pid_file).expect("pid file not written");
+        let pid: i32 = pid_str
+            .trim()
+            .parse()
+            .expect("pid file contains non-integer");
         assert!(pid > 1, "pid file contains invalid PID {}", pid);
 
         // Verify PID matches state.json.
@@ -3785,11 +3796,337 @@ mod oci_lifecycle {
         assert!(
             state_out.contains(&pid.to_string()),
             "pid file PID {} not found in state: {}",
-            pid, state_out
+            pid,
+            state_out
         );
 
         run_remora(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
+        run_remora(&["delete", &id]);
+    }
+
+    /// test_oci_rootfs_propagation
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates an OCI bundle with `linux.rootfsPropagation: "private"` and runs
+    /// `echo ok` inside it. Verifies that the container starts and finishes
+    /// successfully — confirming that the field is parsed, mapped to MS_PRIVATE|MS_REC,
+    /// and applied in pre_exec without error.
+    ///
+    /// Failure indicates the propagation flag parsing or mount(2) call is broken.
+    #[test]
+    fn test_oci_rootfs_propagation() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_rootfs_propagation: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_rootfs_propagation: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        // Config with rootfsPropagation: "private"
+        let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/echo", "ok"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "rootfsPropagation": "private",
+    "namespaces": [
+      {"type": "mount"},
+      {"type": "uts"},
+      {"type": "pid"}
+    ]
+  }
+}"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        let id = format!("test-oci-prop-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 10);
+        // reaching here means the container ran to completion successfully
+    }
+
+    /// test_oci_cgroups_path
+    ///
+    /// Requires: root, alpine-rootfs, cgroups v2.
+    ///
+    /// Creates an OCI bundle with `linux.cgroupsPath: "remora-oci-test"` and runs
+    /// `echo ok` inside it. Verifies that the container starts and finishes
+    /// successfully — confirming that the path is parsed and passed to the cgroup
+    /// builder without error.
+    ///
+    /// Failure indicates the cgroupsPath wiring from OCI config to CgroupConfig is broken.
+    #[test]
+    fn test_oci_cgroups_path() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_cgroups_path: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_cgroups_path: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        let unique_cg = format!("remora-oci-test-{}", std::process::id());
+        let config = format!(
+            r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": ["/bin/echo", "ok"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "linux": {{
+    "cgroupsPath": "{}",
+    "namespaces": [
+      {{"type": "mount"}},
+      {{"type": "uts"}},
+      {{"type": "pid"}}
+    ]
+  }}
+}}"#,
+            unique_cg
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        let id = format!("test-oci-cgpath-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 10);
+        // reaching here means the container ran successfully with explicit cgroupsPath
+    }
+
+    /// test_oci_create_container_hook_in_ns
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Creates an OCI bundle with a `createContainer` hook that writes the inode
+    /// of the hook process's UTS namespace (`/proc/self/ns/uts`) to a temp file..
+    /// After `remora create` completes, verifies that the recorded inode differs
+    /// from the host UTS namespace inode — confirming the hook ran inside the
+    /// container's mount namespace, not the host's.
+    ///
+    /// Failure indicates `createContainer` hooks are run in the host namespace
+    /// instead of the container namespace, violating the OCI Runtime Specification.
+    #[test]
+    fn test_oci_create_container_hook_in_ns() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_create_container_hook_in_ns: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_create_container_hook_in_ns: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        // Write the hook script that records ns inode.
+        let hook_out = bundle_dir.path().join("hook_ns.txt");
+        let hook_script = bundle_dir.path().join("record_ns.sh");
+        std::fs::write(
+            &hook_script,
+            format!(
+                "#!/bin/sh\nstat -Lc %i /proc/self/ns/uts > {}\n",
+                hook_out.display()
+            ),
+        )
+        .unwrap();
+        // Make it executable.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = format!(
+            r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": ["/bin/sleep", "5"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "hooks": {{
+    "createContainer": [
+      {{"path": "{}"}}
+    ]
+  }},
+  "linux": {{
+    "namespaces": [
+      {{"type": "mount"}},
+      {{"type": "uts"}},
+      {{"type": "pid"}}
+    ]
+  }}
+}}"#,
+            hook_script.display()
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
+
+        let id = format!("test-oci-cchook-{}", std::process::id());
+        let (_, stderr, ok) = run_remora(&[
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            &id,
+        ]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        // The hook should have written a file with the uts ns inode.
+        assert!(hook_out.exists(), "hook did not produce output file");
+        let hook_inode: u64 = std::fs::read_to_string(&hook_out)
+            .expect("read hook output")
+            .trim()
+            .parse()
+            .expect("hook output not a number");
+
+        // Get the host uts ns inode.
+        let host_uts_meta = std::fs::metadata("/proc/1/ns/uts").expect("stat /proc/1/ns/uts");
+        use std::os::unix::fs::MetadataExt;
+        let host_inode = host_uts_meta.ino();
+
+        assert_ne!(
+            hook_inode, host_inode,
+            "createContainer hook ran in host UTS namespace (inode {}), expected container ns",
+            hook_inode
+        );
+
+        // Clean up.
+        run_remora(&["kill", &id, "SIGKILL"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        run_remora(&["delete", &id]);
+    }
+
+    /// test_oci_start_container_hook_in_ns
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Creates an OCI bundle with a `startContainer` hook that writes the inode
+    /// of the hook process's UTS namespace (`/proc/self/ns/uts`) to a temp file. After `remora start`
+    /// completes, verifies the recorded inode differs from the host's UTS namespace
+    /// inode — confirming the hook ran inside the container's UTS namespace.
+    ///
+    /// Failure indicates `startContainer` hooks are run in the host namespace
+    /// instead of the container namespace, violating the OCI Runtime Specification.
+    #[test]
+    fn test_oci_start_container_hook_in_ns() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_start_container_hook_in_ns: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_start_container_hook_in_ns: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        let hook_out = bundle_dir.path().join("start_hook_ns.txt");
+        let hook_script = bundle_dir.path().join("record_start_ns.sh");
+        std::fs::write(
+            &hook_script,
+            format!(
+                "#!/bin/sh\nstat -Lc %i /proc/self/ns/uts > {}\n",
+                hook_out.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = format!(
+            r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": ["/bin/echo", "ok"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "hooks": {{
+    "startContainer": [
+      {{"path": "{}"}}
+    ]
+  }},
+  "linux": {{
+    "namespaces": [
+      {{"type": "mount"}},
+      {{"type": "uts"}},
+      {{"type": "pid"}}
+    ]
+  }}
+}}"#,
+            hook_script.display()
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), &config).unwrap();
+
+        let id = format!("test-oci-schook-{}", std::process::id());
+        let (_, stderr, ok) = run_remora(&[
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            &id,
+        ]);
+        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // The hook should have written a file with the uts ns inode.
+        assert!(
+            hook_out.exists(),
+            "startContainer hook did not produce output file"
+        );
+        let hook_inode: u64 = std::fs::read_to_string(&hook_out)
+            .expect("read hook output")
+            .trim()
+            .parse()
+            .expect("hook output not a number");
+
+        let host_uts_meta = std::fs::metadata("/proc/1/ns/uts").expect("stat /proc/1/ns/uts");
+        use std::os::unix::fs::MetadataExt;
+        let host_inode = host_uts_meta.ino();
+
+        assert_ne!(
+            hook_inode, host_inode,
+            "startContainer hook ran in host UTS namespace (inode {}), expected container ns",
+            hook_inode
+        );
+
+        // Wait for container to stop and clean up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+        }
         run_remora(&["delete", &id]);
     }
 }

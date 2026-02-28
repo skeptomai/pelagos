@@ -696,6 +696,9 @@ pub struct Command {
     devices: Vec<DeviceNode>,
     // Pre-compiled seccomp BPF program (takes priority over seccomp_profile).
     seccomp_program: Option<seccompiler::BpfProgram>,
+    // Mount propagation flags applied to the rootfs mountpoint after pivot_root/chroot.
+    // None → default (MS_PRIVATE|MS_REC). Some(flags) → apply those flags instead.
+    rootfs_propagation: Option<libc::c_ulong>,
     // Hostname to set inside the container's UTS namespace.
     hostname: Option<String>,
     // Whether to use newuidmap/newgidmap helpers for multi-range UID/GID mapping.
@@ -744,6 +747,7 @@ impl Command {
             sysctl: Vec::new(),
             devices: Vec::new(),
             seccomp_program: None,
+            rootfs_propagation: None,
             hostname: None,
             links: Vec::new(),
             use_id_helpers: false,
@@ -1135,6 +1139,15 @@ impl Command {
         self.cgroup_config
             .get_or_insert_with(Default::default)
             .pids_limit = Some(max);
+        self
+    }
+
+    /// Override the cgroup path/name for this container (OCI `linux.cgroupsPath`).
+    ///
+    /// By default remora names the cgroup `remora-{child_pid}`. When the OCI config
+    /// specifies `linux.cgroupsPath`, pass it here to use that name instead.
+    pub fn with_cgroup_path(mut self, path: impl Into<String>) -> Self {
+        self.cgroup_config.get_or_insert_with(Default::default).path = Some(path.into());
         self
     }
 
@@ -1594,6 +1607,15 @@ impl Command {
         self
     }
 
+    /// Override the rootfs mount propagation applied after chroot/pivot_root.
+    ///
+    /// Pass `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE`, or `MS_UNBINDABLE` (optionally OR'd
+    /// with `MS_REC`). By default remora applies `MS_PRIVATE | MS_REC`.
+    pub fn with_rootfs_propagation(mut self, flags: libc::c_ulong) -> Self {
+        self.rootfs_propagation = Some(flags);
+        self
+    }
+
     /// Add a read-write bind mount from a host directory into the container.
     ///
     /// The `source` is an absolute path on the host; `target` is the absolute
@@ -1835,6 +1857,7 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
+        let rootfs_propagation = self.rootfs_propagation;
         let hostname = self.hostname.clone();
         let use_id_helpers = self.use_id_helpers;
         // Loopback/Pasta mode: bring up lo inside pre_exec (after unshare(NEWNET)).
@@ -2231,16 +2254,19 @@ impl Command {
 
                     // Step 1.5: If we created a mount namespace, make all mounts private
                     // to prevent mount propagation leaking to the parent namespace.
+                    // linux.rootfsPropagation overrides the default MS_PRIVATE|MS_REC.
                     if namespaces.contains(Namespace::MOUNT) {
                         use std::ptr;
 
+                        let prop_flags =
+                            rootfs_propagation.unwrap_or(libc::MS_REC | libc::MS_PRIVATE);
                         let root = c"/";
                         let result = libc::mount(
-                            ptr::null(),                     // source: NULL (remount)
-                            root.as_ptr(),                   // target: root
-                            ptr::null(),                     // fstype: NULL (remount)
-                            libc::MS_REC | libc::MS_PRIVATE, // flags: recursive + private
-                            ptr::null(),                     // data: NULL
+                            ptr::null(),   // source: NULL (remount)
+                            root.as_ptr(), // target: root
+                            ptr::null(),   // fstype: NULL (remount)
+                            prop_flags,
+                            ptr::null(), // data: NULL
                         );
 
                         if result != 0 {
@@ -2909,8 +2935,13 @@ impl Command {
                 // Mount kernel filesystems (proc, sysfs, devpts, mqueue, cgroup2, …)
                 // specified by OCI config.json `mounts` entries.
                 for km in &kernel_mounts {
-                    std::fs::create_dir_all(&km.target)
-                        .map_err(|e| io::Error::other(format!("kernel mount mkdir {}: {}", km.target.display(), e)))?;
+                    std::fs::create_dir_all(&km.target).map_err(|e| {
+                        io::Error::other(format!(
+                            "kernel mount mkdir {}: {}",
+                            km.target.display(),
+                            e
+                        ))
+                    })?;
                     let tgt_c = CString::new(km.target.as_os_str().as_encoded_bytes()).unwrap();
                     let src_c = CString::new(km.source.as_bytes()).unwrap();
                     let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
@@ -2920,11 +2951,19 @@ impl Command {
                     } else {
                         dat_c.as_ptr() as *const libc::c_void
                     };
-                    let result = libc::mount(src_c.as_ptr(), tgt_c.as_ptr(), fst_c.as_ptr(), km.flags, dat_ptr);
+                    let result = libc::mount(
+                        src_c.as_ptr(),
+                        tgt_c.as_ptr(),
+                        fst_c.as_ptr(),
+                        km.flags,
+                        dat_ptr,
+                    );
                     if result != 0 {
                         return Err(io::Error::other(format!(
                             "mount {} ({}) at {}: {}",
-                            km.fs_type, km.source, km.target.display(),
+                            km.fs_type,
+                            km.source,
+                            km.target.display(),
                             io::Error::last_os_error()
                         )));
                     }
@@ -3501,6 +3540,7 @@ impl Command {
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
+        let rootfs_propagation = self.rootfs_propagation;
         let hostname = self.hostname.clone();
         let use_id_helpers = self.use_id_helpers;
         let bring_up_loopback = self.network_config.as_ref().is_some_and(|c| {
@@ -3882,13 +3922,16 @@ impl Command {
                             .map_err(|e| io::Error::other(format!("unshare error: {}", e)))?;
                     }
 
+                    // linux.rootfsPropagation overrides the default MS_PRIVATE|MS_REC.
                     if namespaces.contains(Namespace::MOUNT) {
+                        let prop_flags =
+                            rootfs_propagation.unwrap_or(libc::MS_REC | libc::MS_PRIVATE);
                         let root = c"/";
                         let result = libc::mount(
                             ptr::null(),
                             root.as_ptr(),
                             ptr::null(),
-                            libc::MS_PRIVATE | libc::MS_REC,
+                            prop_flags,
                             ptr::null(),
                         );
                         if result != 0 {
@@ -4450,8 +4493,13 @@ impl Command {
                 // Mount kernel filesystems (proc, sysfs, devpts, mqueue, cgroup2, …)
                 // specified by OCI config.json `mounts` entries.
                 for km in &kernel_mounts {
-                    std::fs::create_dir_all(&km.target)
-                        .map_err(|e| io::Error::other(format!("kernel mount mkdir {}: {}", km.target.display(), e)))?;
+                    std::fs::create_dir_all(&km.target).map_err(|e| {
+                        io::Error::other(format!(
+                            "kernel mount mkdir {}: {}",
+                            km.target.display(),
+                            e
+                        ))
+                    })?;
                     let tgt_c = CString::new(km.target.as_os_str().as_encoded_bytes()).unwrap();
                     let src_c = CString::new(km.source.as_bytes()).unwrap();
                     let fst_c = CString::new(km.fs_type.as_bytes()).unwrap();
@@ -4461,11 +4509,19 @@ impl Command {
                     } else {
                         dat_c.as_ptr() as *const libc::c_void
                     };
-                    let result = libc::mount(src_c.as_ptr(), tgt_c.as_ptr(), fst_c.as_ptr(), km.flags, dat_ptr);
+                    let result = libc::mount(
+                        src_c.as_ptr(),
+                        tgt_c.as_ptr(),
+                        fst_c.as_ptr(),
+                        km.flags,
+                        dat_ptr,
+                    );
                     if result != 0 {
                         return Err(io::Error::other(format!(
                             "mount {} ({}) at {}: {}",
-                            km.fs_type, km.source, km.target.display(),
+                            km.fs_type,
+                            km.source,
+                            km.target.display(),
                             io::Error::last_os_error()
                         )));
                     }

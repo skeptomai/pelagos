@@ -105,6 +105,12 @@ pub struct OciLinux {
     #[serde(default)]
     pub devices: Vec<OciDevice>,
     pub seccomp: Option<OciSeccomp>,
+    /// Mount propagation of the rootfs: "shared" | "slave" | "private" | "unbindable".
+    /// Defaults to "rprivate" (remora makes all mounts private by default).
+    pub rootfs_propagation: Option<String>,
+    /// Absolute path for the container's cgroup (e.g. "/myapp/container1").
+    /// If absent, remora auto-generates a path.
+    pub cgroups_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +201,7 @@ pub struct OciSyscallArg {
 
 /// OCI lifecycle hooks. Run in the host namespace.
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct OciHooks {
     #[serde(default)]
     pub prestart: Vec<OciHook>,
@@ -317,48 +324,48 @@ fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
     // Strip optional "CAP_" prefix — OCI bundles may include it or omit it.
     let n = name.strip_prefix("CAP_").unwrap_or(name);
     match n {
-        "CHOWN"              => Some(Capability::CHOWN),
-        "DAC_OVERRIDE"       => Some(Capability::DAC_OVERRIDE),
-        "DAC_READ_SEARCH"    => Some(Capability::DAC_READ_SEARCH),
-        "FOWNER"             => Some(Capability::FOWNER),
-        "FSETID"             => Some(Capability::FSETID),
-        "KILL"               => Some(Capability::KILL),
-        "SETGID"             => Some(Capability::SETGID),
-        "SETUID"             => Some(Capability::SETUID),
-        "SETPCAP"            => Some(Capability::SETPCAP),
-        "LINUX_IMMUTABLE"    => Some(Capability::LINUX_IMMUTABLE),
-        "NET_BIND_SERVICE"   => Some(Capability::NET_BIND_SERVICE),
-        "NET_BROADCAST"      => Some(Capability::NET_BROADCAST),
-        "NET_ADMIN"          => Some(Capability::NET_ADMIN),
-        "NET_RAW"            => Some(Capability::NET_RAW),
-        "IPC_LOCK"           => Some(Capability::IPC_LOCK),
-        "IPC_OWNER"          => Some(Capability::IPC_OWNER),
-        "SYS_MODULE"         => Some(Capability::SYS_MODULE),
-        "SYS_RAWIO"          => Some(Capability::SYS_RAWIO),
-        "SYS_CHROOT"         => Some(Capability::SYS_CHROOT),
-        "SYS_PTRACE"         => Some(Capability::SYS_PTRACE),
-        "SYS_PACCT"          => Some(Capability::SYS_PACCT),
-        "SYS_ADMIN"          => Some(Capability::SYS_ADMIN),
-        "SYS_BOOT"           => Some(Capability::SYS_BOOT),
-        "SYS_NICE"           => Some(Capability::SYS_NICE),
-        "SYS_RESOURCE"       => Some(Capability::SYS_RESOURCE),
-        "SYS_TIME"           => Some(Capability::SYS_TIME),
-        "SYS_TTY_CONFIG"     => Some(Capability::SYS_TTY_CONFIG),
-        "MKNOD"              => Some(Capability::MKNOD),
-        "LEASE"              => Some(Capability::LEASE),
-        "AUDIT_WRITE"        => Some(Capability::AUDIT_WRITE),
-        "AUDIT_CONTROL"      => Some(Capability::AUDIT_CONTROL),
-        "SETFCAP"            => Some(Capability::SETFCAP),
-        "MAC_OVERRIDE"       => Some(Capability::MAC_OVERRIDE),
-        "MAC_ADMIN"          => Some(Capability::MAC_ADMIN),
-        "SYSLOG"             => Some(Capability::SYSLOG),
-        "WAKE_ALARM"         => Some(Capability::WAKE_ALARM),
-        "BLOCK_SUSPEND"      => Some(Capability::BLOCK_SUSPEND),
-        "AUDIT_READ"         => Some(Capability::AUDIT_READ),
-        "PERFMON"            => Some(Capability::PERFMON),
-        "BPF"                => Some(Capability::BPF),
+        "CHOWN" => Some(Capability::CHOWN),
+        "DAC_OVERRIDE" => Some(Capability::DAC_OVERRIDE),
+        "DAC_READ_SEARCH" => Some(Capability::DAC_READ_SEARCH),
+        "FOWNER" => Some(Capability::FOWNER),
+        "FSETID" => Some(Capability::FSETID),
+        "KILL" => Some(Capability::KILL),
+        "SETGID" => Some(Capability::SETGID),
+        "SETUID" => Some(Capability::SETUID),
+        "SETPCAP" => Some(Capability::SETPCAP),
+        "LINUX_IMMUTABLE" => Some(Capability::LINUX_IMMUTABLE),
+        "NET_BIND_SERVICE" => Some(Capability::NET_BIND_SERVICE),
+        "NET_BROADCAST" => Some(Capability::NET_BROADCAST),
+        "NET_ADMIN" => Some(Capability::NET_ADMIN),
+        "NET_RAW" => Some(Capability::NET_RAW),
+        "IPC_LOCK" => Some(Capability::IPC_LOCK),
+        "IPC_OWNER" => Some(Capability::IPC_OWNER),
+        "SYS_MODULE" => Some(Capability::SYS_MODULE),
+        "SYS_RAWIO" => Some(Capability::SYS_RAWIO),
+        "SYS_CHROOT" => Some(Capability::SYS_CHROOT),
+        "SYS_PTRACE" => Some(Capability::SYS_PTRACE),
+        "SYS_PACCT" => Some(Capability::SYS_PACCT),
+        "SYS_ADMIN" => Some(Capability::SYS_ADMIN),
+        "SYS_BOOT" => Some(Capability::SYS_BOOT),
+        "SYS_NICE" => Some(Capability::SYS_NICE),
+        "SYS_RESOURCE" => Some(Capability::SYS_RESOURCE),
+        "SYS_TIME" => Some(Capability::SYS_TIME),
+        "SYS_TTY_CONFIG" => Some(Capability::SYS_TTY_CONFIG),
+        "MKNOD" => Some(Capability::MKNOD),
+        "LEASE" => Some(Capability::LEASE),
+        "AUDIT_WRITE" => Some(Capability::AUDIT_WRITE),
+        "AUDIT_CONTROL" => Some(Capability::AUDIT_CONTROL),
+        "SETFCAP" => Some(Capability::SETFCAP),
+        "MAC_OVERRIDE" => Some(Capability::MAC_OVERRIDE),
+        "MAC_ADMIN" => Some(Capability::MAC_ADMIN),
+        "SYSLOG" => Some(Capability::SYSLOG),
+        "WAKE_ALARM" => Some(Capability::WAKE_ALARM),
+        "BLOCK_SUSPEND" => Some(Capability::BLOCK_SUSPEND),
+        "AUDIT_READ" => Some(Capability::AUDIT_READ),
+        "PERFMON" => Some(Capability::PERFMON),
+        "BPF" => Some(Capability::BPF),
         "CHECKPOINT_RESTORE" => Some(Capability::CHECKPOINT_RESTORE),
-        _                    => None,
+        _ => None,
     }
 }
 
@@ -441,12 +448,18 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
             cmd = cmd.with_namespaces(ns_flags);
         }
 
-        // Mount proc automatically when a mount namespace is requested
+        // Mount proc automatically when a mount namespace is requested,
+        // unless the OCI config already supplies an explicit "proc" type mount
+        // (adding both would cause a double-mount and a pre_exec failure).
         let has_mount_ns = linux
             .namespaces
             .iter()
             .any(|n| n.ns_type == "mount" && n.path.is_none());
-        if has_mount_ns {
+        let has_explicit_proc = config
+            .mounts
+            .iter()
+            .any(|m| m.mount_type.as_deref() == Some("proc"));
+        if has_mount_ns && !has_explicit_proc {
             cmd = cmd.with_proc_mount();
         }
 
@@ -567,6 +580,28 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             cmd = cmd.with_seccomp_program(prog);
         }
+
+        // linux.rootfsPropagation
+        if let Some(ref prop) = linux.rootfs_propagation {
+            let flags: libc::c_ulong = match prop.as_str() {
+                "shared" => libc::MS_SHARED | libc::MS_REC,
+                "slave" => libc::MS_SLAVE | libc::MS_REC,
+                "private" => libc::MS_PRIVATE | libc::MS_REC,
+                "unbindable" => libc::MS_UNBINDABLE | libc::MS_REC,
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown rootfsPropagation: {}", other),
+                    ));
+                }
+            };
+            cmd = cmd.with_rootfs_propagation(flags);
+        }
+
+        // linux.cgroupsPath
+        if let Some(ref cg_path) = linux.cgroups_path {
+            cmd = cmd.with_cgroup_path(cg_path.as_str());
+        }
     }
 
     // process.rlimits
@@ -606,31 +641,34 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
         let mut extra_data_parts: Vec<&str> = Vec::new();
         for opt in &mount.options {
             match opt.as_str() {
-                "nosuid"    => flags |= libc::MS_NOSUID,
-                "noexec"    => flags |= libc::MS_NOEXEC,
-                "nodev"     => flags |= libc::MS_NODEV,
+                "nosuid" => flags |= libc::MS_NOSUID,
+                "noexec" => flags |= libc::MS_NOEXEC,
+                "nodev" => flags |= libc::MS_NODEV,
                 "ro" | "readonly" => flags |= libc::MS_RDONLY,
-                "relatime"  => flags |= libc::MS_RELATIME,
-                "noatime"   => flags |= libc::MS_NOATIME,
+                "relatime" => flags |= libc::MS_RELATIME,
+                "noatime" => flags |= libc::MS_NOATIME,
                 "nodiratime" => flags |= libc::MS_NODIRATIME,
                 "strictatime" => flags |= libc::MS_STRICTATIME,
-                "shared"    => flags |= libc::MS_SHARED,
-                "slave"     => flags |= libc::MS_SLAVE,
-                "private"   => flags |= libc::MS_PRIVATE,
+                "shared" => flags |= libc::MS_SHARED,
+                "slave" => flags |= libc::MS_SLAVE,
+                "private" => flags |= libc::MS_PRIVATE,
                 "unbindable" => flags |= libc::MS_UNBINDABLE,
-                "bind"      => flags |= libc::MS_BIND,
-                "rbind"     => flags |= libc::MS_BIND | libc::MS_REC,
-                other       => extra_data_parts.push(other),
+                "bind" => flags |= libc::MS_BIND,
+                "rbind" => flags |= libc::MS_BIND | libc::MS_REC,
+                other => extra_data_parts.push(other),
             }
         }
         let extra_data = extra_data_parts.join(",");
 
         match mount_type {
             "tmpfs" => {
-                // For tmpfs, pass the option string (size=, mode=, etc.) as data;
-                // the with_tmpfs builder adds MS_NOSUID|MS_NODEV itself.
-                let opts: Vec<&str> = mount.options.iter().map(|s| s.as_str()).collect();
-                cmd = cmd.with_tmpfs(dest, &opts.join(","));
+                // Use with_kernel_mount so the parsed MS_* flags (nosuid, strictatime, etc.)
+                // go into the mount(2) flags argument, while only non-flag options
+                // (mode=, size=, uid=, gid=) are passed as mount data.
+                // with_tmpfs hardcodes MS_NOSUID|MS_NODEV and passes all opts as data,
+                // which causes EINVAL when flag-like tokens appear in the data string.
+                let f = libc::MS_NOSUID | libc::MS_NODEV | flags;
+                cmd = cmd.with_kernel_mount("tmpfs", "tmpfs", dest, f, &extra_data);
             }
             "proc" => {
                 let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | flags;
@@ -658,12 +696,14 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 cmd = cmd.with_kernel_mount("mqueue", src, dest, f, "");
             }
             "cgroup" => {
-                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
+                let f =
+                    libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
                 let src = mount.source.as_deref().unwrap_or("cgroup");
                 cmd = cmd.with_kernel_mount("cgroup", src, dest, f, &extra_data);
             }
             "cgroup2" => {
-                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
+                let f =
+                    libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
                 let src = mount.source.as_deref().unwrap_or("cgroup2");
                 cmd = cmd.with_kernel_mount("cgroup2", src, dest, f, "");
             }
@@ -843,6 +883,210 @@ fn run_hooks(hooks: &[OciHook], state: &OciState) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Run a list of OCI hooks in the container's namespaces (createContainer /
+/// startContainer hooks).
+///
+/// Opens the container's namespace fds from `/proc/<container_pid>/ns/{net,uts,ipc}`,
+/// then forks a helper child that calls `setns(2)` for each namespace and runs every
+/// hook sequentially in that joined namespace. The parent waits for the child.
+///
+/// Mount namespace is intentionally excluded: by the time `createContainer` /
+/// `startContainer` hooks are called in remora's lifecycle the container process
+/// has already called `pivot_root`, so the mount namespace's filesystem view is
+/// the container rootfs — the hook binary (on the host) would not be found.
+/// OCI runtimes that run hooks before `pivot_root` (e.g. runc) can join the mount
+/// namespace; remora joins the remaining namespaces (net, uts, ipc).
+///
+/// PID namespace is excluded for the same reason: `setns(CLONE_NEWPID)` only
+/// affects `pid_for_children`; the calling process is not moved.
+///
+/// This satisfies the OCI spec requirement that `createContainer` and
+/// `startContainer` hooks execute inside the container's network/uts/ipc
+/// namespace context.
+fn run_hooks_in_ns(hooks: &[OciHook], state: &OciState, container_pid: i32) -> io::Result<()> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    // Only join non-filesystem namespaces so the hook binary on the host is
+    // still accessible after setns.
+    let ns_names = ["net", "uts", "ipc"];
+    let mut ns_fds: Vec<i32> = Vec::new();
+    for ns in &ns_names {
+        let path = format!("/proc/{}/ns/{}", container_pid, ns);
+        let path_c = match std::ffi::CString::new(path.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            // Only add if it differs from the host namespace (same inode = already joined)
+            let host_path = format!("/proc/1/ns/{}", ns);
+            let host_c = match std::ffi::CString::new(host_path.as_bytes()) {
+                Ok(c) => c,
+                Err(_) => {
+                    ns_fds.push(fd);
+                    continue;
+                }
+            };
+            let mut cst = unsafe { std::mem::zeroed::<libc::stat>() };
+            let mut hst = unsafe { std::mem::zeroed::<libc::stat>() };
+            let cst_ok = unsafe { libc::fstat(fd, &mut cst) } == 0;
+            let hst_ok = unsafe { libc::stat(host_c.as_ptr(), &mut hst) } == 0;
+            if cst_ok && hst_ok && cst.st_ino == hst.st_ino {
+                // Same namespace as host — skip (setns would be a no-op / EPERM)
+                unsafe { libc::close(fd) };
+            } else {
+                ns_fds.push(fd);
+            }
+        }
+    }
+
+    let state_json = serde_json::to_vec(state).map_err(io::Error::other)?;
+
+    // Fork a helper process that joins the container namespaces, then runs hooks.
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => {
+            for fd in ns_fds {
+                unsafe { libc::close(fd) };
+            }
+            Err(io::Error::last_os_error())
+        }
+        0 => {
+            // CHILD: join each namespace then exec hooks.
+            //
+            // IMPORTANT: we must NOT call Rust's std::process::Command here —
+            // doing so after fork() in a potentially-multithreaded process risks
+            // deadlock (Rust's internal I/O and allocator mutexes may be held by
+            // threads that no longer exist in the forked child).  Use raw libc
+            // fork+exec for each hook instead.
+            for &fd in &ns_fds {
+                unsafe { libc::setns(fd, 0) };
+                unsafe { libc::close(fd) };
+            }
+
+            // Create a pipe so we can write state JSON to each hook's stdin.
+            for hook in hooks {
+                let mut stdin_pipe = [0i32; 2];
+                if unsafe { libc::pipe(stdin_pipe.as_mut_ptr()) } != 0 {
+                    unsafe { libc::_exit(1) };
+                }
+                let (pipe_r, pipe_w) = (stdin_pipe[0], stdin_pipe[1]);
+
+                // Build argv and envp as CString arrays.
+                let mut argv_cstr: Vec<std::ffi::CString> = Vec::new();
+                let path_c = match std::ffi::CString::new(hook.path.as_bytes()) {
+                    Ok(c) => c,
+                    Err(_) => unsafe { libc::_exit(1) },
+                };
+                argv_cstr.push(path_c.clone());
+                for arg in hook.args.iter().skip(1) {
+                    match std::ffi::CString::new(arg.as_bytes()) {
+                        Ok(c) => argv_cstr.push(c),
+                        Err(_) => unsafe { libc::_exit(1) },
+                    }
+                }
+                let mut argv_ptrs: Vec<*const libc::c_char> =
+                    argv_cstr.iter().map(|c| c.as_ptr()).collect();
+                argv_ptrs.push(std::ptr::null());
+
+                let mut envp_cstr: Vec<std::ffi::CString> = Vec::new();
+                for entry in &hook.env {
+                    if let Ok(c) = std::ffi::CString::new(entry.as_bytes()) {
+                        envp_cstr.push(c);
+                    }
+                }
+                let mut envp_ptrs: Vec<*const libc::c_char> =
+                    envp_cstr.iter().map(|c| c.as_ptr()).collect();
+                envp_ptrs.push(std::ptr::null());
+
+                let hook_pid = unsafe { libc::fork() };
+                match hook_pid {
+                    -1 => unsafe { libc::_exit(1) },
+                    0 => {
+                        // Hook grandchild: redirect stdin from pipe, then exec.
+                        unsafe { libc::close(pipe_w) };
+                        unsafe { libc::dup2(pipe_r, 0) };
+                        unsafe { libc::close(pipe_r) };
+                        unsafe {
+                            libc::execve(path_c.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr())
+                        };
+                        unsafe { libc::_exit(127) };
+                    }
+                    _ => {
+                        // Helper child: write state JSON to hook's stdin, then wait.
+                        unsafe { libc::close(pipe_r) };
+                        let mut written = 0usize;
+                        while written < state_json.len() {
+                            let n = unsafe {
+                                libc::write(
+                                    pipe_w,
+                                    state_json[written..].as_ptr() as *const libc::c_void,
+                                    state_json.len() - written,
+                                )
+                            };
+                            if n <= 0 {
+                                break;
+                            }
+                            written += n as usize;
+                        }
+                        unsafe { libc::close(pipe_w) };
+
+                        // Wait for hook, respecting optional timeout.
+                        let deadline = hook
+                            .timeout
+                            .map(|t| std::time::Instant::now() + Duration::from_secs(t as u64));
+                        loop {
+                            let mut wstatus = 0i32;
+                            let ret =
+                                unsafe { libc::waitpid(hook_pid, &mut wstatus, libc::WNOHANG) };
+                            if ret == hook_pid {
+                                let ok =
+                                    libc::WIFEXITED(wstatus) && libc::WEXITSTATUS(wstatus) == 0;
+                                if !ok {
+                                    unsafe { libc::_exit(1) };
+                                }
+                                break;
+                            }
+                            if let Some(dl) = deadline {
+                                if std::time::Instant::now() >= dl {
+                                    unsafe { libc::kill(hook_pid, libc::SIGKILL) };
+                                    unsafe { libc::_exit(1) };
+                                }
+                            }
+                            // Brief sleep to avoid busy-poll.
+                            unsafe {
+                                libc::usleep(20_000);
+                            }
+                        }
+                    }
+                }
+            }
+            unsafe { libc::_exit(0) };
+        }
+        child_pid => {
+            // PARENT: close our copies of the ns fds.
+            for fd in ns_fds {
+                unsafe { libc::close(fd) };
+            }
+            // Wait for the helper.
+            let mut status = 0i32;
+            let ret = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "createContainer/startContainer hook failed",
+                ))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,16 +1314,18 @@ pub fn cmd_create(
                 fs::write(pf, format!("{}\n", container_pid))?;
             }
 
-            // Run prestart hooks (host namespace, after container is "created").
+            // Run lifecycle hooks after container is in "created" state.
             if let Some(ref hooks) = config.hooks {
+                // prestart + createRuntime: host namespace (per OCI spec)
                 if !hooks.prestart.is_empty() {
                     run_hooks(&hooks.prestart, &state)?;
                 }
                 if !hooks.create_runtime.is_empty() {
                     run_hooks(&hooks.create_runtime, &state)?;
                 }
+                // createContainer: container namespace (per OCI spec)
                 if !hooks.create_container.is_empty() {
-                    run_hooks(&hooks.create_container, &state)?;
+                    run_hooks_in_ns(&hooks.create_container, &state, container_pid)?;
                 }
             }
 
@@ -1100,6 +1346,16 @@ pub fn cmd_start(id: &str) -> io::Result<()> {
                 id, state.status
             ),
         ));
+    }
+
+    // Run startContainer hooks in the container's namespace BEFORE exec.
+    // These must run after "created" state but before the user process starts.
+    if let Ok(config) = config_from_bundle(std::path::Path::new(&state.bundle)) {
+        if let Some(ref hooks) = config.hooks {
+            if !hooks.start_container.is_empty() {
+                run_hooks_in_ns(&hooks.start_container, &state, state.pid)?;
+            }
+        }
     }
 
     // Connect to exec.sock and send the start byte.
@@ -1154,40 +1410,43 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
 
     // Accept signal as name (with or without "SIG" prefix) or number.
     let sig: i32 = match signal.to_ascii_uppercase().trim_start_matches("SIG") {
-        "HUP"    | "1"  => libc::SIGHUP,
-        "INT"    | "2"  => libc::SIGINT,
-        "QUIT"   | "3"  => libc::SIGQUIT,
-        "ILL"    | "4"  => libc::SIGILL,
-        "TRAP"   | "5"  => libc::SIGTRAP,
-        "ABRT"   | "6"  => libc::SIGABRT,
-        "BUS"    | "7"  => libc::SIGBUS,
-        "FPE"    | "8"  => libc::SIGFPE,
-        "KILL"   | "9"  => libc::SIGKILL,
-        "USR1"   | "10" => libc::SIGUSR1,
-        "SEGV"   | "11" => libc::SIGSEGV,
-        "USR2"   | "12" => libc::SIGUSR2,
-        "PIPE"   | "13" => libc::SIGPIPE,
-        "ALRM"   | "14" => libc::SIGALRM,
-        "TERM"   | "15" => libc::SIGTERM,
-        "CHLD"   | "17" => libc::SIGCHLD,
-        "CONT"   | "18" => libc::SIGCONT,
-        "STOP"   | "19" => libc::SIGSTOP,
-        "TSTP"   | "20" => libc::SIGTSTP,
-        "TTIN"   | "21" => libc::SIGTTIN,
-        "TTOU"   | "22" => libc::SIGTTOU,
-        "URG"    | "23" => libc::SIGURG,
-        "XCPU"   | "24" => libc::SIGXCPU,
-        "XFSZ"   | "25" => libc::SIGXFSZ,
+        "HUP" | "1" => libc::SIGHUP,
+        "INT" | "2" => libc::SIGINT,
+        "QUIT" | "3" => libc::SIGQUIT,
+        "ILL" | "4" => libc::SIGILL,
+        "TRAP" | "5" => libc::SIGTRAP,
+        "ABRT" | "6" => libc::SIGABRT,
+        "BUS" | "7" => libc::SIGBUS,
+        "FPE" | "8" => libc::SIGFPE,
+        "KILL" | "9" => libc::SIGKILL,
+        "USR1" | "10" => libc::SIGUSR1,
+        "SEGV" | "11" => libc::SIGSEGV,
+        "USR2" | "12" => libc::SIGUSR2,
+        "PIPE" | "13" => libc::SIGPIPE,
+        "ALRM" | "14" => libc::SIGALRM,
+        "TERM" | "15" => libc::SIGTERM,
+        "CHLD" | "17" => libc::SIGCHLD,
+        "CONT" | "18" => libc::SIGCONT,
+        "STOP" | "19" => libc::SIGSTOP,
+        "TSTP" | "20" => libc::SIGTSTP,
+        "TTIN" | "21" => libc::SIGTTIN,
+        "TTOU" | "22" => libc::SIGTTOU,
+        "URG" | "23" => libc::SIGURG,
+        "XCPU" | "24" => libc::SIGXCPU,
+        "XFSZ" | "25" => libc::SIGXFSZ,
         "VTALRM" | "26" => libc::SIGVTALRM,
-        "PROF"   | "27" => libc::SIGPROF,
-        "WINCH"  | "28" => libc::SIGWINCH,
+        "PROF" | "27" => libc::SIGPROF,
+        "WINCH" | "28" => libc::SIGWINCH,
         "IO" | "POLL" | "29" => libc::SIGIO,
-        "PWR"    | "30" => libc::SIGPWR,
-        "SYS"    | "31" => libc::SIGSYS,
+        "PWR" | "30" => libc::SIGPWR,
+        "SYS" | "31" => libc::SIGSYS,
         s => s.parse::<i32>().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unknown signal '{}' — use a name (SIGTERM) or number (15)", signal),
+                format!(
+                    "unknown signal '{}' — use a name (SIGTERM) or number (15)",
+                    signal
+                ),
             )
         })?,
     };
@@ -1243,22 +1502,53 @@ mod tests {
     fn test_oci_cap_all_known_names_round_trip() {
         // Every OCI capability name used in Docker's default profile must map to a flag.
         let known = [
-            "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
-            "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
-            "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST",
-            "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK", "CAP_IPC_OWNER",
-            "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE",
-            "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE",
-            "CAP_SYS_RESOURCE", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD",
-            "CAP_LEASE", "CAP_AUDIT_WRITE", "CAP_AUDIT_CONTROL", "CAP_SETFCAP",
-            "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG", "CAP_WAKE_ALARM",
-            "CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF",
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_DAC_READ_SEARCH",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_KILL",
+            "CAP_SETGID",
+            "CAP_SETUID",
+            "CAP_SETPCAP",
+            "CAP_LINUX_IMMUTABLE",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_NET_BROADCAST",
+            "CAP_NET_ADMIN",
+            "CAP_NET_RAW",
+            "CAP_IPC_LOCK",
+            "CAP_IPC_OWNER",
+            "CAP_SYS_MODULE",
+            "CAP_SYS_RAWIO",
+            "CAP_SYS_CHROOT",
+            "CAP_SYS_PTRACE",
+            "CAP_SYS_PACCT",
+            "CAP_SYS_ADMIN",
+            "CAP_SYS_BOOT",
+            "CAP_SYS_NICE",
+            "CAP_SYS_RESOURCE",
+            "CAP_SYS_TIME",
+            "CAP_SYS_TTY_CONFIG",
+            "CAP_MKNOD",
+            "CAP_LEASE",
+            "CAP_AUDIT_WRITE",
+            "CAP_AUDIT_CONTROL",
+            "CAP_SETFCAP",
+            "CAP_MAC_OVERRIDE",
+            "CAP_MAC_ADMIN",
+            "CAP_SYSLOG",
+            "CAP_WAKE_ALARM",
+            "CAP_BLOCK_SUSPEND",
+            "CAP_AUDIT_READ",
+            "CAP_PERFMON",
+            "CAP_BPF",
             "CAP_CHECKPOINT_RESTORE",
         ];
         for name in &known {
             assert!(
                 oci_cap_to_flag(name).is_some(),
-                "oci_cap_to_flag returned None for {}", name
+                "oci_cap_to_flag returned None for {}",
+                name
             );
         }
     }
@@ -1277,11 +1567,11 @@ mod tests {
         // The signal parsing in cmd_kill must accept names from runtime-tools.
         let cases: &[(&str, i32)] = &[
             ("SIGTERM", libc::SIGTERM),
-            ("TERM",    libc::SIGTERM),
-            ("15",      libc::SIGTERM),
+            ("TERM", libc::SIGTERM),
+            ("15", libc::SIGTERM),
             ("SIGKILL", libc::SIGKILL),
-            ("9",       libc::SIGKILL),
-            ("SIGHUP",  libc::SIGHUP),
+            ("9", libc::SIGKILL),
+            ("SIGHUP", libc::SIGHUP),
             ("SIGWINCH", libc::SIGWINCH),
             ("SIGCHLD", libc::SIGCHLD),
             ("SIGCONT", libc::SIGCONT),
@@ -1293,43 +1583,47 @@ mod tests {
             ("SIGALRM", libc::SIGALRM),
             ("SIGSEGV", libc::SIGSEGV),
             ("SIGABRT", libc::SIGABRT),
-            ("SIGSYS",  libc::SIGSYS),
+            ("SIGSYS", libc::SIGSYS),
         ];
         for (name, expected) in cases {
             let got = match name.to_ascii_uppercase().trim_start_matches("SIG") {
-                "HUP"    | "1"  => libc::SIGHUP,
-                "INT"    | "2"  => libc::SIGINT,
-                "QUIT"   | "3"  => libc::SIGQUIT,
-                "ILL"    | "4"  => libc::SIGILL,
-                "TRAP"   | "5"  => libc::SIGTRAP,
-                "ABRT"   | "6"  => libc::SIGABRT,
-                "BUS"    | "7"  => libc::SIGBUS,
-                "FPE"    | "8"  => libc::SIGFPE,
-                "KILL"   | "9"  => libc::SIGKILL,
-                "USR1"   | "10" => libc::SIGUSR1,
-                "SEGV"   | "11" => libc::SIGSEGV,
-                "USR2"   | "12" => libc::SIGUSR2,
-                "PIPE"   | "13" => libc::SIGPIPE,
-                "ALRM"   | "14" => libc::SIGALRM,
-                "TERM"   | "15" => libc::SIGTERM,
-                "CHLD"   | "17" => libc::SIGCHLD,
-                "CONT"   | "18" => libc::SIGCONT,
-                "STOP"   | "19" => libc::SIGSTOP,
-                "TSTP"   | "20" => libc::SIGTSTP,
-                "TTIN"   | "21" => libc::SIGTTIN,
-                "TTOU"   | "22" => libc::SIGTTOU,
-                "URG"    | "23" => libc::SIGURG,
-                "XCPU"   | "24" => libc::SIGXCPU,
-                "XFSZ"   | "25" => libc::SIGXFSZ,
+                "HUP" | "1" => libc::SIGHUP,
+                "INT" | "2" => libc::SIGINT,
+                "QUIT" | "3" => libc::SIGQUIT,
+                "ILL" | "4" => libc::SIGILL,
+                "TRAP" | "5" => libc::SIGTRAP,
+                "ABRT" | "6" => libc::SIGABRT,
+                "BUS" | "7" => libc::SIGBUS,
+                "FPE" | "8" => libc::SIGFPE,
+                "KILL" | "9" => libc::SIGKILL,
+                "USR1" | "10" => libc::SIGUSR1,
+                "SEGV" | "11" => libc::SIGSEGV,
+                "USR2" | "12" => libc::SIGUSR2,
+                "PIPE" | "13" => libc::SIGPIPE,
+                "ALRM" | "14" => libc::SIGALRM,
+                "TERM" | "15" => libc::SIGTERM,
+                "CHLD" | "17" => libc::SIGCHLD,
+                "CONT" | "18" => libc::SIGCONT,
+                "STOP" | "19" => libc::SIGSTOP,
+                "TSTP" | "20" => libc::SIGTSTP,
+                "TTIN" | "21" => libc::SIGTTIN,
+                "TTOU" | "22" => libc::SIGTTOU,
+                "URG" | "23" => libc::SIGURG,
+                "XCPU" | "24" => libc::SIGXCPU,
+                "XFSZ" | "25" => libc::SIGXFSZ,
                 "VTALRM" | "26" => libc::SIGVTALRM,
-                "PROF"   | "27" => libc::SIGPROF,
-                "WINCH"  | "28" => libc::SIGWINCH,
+                "PROF" | "27" => libc::SIGPROF,
+                "WINCH" | "28" => libc::SIGWINCH,
                 "IO" | "POLL" | "29" => libc::SIGIO,
-                "PWR"    | "30" => libc::SIGPWR,
-                "SYS"    | "31" => libc::SIGSYS,
+                "PWR" | "30" => libc::SIGPWR,
+                "SYS" | "31" => libc::SIGSYS,
                 s => s.parse::<i32>().unwrap_or(-1),
             };
-            assert_eq!(got, *expected, "signal '{}' mapped to {} not {}", name, got, expected);
+            assert_eq!(
+                got, *expected,
+                "signal '{}' mapped to {} not {}",
+                name, got, expected
+            );
         }
     }
 }
