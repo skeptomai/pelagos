@@ -53,6 +53,10 @@ pub struct CgroupConfig {
 
     /// Maximum number of live processes/threads in the cgroup (`pids.max`).
     pub pids_limit: Option<u64>,
+
+    /// Explicit cgroup path from OCI `linux.cgroupsPath`.
+    /// If set, used as-is as the cgroup name/path; otherwise defaults to `remora-{pid}`.
+    pub path: Option<String>,
 }
 
 /// Create a cgroup named `remora-{child_pid}`, apply configured limits, and add
@@ -66,7 +70,10 @@ pub struct CgroupConfig {
 /// Returns an error if the cgroup cannot be created (e.g. missing permissions,
 /// cgroup fs not mounted) or if the PID cannot be added.
 pub fn setup_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<Cgroup> {
-    let name = format!("remora-{}", child_pid);
+    let name = cfg
+        .path
+        .clone()
+        .unwrap_or_else(|| format!("remora-{}", child_pid));
     let hier = hierarchies::auto();
 
     let mut builder = CgroupBuilder::new(&name);

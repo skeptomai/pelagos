@@ -3678,7 +3678,10 @@ mod oci_lifecycle {
         std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
         let id = format!("test-oci-kmnt-{}", std::process::id());
         let (_, stderr, ok) = run_remora(&[
-            "create", "--bundle", bundle_dir.path().to_str().unwrap(), &id,
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            &id,
         ]);
         assert!(ok, "remora create (kernel mounts) failed: {}", stderr);
         let (_, stderr, ok) = run_remora(&["start", &id]);
@@ -3687,7 +3690,9 @@ mod oci_lifecycle {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let (stdout, _, _) = run_remora(&["state", &id]);
-            if stdout.contains("\"stopped\"") { break; }
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
             if std::time::Instant::now() > deadline {
                 run_remora(&["delete", &id]);
                 panic!("container with kernel mounts did not stop within 5s");
@@ -3731,7 +3736,11 @@ mod oci_lifecycle {
         assert!(ok, "remora create --bundle failed: {}", stderr);
 
         let (stdout, _, _) = run_remora(&["state", &id]);
-        assert!(stdout.contains("\"created\""), "expected created state, got: {}", stdout);
+        assert!(
+            stdout.contains("\"created\""),
+            "expected created state, got: {}",
+            stdout
+        );
 
         run_remora(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -3775,9 +3784,11 @@ mod oci_lifecycle {
         assert!(ok, "remora create --pid-file failed: {}", stderr);
 
         // Verify pid file exists and contains a positive integer.
-        let pid_str = std::fs::read_to_string(&pid_file)
-            .expect("pid file not written");
-        let pid: i32 = pid_str.trim().parse().expect("pid file contains non-integer");
+        let pid_str = std::fs::read_to_string(&pid_file).expect("pid file not written");
+        let pid: i32 = pid_str
+            .trim()
+            .parse()
+            .expect("pid file contains non-integer");
         assert!(pid > 1, "pid file contains invalid PID {}", pid);
 
         // Verify PID matches state.json.
@@ -3785,12 +3796,120 @@ mod oci_lifecycle {
         assert!(
             state_out.contains(&pid.to_string()),
             "pid file PID {} not found in state: {}",
-            pid, state_out
+            pid,
+            state_out
         );
 
         run_remora(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(300));
         run_remora(&["delete", &id]);
+    }
+
+    /// test_oci_rootfs_propagation
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Creates an OCI bundle with `linux.rootfsPropagation: "private"` and runs
+    /// `echo ok` inside it. Verifies that the container starts and finishes
+    /// successfully — confirming that the field is parsed, mapped to MS_PRIVATE|MS_REC,
+    /// and applied in pre_exec without error.
+    ///
+    /// Failure indicates the propagation flag parsing or mount(2) call is broken.
+    #[test]
+    fn test_oci_rootfs_propagation() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_rootfs_propagation: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_rootfs_propagation: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        // Config with rootfsPropagation: "private"
+        let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "args": ["/bin/echo", "ok"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "rootfsPropagation": "private",
+    "namespaces": [
+      {"type": "mount"},
+      {"type": "uts"},
+      {"type": "pid"}
+    ]
+  }
+}"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        let id = format!("test-oci-prop-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 10);
+        // reaching here means the container ran to completion successfully
+    }
+
+    /// test_oci_cgroups_path
+    ///
+    /// Requires: root, alpine-rootfs, cgroups v2.
+    ///
+    /// Creates an OCI bundle with `linux.cgroupsPath: "remora-oci-test"` and runs
+    /// `echo ok` inside it. Verifies that the container starts and finishes
+    /// successfully — confirming that the path is parsed and passed to the cgroup
+    /// builder without error.
+    ///
+    /// Failure indicates the cgroupsPath wiring from OCI config to CgroupConfig is broken.
+    #[test]
+    fn test_oci_cgroups_path() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_cgroups_path: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_cgroups_path: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        let unique_cg = format!("remora-oci-test-{}", std::process::id());
+        let config = format!(
+            r#"{{
+  "ociVersion": "1.0.2",
+  "root": {{"path": "rootfs"}},
+  "process": {{
+    "args": ["/bin/echo", "ok"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  }},
+  "linux": {{
+    "cgroupsPath": "{}",
+    "namespaces": [
+      {{"type": "mount"}},
+      {{"type": "uts"}},
+      {{"type": "pid"}}
+    ]
+  }}
+}}"#,
+            unique_cg
+        );
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        let id = format!("test-oci-cgpath-{}", std::process::id());
+        oci_run_to_completion(&id, bundle_dir.path(), 10);
+        // reaching here means the container ran successfully with explicit cgroupsPath
     }
 }
 

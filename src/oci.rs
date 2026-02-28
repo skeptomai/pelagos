@@ -105,6 +105,12 @@ pub struct OciLinux {
     #[serde(default)]
     pub devices: Vec<OciDevice>,
     pub seccomp: Option<OciSeccomp>,
+    /// Mount propagation of the rootfs: "shared" | "slave" | "private" | "unbindable".
+    /// Defaults to "rprivate" (remora makes all mounts private by default).
+    pub rootfs_propagation: Option<String>,
+    /// Absolute path for the container's cgroup (e.g. "/myapp/container1").
+    /// If absent, remora auto-generates a path.
+    pub cgroups_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,48 +323,48 @@ fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
     // Strip optional "CAP_" prefix — OCI bundles may include it or omit it.
     let n = name.strip_prefix("CAP_").unwrap_or(name);
     match n {
-        "CHOWN"              => Some(Capability::CHOWN),
-        "DAC_OVERRIDE"       => Some(Capability::DAC_OVERRIDE),
-        "DAC_READ_SEARCH"    => Some(Capability::DAC_READ_SEARCH),
-        "FOWNER"             => Some(Capability::FOWNER),
-        "FSETID"             => Some(Capability::FSETID),
-        "KILL"               => Some(Capability::KILL),
-        "SETGID"             => Some(Capability::SETGID),
-        "SETUID"             => Some(Capability::SETUID),
-        "SETPCAP"            => Some(Capability::SETPCAP),
-        "LINUX_IMMUTABLE"    => Some(Capability::LINUX_IMMUTABLE),
-        "NET_BIND_SERVICE"   => Some(Capability::NET_BIND_SERVICE),
-        "NET_BROADCAST"      => Some(Capability::NET_BROADCAST),
-        "NET_ADMIN"          => Some(Capability::NET_ADMIN),
-        "NET_RAW"            => Some(Capability::NET_RAW),
-        "IPC_LOCK"           => Some(Capability::IPC_LOCK),
-        "IPC_OWNER"          => Some(Capability::IPC_OWNER),
-        "SYS_MODULE"         => Some(Capability::SYS_MODULE),
-        "SYS_RAWIO"          => Some(Capability::SYS_RAWIO),
-        "SYS_CHROOT"         => Some(Capability::SYS_CHROOT),
-        "SYS_PTRACE"         => Some(Capability::SYS_PTRACE),
-        "SYS_PACCT"          => Some(Capability::SYS_PACCT),
-        "SYS_ADMIN"          => Some(Capability::SYS_ADMIN),
-        "SYS_BOOT"           => Some(Capability::SYS_BOOT),
-        "SYS_NICE"           => Some(Capability::SYS_NICE),
-        "SYS_RESOURCE"       => Some(Capability::SYS_RESOURCE),
-        "SYS_TIME"           => Some(Capability::SYS_TIME),
-        "SYS_TTY_CONFIG"     => Some(Capability::SYS_TTY_CONFIG),
-        "MKNOD"              => Some(Capability::MKNOD),
-        "LEASE"              => Some(Capability::LEASE),
-        "AUDIT_WRITE"        => Some(Capability::AUDIT_WRITE),
-        "AUDIT_CONTROL"      => Some(Capability::AUDIT_CONTROL),
-        "SETFCAP"            => Some(Capability::SETFCAP),
-        "MAC_OVERRIDE"       => Some(Capability::MAC_OVERRIDE),
-        "MAC_ADMIN"          => Some(Capability::MAC_ADMIN),
-        "SYSLOG"             => Some(Capability::SYSLOG),
-        "WAKE_ALARM"         => Some(Capability::WAKE_ALARM),
-        "BLOCK_SUSPEND"      => Some(Capability::BLOCK_SUSPEND),
-        "AUDIT_READ"         => Some(Capability::AUDIT_READ),
-        "PERFMON"            => Some(Capability::PERFMON),
-        "BPF"                => Some(Capability::BPF),
+        "CHOWN" => Some(Capability::CHOWN),
+        "DAC_OVERRIDE" => Some(Capability::DAC_OVERRIDE),
+        "DAC_READ_SEARCH" => Some(Capability::DAC_READ_SEARCH),
+        "FOWNER" => Some(Capability::FOWNER),
+        "FSETID" => Some(Capability::FSETID),
+        "KILL" => Some(Capability::KILL),
+        "SETGID" => Some(Capability::SETGID),
+        "SETUID" => Some(Capability::SETUID),
+        "SETPCAP" => Some(Capability::SETPCAP),
+        "LINUX_IMMUTABLE" => Some(Capability::LINUX_IMMUTABLE),
+        "NET_BIND_SERVICE" => Some(Capability::NET_BIND_SERVICE),
+        "NET_BROADCAST" => Some(Capability::NET_BROADCAST),
+        "NET_ADMIN" => Some(Capability::NET_ADMIN),
+        "NET_RAW" => Some(Capability::NET_RAW),
+        "IPC_LOCK" => Some(Capability::IPC_LOCK),
+        "IPC_OWNER" => Some(Capability::IPC_OWNER),
+        "SYS_MODULE" => Some(Capability::SYS_MODULE),
+        "SYS_RAWIO" => Some(Capability::SYS_RAWIO),
+        "SYS_CHROOT" => Some(Capability::SYS_CHROOT),
+        "SYS_PTRACE" => Some(Capability::SYS_PTRACE),
+        "SYS_PACCT" => Some(Capability::SYS_PACCT),
+        "SYS_ADMIN" => Some(Capability::SYS_ADMIN),
+        "SYS_BOOT" => Some(Capability::SYS_BOOT),
+        "SYS_NICE" => Some(Capability::SYS_NICE),
+        "SYS_RESOURCE" => Some(Capability::SYS_RESOURCE),
+        "SYS_TIME" => Some(Capability::SYS_TIME),
+        "SYS_TTY_CONFIG" => Some(Capability::SYS_TTY_CONFIG),
+        "MKNOD" => Some(Capability::MKNOD),
+        "LEASE" => Some(Capability::LEASE),
+        "AUDIT_WRITE" => Some(Capability::AUDIT_WRITE),
+        "AUDIT_CONTROL" => Some(Capability::AUDIT_CONTROL),
+        "SETFCAP" => Some(Capability::SETFCAP),
+        "MAC_OVERRIDE" => Some(Capability::MAC_OVERRIDE),
+        "MAC_ADMIN" => Some(Capability::MAC_ADMIN),
+        "SYSLOG" => Some(Capability::SYSLOG),
+        "WAKE_ALARM" => Some(Capability::WAKE_ALARM),
+        "BLOCK_SUSPEND" => Some(Capability::BLOCK_SUSPEND),
+        "AUDIT_READ" => Some(Capability::AUDIT_READ),
+        "PERFMON" => Some(Capability::PERFMON),
+        "BPF" => Some(Capability::BPF),
         "CHECKPOINT_RESTORE" => Some(Capability::CHECKPOINT_RESTORE),
-        _                    => None,
+        _ => None,
     }
 }
 
@@ -567,6 +573,28 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             cmd = cmd.with_seccomp_program(prog);
         }
+
+        // linux.rootfsPropagation
+        if let Some(ref prop) = linux.rootfs_propagation {
+            let flags: libc::c_ulong = match prop.as_str() {
+                "shared" => libc::MS_SHARED | libc::MS_REC,
+                "slave" => libc::MS_SLAVE | libc::MS_REC,
+                "private" => libc::MS_PRIVATE | libc::MS_REC,
+                "unbindable" => libc::MS_UNBINDABLE | libc::MS_REC,
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown rootfsPropagation: {}", other),
+                    ));
+                }
+            };
+            cmd = cmd.with_rootfs_propagation(flags);
+        }
+
+        // linux.cgroupsPath
+        if let Some(ref cg_path) = linux.cgroups_path {
+            cmd = cmd.with_cgroup_path(cg_path.as_str());
+        }
     }
 
     // process.rlimits
@@ -606,21 +634,21 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
         let mut extra_data_parts: Vec<&str> = Vec::new();
         for opt in &mount.options {
             match opt.as_str() {
-                "nosuid"    => flags |= libc::MS_NOSUID,
-                "noexec"    => flags |= libc::MS_NOEXEC,
-                "nodev"     => flags |= libc::MS_NODEV,
+                "nosuid" => flags |= libc::MS_NOSUID,
+                "noexec" => flags |= libc::MS_NOEXEC,
+                "nodev" => flags |= libc::MS_NODEV,
                 "ro" | "readonly" => flags |= libc::MS_RDONLY,
-                "relatime"  => flags |= libc::MS_RELATIME,
-                "noatime"   => flags |= libc::MS_NOATIME,
+                "relatime" => flags |= libc::MS_RELATIME,
+                "noatime" => flags |= libc::MS_NOATIME,
                 "nodiratime" => flags |= libc::MS_NODIRATIME,
                 "strictatime" => flags |= libc::MS_STRICTATIME,
-                "shared"    => flags |= libc::MS_SHARED,
-                "slave"     => flags |= libc::MS_SLAVE,
-                "private"   => flags |= libc::MS_PRIVATE,
+                "shared" => flags |= libc::MS_SHARED,
+                "slave" => flags |= libc::MS_SLAVE,
+                "private" => flags |= libc::MS_PRIVATE,
                 "unbindable" => flags |= libc::MS_UNBINDABLE,
-                "bind"      => flags |= libc::MS_BIND,
-                "rbind"     => flags |= libc::MS_BIND | libc::MS_REC,
-                other       => extra_data_parts.push(other),
+                "bind" => flags |= libc::MS_BIND,
+                "rbind" => flags |= libc::MS_BIND | libc::MS_REC,
+                other => extra_data_parts.push(other),
             }
         }
         let extra_data = extra_data_parts.join(",");
@@ -658,12 +686,14 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 cmd = cmd.with_kernel_mount("mqueue", src, dest, f, "");
             }
             "cgroup" => {
-                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
+                let f =
+                    libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
                 let src = mount.source.as_deref().unwrap_or("cgroup");
                 cmd = cmd.with_kernel_mount("cgroup", src, dest, f, &extra_data);
             }
             "cgroup2" => {
-                let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
+                let f =
+                    libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RELATIME | flags;
                 let src = mount.source.as_deref().unwrap_or("cgroup2");
                 cmd = cmd.with_kernel_mount("cgroup2", src, dest, f, "");
             }
@@ -1154,40 +1184,43 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
 
     // Accept signal as name (with or without "SIG" prefix) or number.
     let sig: i32 = match signal.to_ascii_uppercase().trim_start_matches("SIG") {
-        "HUP"    | "1"  => libc::SIGHUP,
-        "INT"    | "2"  => libc::SIGINT,
-        "QUIT"   | "3"  => libc::SIGQUIT,
-        "ILL"    | "4"  => libc::SIGILL,
-        "TRAP"   | "5"  => libc::SIGTRAP,
-        "ABRT"   | "6"  => libc::SIGABRT,
-        "BUS"    | "7"  => libc::SIGBUS,
-        "FPE"    | "8"  => libc::SIGFPE,
-        "KILL"   | "9"  => libc::SIGKILL,
-        "USR1"   | "10" => libc::SIGUSR1,
-        "SEGV"   | "11" => libc::SIGSEGV,
-        "USR2"   | "12" => libc::SIGUSR2,
-        "PIPE"   | "13" => libc::SIGPIPE,
-        "ALRM"   | "14" => libc::SIGALRM,
-        "TERM"   | "15" => libc::SIGTERM,
-        "CHLD"   | "17" => libc::SIGCHLD,
-        "CONT"   | "18" => libc::SIGCONT,
-        "STOP"   | "19" => libc::SIGSTOP,
-        "TSTP"   | "20" => libc::SIGTSTP,
-        "TTIN"   | "21" => libc::SIGTTIN,
-        "TTOU"   | "22" => libc::SIGTTOU,
-        "URG"    | "23" => libc::SIGURG,
-        "XCPU"   | "24" => libc::SIGXCPU,
-        "XFSZ"   | "25" => libc::SIGXFSZ,
+        "HUP" | "1" => libc::SIGHUP,
+        "INT" | "2" => libc::SIGINT,
+        "QUIT" | "3" => libc::SIGQUIT,
+        "ILL" | "4" => libc::SIGILL,
+        "TRAP" | "5" => libc::SIGTRAP,
+        "ABRT" | "6" => libc::SIGABRT,
+        "BUS" | "7" => libc::SIGBUS,
+        "FPE" | "8" => libc::SIGFPE,
+        "KILL" | "9" => libc::SIGKILL,
+        "USR1" | "10" => libc::SIGUSR1,
+        "SEGV" | "11" => libc::SIGSEGV,
+        "USR2" | "12" => libc::SIGUSR2,
+        "PIPE" | "13" => libc::SIGPIPE,
+        "ALRM" | "14" => libc::SIGALRM,
+        "TERM" | "15" => libc::SIGTERM,
+        "CHLD" | "17" => libc::SIGCHLD,
+        "CONT" | "18" => libc::SIGCONT,
+        "STOP" | "19" => libc::SIGSTOP,
+        "TSTP" | "20" => libc::SIGTSTP,
+        "TTIN" | "21" => libc::SIGTTIN,
+        "TTOU" | "22" => libc::SIGTTOU,
+        "URG" | "23" => libc::SIGURG,
+        "XCPU" | "24" => libc::SIGXCPU,
+        "XFSZ" | "25" => libc::SIGXFSZ,
         "VTALRM" | "26" => libc::SIGVTALRM,
-        "PROF"   | "27" => libc::SIGPROF,
-        "WINCH"  | "28" => libc::SIGWINCH,
+        "PROF" | "27" => libc::SIGPROF,
+        "WINCH" | "28" => libc::SIGWINCH,
         "IO" | "POLL" | "29" => libc::SIGIO,
-        "PWR"    | "30" => libc::SIGPWR,
-        "SYS"    | "31" => libc::SIGSYS,
+        "PWR" | "30" => libc::SIGPWR,
+        "SYS" | "31" => libc::SIGSYS,
         s => s.parse::<i32>().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unknown signal '{}' — use a name (SIGTERM) or number (15)", signal),
+                format!(
+                    "unknown signal '{}' — use a name (SIGTERM) or number (15)",
+                    signal
+                ),
             )
         })?,
     };
@@ -1243,22 +1276,53 @@ mod tests {
     fn test_oci_cap_all_known_names_round_trip() {
         // Every OCI capability name used in Docker's default profile must map to a flag.
         let known = [
-            "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
-            "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP",
-            "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST",
-            "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK", "CAP_IPC_OWNER",
-            "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE",
-            "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE",
-            "CAP_SYS_RESOURCE", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD",
-            "CAP_LEASE", "CAP_AUDIT_WRITE", "CAP_AUDIT_CONTROL", "CAP_SETFCAP",
-            "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG", "CAP_WAKE_ALARM",
-            "CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF",
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_DAC_READ_SEARCH",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_KILL",
+            "CAP_SETGID",
+            "CAP_SETUID",
+            "CAP_SETPCAP",
+            "CAP_LINUX_IMMUTABLE",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_NET_BROADCAST",
+            "CAP_NET_ADMIN",
+            "CAP_NET_RAW",
+            "CAP_IPC_LOCK",
+            "CAP_IPC_OWNER",
+            "CAP_SYS_MODULE",
+            "CAP_SYS_RAWIO",
+            "CAP_SYS_CHROOT",
+            "CAP_SYS_PTRACE",
+            "CAP_SYS_PACCT",
+            "CAP_SYS_ADMIN",
+            "CAP_SYS_BOOT",
+            "CAP_SYS_NICE",
+            "CAP_SYS_RESOURCE",
+            "CAP_SYS_TIME",
+            "CAP_SYS_TTY_CONFIG",
+            "CAP_MKNOD",
+            "CAP_LEASE",
+            "CAP_AUDIT_WRITE",
+            "CAP_AUDIT_CONTROL",
+            "CAP_SETFCAP",
+            "CAP_MAC_OVERRIDE",
+            "CAP_MAC_ADMIN",
+            "CAP_SYSLOG",
+            "CAP_WAKE_ALARM",
+            "CAP_BLOCK_SUSPEND",
+            "CAP_AUDIT_READ",
+            "CAP_PERFMON",
+            "CAP_BPF",
             "CAP_CHECKPOINT_RESTORE",
         ];
         for name in &known {
             assert!(
                 oci_cap_to_flag(name).is_some(),
-                "oci_cap_to_flag returned None for {}", name
+                "oci_cap_to_flag returned None for {}",
+                name
             );
         }
     }
@@ -1277,11 +1341,11 @@ mod tests {
         // The signal parsing in cmd_kill must accept names from runtime-tools.
         let cases: &[(&str, i32)] = &[
             ("SIGTERM", libc::SIGTERM),
-            ("TERM",    libc::SIGTERM),
-            ("15",      libc::SIGTERM),
+            ("TERM", libc::SIGTERM),
+            ("15", libc::SIGTERM),
             ("SIGKILL", libc::SIGKILL),
-            ("9",       libc::SIGKILL),
-            ("SIGHUP",  libc::SIGHUP),
+            ("9", libc::SIGKILL),
+            ("SIGHUP", libc::SIGHUP),
             ("SIGWINCH", libc::SIGWINCH),
             ("SIGCHLD", libc::SIGCHLD),
             ("SIGCONT", libc::SIGCONT),
@@ -1293,43 +1357,47 @@ mod tests {
             ("SIGALRM", libc::SIGALRM),
             ("SIGSEGV", libc::SIGSEGV),
             ("SIGABRT", libc::SIGABRT),
-            ("SIGSYS",  libc::SIGSYS),
+            ("SIGSYS", libc::SIGSYS),
         ];
         for (name, expected) in cases {
             let got = match name.to_ascii_uppercase().trim_start_matches("SIG") {
-                "HUP"    | "1"  => libc::SIGHUP,
-                "INT"    | "2"  => libc::SIGINT,
-                "QUIT"   | "3"  => libc::SIGQUIT,
-                "ILL"    | "4"  => libc::SIGILL,
-                "TRAP"   | "5"  => libc::SIGTRAP,
-                "ABRT"   | "6"  => libc::SIGABRT,
-                "BUS"    | "7"  => libc::SIGBUS,
-                "FPE"    | "8"  => libc::SIGFPE,
-                "KILL"   | "9"  => libc::SIGKILL,
-                "USR1"   | "10" => libc::SIGUSR1,
-                "SEGV"   | "11" => libc::SIGSEGV,
-                "USR2"   | "12" => libc::SIGUSR2,
-                "PIPE"   | "13" => libc::SIGPIPE,
-                "ALRM"   | "14" => libc::SIGALRM,
-                "TERM"   | "15" => libc::SIGTERM,
-                "CHLD"   | "17" => libc::SIGCHLD,
-                "CONT"   | "18" => libc::SIGCONT,
-                "STOP"   | "19" => libc::SIGSTOP,
-                "TSTP"   | "20" => libc::SIGTSTP,
-                "TTIN"   | "21" => libc::SIGTTIN,
-                "TTOU"   | "22" => libc::SIGTTOU,
-                "URG"    | "23" => libc::SIGURG,
-                "XCPU"   | "24" => libc::SIGXCPU,
-                "XFSZ"   | "25" => libc::SIGXFSZ,
+                "HUP" | "1" => libc::SIGHUP,
+                "INT" | "2" => libc::SIGINT,
+                "QUIT" | "3" => libc::SIGQUIT,
+                "ILL" | "4" => libc::SIGILL,
+                "TRAP" | "5" => libc::SIGTRAP,
+                "ABRT" | "6" => libc::SIGABRT,
+                "BUS" | "7" => libc::SIGBUS,
+                "FPE" | "8" => libc::SIGFPE,
+                "KILL" | "9" => libc::SIGKILL,
+                "USR1" | "10" => libc::SIGUSR1,
+                "SEGV" | "11" => libc::SIGSEGV,
+                "USR2" | "12" => libc::SIGUSR2,
+                "PIPE" | "13" => libc::SIGPIPE,
+                "ALRM" | "14" => libc::SIGALRM,
+                "TERM" | "15" => libc::SIGTERM,
+                "CHLD" | "17" => libc::SIGCHLD,
+                "CONT" | "18" => libc::SIGCONT,
+                "STOP" | "19" => libc::SIGSTOP,
+                "TSTP" | "20" => libc::SIGTSTP,
+                "TTIN" | "21" => libc::SIGTTIN,
+                "TTOU" | "22" => libc::SIGTTOU,
+                "URG" | "23" => libc::SIGURG,
+                "XCPU" | "24" => libc::SIGXCPU,
+                "XFSZ" | "25" => libc::SIGXFSZ,
                 "VTALRM" | "26" => libc::SIGVTALRM,
-                "PROF"   | "27" => libc::SIGPROF,
-                "WINCH"  | "28" => libc::SIGWINCH,
+                "PROF" | "27" => libc::SIGPROF,
+                "WINCH" | "28" => libc::SIGWINCH,
                 "IO" | "POLL" | "29" => libc::SIGIO,
-                "PWR"    | "30" => libc::SIGPWR,
-                "SYS"    | "31" => libc::SIGSYS,
+                "PWR" | "30" => libc::SIGPWR,
+                "SYS" | "31" => libc::SIGSYS,
                 s => s.parse::<i32>().unwrap_or(-1),
             };
-            assert_eq!(got, *expected, "signal '{}' mapped to {} not {}", name, got, expected);
+            assert_eq!(
+                got, *expected,
+                "signal '{}' mapped to {} not {}",
+                name, got, expected
+            );
         }
     }
 }

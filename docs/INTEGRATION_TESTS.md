@@ -741,6 +741,27 @@ written with a positive integer that matches the PID reported in `state.json`. F
 
 ---
 
+### `test_oci_rootfs_propagation`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with `linux.rootfsPropagation: "private"` and runs `echo ok` inside it.
+Verifies the container starts and completes successfully. Failure indicates the `rootfsPropagation`
+field is not parsed, the mapping to `MS_PRIVATE|MS_REC` is wrong, or the `mount(2)` call fails,
+which would cause the container to refuse to start whenever a runtime-tools bundle specifies
+mount propagation.
+
+---
+
+### `test_oci_cgroups_path`
+**Requires:** root, rootfs
+
+Creates an OCI bundle with `linux.cgroupsPath` set to a unique name and runs `echo ok` inside it.
+Verifies the container starts and completes successfully. Failure indicates the `cgroupsPath` field
+is not wired from OCI config through to `CgroupConfig.path`, which would break runtimes that
+rely on predictable cgroup hierarchy placement (e.g. systemd-managed slices).
+
+---
+
 ## Rootless Mode Tests
 
 The following tests only execute when the test binary is run **without root** (no `sudo`).
