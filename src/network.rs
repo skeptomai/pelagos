@@ -697,7 +697,7 @@ pub fn setup_bridge_network(
 
     // 8. Optionally install port-forward (DNAT) rules.
     if !port_forwards.is_empty() {
-        enable_port_forwards(&net_def, container_ip, &port_forwards)?;
+        enable_port_forwards(ns_name, &net_def, container_ip, &port_forwards)?;
     }
 
     // 9. Start userspace TCP proxy for port forwards (handles localhost traffic
@@ -752,7 +752,7 @@ pub fn teardown_network(setup: &NetworkSetup) {
         }
     };
     if !setup.port_forwards.is_empty() {
-        disable_port_forwards(&net_def, setup.container_ip, &setup.port_forwards);
+        disable_port_forwards(&setup.ns_name, &net_def);
     }
     if setup.nat_enabled {
         disable_nat(&setup.ns_name, &net_def);
@@ -1080,23 +1080,52 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
 
 // ── N4: Port mapping (DNAT) ───────────────────────────────────────────────────
 
+/// A port-forward state file entry: `(ns_name, container_ip, host_port, container_port, proto)`.
+type PortForwardEntry = (String, Ipv4Addr, u16, u16, PortProto);
+
 /// Parse one line from the port-forwards state file.
 ///
 /// Format: `{ip}:{host_port}:{container_port}[:{proto}]`
 /// The proto field defaults to `tcp` when absent (backwards compat).
-fn parse_port_forward_line(line: &str) -> Option<(Ipv4Addr, u16, u16, PortProto)> {
-    let mut parts = line.splitn(4, ':');
-    let ip: Ipv4Addr = parts.next()?.parse().ok()?;
-    let host_port: u16 = parts.next()?.parse().ok()?;
-    let container_port: u16 = parts.next()?.parse().ok()?;
-    let proto = parts.next().map(PortProto::parse).unwrap_or(PortProto::Tcp);
-    Some((ip, host_port, container_port, proto))
+/// Parse one line from the port-forwards state file.
+///
+/// New format (since crash-safe eviction was added):
+///   `ns_name:ip:host_port:container_port:proto`   (5 colon-separated fields)
+///
+/// Old format (backward-compat; treated as if ns_name = ""):
+///   `ip:host_port:container_port[:proto]`          (3-4 fields; first parses as IPv4)
+///
+/// Returns `(ns_name, ip, host_port, container_port, proto)`.
+/// Old-format entries have an empty `ns_name` and are treated as stale by liveness checks.
+fn parse_port_forward_line(line: &str) -> Option<(String, Ipv4Addr, u16, u16, PortProto)> {
+    // Detect format: if the first colon-delimited token is a valid IPv4 address, it's
+    // the old format.  Otherwise the first token is a netns name.
+    let first_colon = line.find(':')?;
+    let first = &line[..first_colon];
+    if let Ok(ip) = first.parse::<Ipv4Addr>() {
+        // Old format: ip:hp:cp[:proto]
+        let mut parts = line.splitn(4, ':');
+        let _ip_str = parts.next()?; // already parsed above
+        let host_port: u16 = parts.next()?.parse().ok()?;
+        let container_port: u16 = parts.next()?.parse().ok()?;
+        let proto = parts.next().map(PortProto::parse).unwrap_or(PortProto::Tcp);
+        Some((String::new(), ip, host_port, container_port, proto))
+    } else {
+        // New format: ns_name:ip:hp:cp:proto
+        let mut parts = line.splitn(5, ':');
+        let ns_name = parts.next()?.to_string();
+        let ip: Ipv4Addr = parts.next()?.parse().ok()?;
+        let host_port: u16 = parts.next()?.parse().ok()?;
+        let container_port: u16 = parts.next()?.parse().ok()?;
+        let proto = parts.next().map(PortProto::parse).unwrap_or(PortProto::Tcp);
+        Some((ns_name, ip, host_port, container_port, proto))
+    }
 }
 
 /// Read all port-forward entries from an already-flocked file.
 fn read_port_forwards_locked(
     file: &mut std::fs::File,
-) -> io::Result<Vec<(Ipv4Addr, u16, u16, PortProto)>> {
+) -> io::Result<Vec<PortForwardEntry>> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
@@ -1108,14 +1137,24 @@ fn read_port_forwards_locked(
     Ok(entries)
 }
 
-/// Count active port-forward entries (reads without locking — for teardown checks only).
+/// Count *live* port-forward entries (reads without locking — for teardown checks only).
+///
+/// Entries from crashed containers are evicted the same way as the NAT refcount:
+/// by checking whether `/run/netns/{ns_name}` still exists.  Old-format entries
+/// (empty ns_name, written before crash-safe eviction was added) are treated as
+/// stale and not counted.
 fn read_port_forwards_count(network_name: &str) -> usize {
     let content =
         match std::fs::read_to_string(crate::paths::network_port_forwards_file(network_name)) {
             Ok(c) => c,
             Err(_) => return 0,
         };
-    content.lines().filter(|l| !l.trim().is_empty()).count()
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(parse_port_forward_line)
+        .filter(|(ns_name, _, _, _, _)| !ns_name.is_empty() && netns_exists(ns_name))
+        .count()
 }
 
 /// Count live NAT active-set entries without locking (for teardown checks only).
@@ -1172,7 +1211,11 @@ fn build_prerouting_script(
 /// Uses `flock(LOCK_EX)` on the per-network port-forwards file to serialise
 /// concurrent spawns. The network's nft table / prerouting chain are created
 /// idempotently, so this is safe whether NAT is enabled or not.
+///
+/// Stale entries (whose `/run/netns/{ns_name}` no longer exists) are evicted on
+/// each call — the same crash-safe strategy as `enable_nat`.
 fn enable_port_forwards(
+    ns_name: &str,
     net: &NetworkDef,
     container_ip: Ipv4Addr,
     forwards: &[(u16, u16, PortProto)],
@@ -1191,21 +1234,30 @@ fn enable_port_forwards(
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
-    let mut entries = read_port_forwards_locked(&mut file)?;
+    // Load existing entries and evict stale ones (crashed containers).
+    let existing = read_port_forwards_locked(&mut file)?;
+    let mut live: Vec<PortForwardEntry> = existing
+        .into_iter()
+        .filter(|(n, _, _, _, _)| !n.is_empty() && netns_exists(n))
+        .collect();
 
     for &(host_port, container_port, proto) in forwards {
-        entries.push((container_ip, host_port, container_port, proto));
+        live.push((ns_name.to_string(), container_ip, host_port, container_port, proto));
     }
 
-    // Overwrite file with all entries.
+    // Overwrite file with live + new entries in new format.
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-    for (ip, hp, cp, proto) in &entries {
-        writeln!(file, "{}:{}:{}:{}", ip, hp, cp, proto.as_str())?;
+    for (ns, ip, hp, cp, proto) in &live {
+        writeln!(file, "{}:{}:{}:{}:{}", ns, ip, hp, cp, proto.as_str())?;
     }
 
-    // Install nftables DNAT rules.
-    let script = build_prerouting_script(net, &entries);
+    // Install nftables DNAT rules (build_prerouting_script needs ip/hp/cp/proto only).
+    let nft_entries: Vec<(Ipv4Addr, u16, u16, PortProto)> = live
+        .iter()
+        .map(|(_, ip, hp, cp, proto)| (*ip, *hp, *cp, *proto))
+        .collect();
+    let script = build_prerouting_script(net, &nft_entries);
     run_nft(&script)?;
 
     // flock released when `file` is dropped.
@@ -1218,12 +1270,11 @@ fn enable_port_forwards(
 /// - If no entries remain BUT NAT is still active, flushes only the prerouting chain.
 /// - If entries remain, rebuilds the prerouting chain from the survivors.
 ///
+/// Also evicts stale entries from crashed containers (same crash-safe strategy as
+/// `disable_nat`).
+///
 /// Errors are non-fatal (logged via `log::warn!`).
-fn disable_port_forwards(
-    net: &NetworkDef,
-    container_ip: Ipv4Addr,
-    forwards: &[(u16, u16, PortProto)],
-) {
+fn disable_port_forwards(ns_name: &str, net: &NetworkDef) {
     let pf_path = crate::paths::network_port_forwards_file(&net.name);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -1250,28 +1301,34 @@ fn disable_port_forwards(
         }
     };
 
-    // Remove all entries belonging to this container (match on IP + host port).
-    let remaining: Vec<(Ipv4Addr, u16, u16, PortProto)> = entries
+    // Remove this container's entries (by ns_name) and evict other stale entries.
+    // ns_name-based matching is simpler and more correct than IP+port matching.
+    // Old-format entries (empty ns_name) are treated as stale and evicted.
+    let remaining: Vec<PortForwardEntry> = entries
         .into_iter()
-        .filter(|(ip, hp, _cp, _proto)| {
-            !(*ip == container_ip && forwards.iter().any(|&(h, _, _)| h == *hp))
-        })
+        .filter(|(n, _, _, _, _)| !n.is_empty() && n != ns_name && netns_exists(n))
         .collect();
 
-    // Write remaining entries back.
+    // Write remaining entries back in new format.
     if let Err(e) = file.seek(SeekFrom::Start(0)).and_then(|_| file.set_len(0)) {
         log::warn!("port forwards file truncate (non-fatal): {}", e);
         return;
     }
-    for (ip, hp, cp, proto) in &remaining {
-        let _ = writeln!(file, "{}:{}:{}:{}", ip, hp, cp, proto.as_str());
+    for (ns, ip, hp, cp, proto) in &remaining {
+        let _ = writeln!(file, "{}:{}:{}:{}:{}", ns, ip, hp, cp, proto.as_str());
     }
 
     // flock released; now update nftables.
     drop(file);
 
+    // Build nft entries without ns_name.
+    let nft_remaining: Vec<(Ipv4Addr, u16, u16, PortProto)> = remaining
+        .iter()
+        .map(|(_, ip, hp, cp, proto)| (*ip, *hp, *cp, *proto))
+        .collect();
+
     let table = net.nft_table_name();
-    if remaining.is_empty() {
+    if nft_remaining.is_empty() {
         // No more port forwards — check if NAT is also gone.
         if read_nat_refcount(&net.name) == 0 {
             // Nothing using the table — remove it entirely.
@@ -1286,7 +1343,7 @@ fn disable_port_forwards(
         }
     } else {
         // Rebuild prerouting chain from the surviving entries.
-        let script = build_prerouting_script(net, &remaining);
+        let script = build_prerouting_script(net, &nft_remaining);
         if let Err(e) = run_nft(&script) {
             log::warn!("nft rebuild prerouting (non-fatal): {}", e);
         }
@@ -1820,24 +1877,39 @@ mod tests {
 
     #[test]
     fn test_parse_port_forward_line_with_proto() {
+        // Old format (ip:hp:cp:proto) — ns_name is empty, fields shift right by 1.
         let r = parse_port_forward_line("192.168.1.5:8080:80:udp").unwrap();
-        assert_eq!(r.0, "192.168.1.5".parse::<std::net::Ipv4Addr>().unwrap());
-        assert_eq!(r.1, 8080);
-        assert_eq!(r.2, 80);
-        assert_eq!(r.3, PortProto::Udp);
+        assert_eq!(r.0, ""); // old format → empty ns_name
+        assert_eq!(r.1, "192.168.1.5".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(r.2, 8080);
+        assert_eq!(r.3, 80);
+        assert_eq!(r.4, PortProto::Udp);
     }
 
     #[test]
     fn test_parse_port_forward_line_backwards_compat() {
-        // Lines without a proto field must default to Tcp.
+        // Old format lines without a proto field must default to Tcp.
         let r = parse_port_forward_line("10.0.0.2:443:443").unwrap();
-        assert_eq!(r.3, PortProto::Tcp);
+        assert_eq!(r.0, ""); // old format → empty ns_name
+        assert_eq!(r.4, PortProto::Tcp);
     }
 
     #[test]
     fn test_parse_port_forward_line_both_proto() {
+        // Old format.
         let r = parse_port_forward_line("172.19.0.2:53:53:both").unwrap();
-        assert_eq!(r.3, PortProto::Both);
+        assert_eq!(r.4, PortProto::Both);
+    }
+
+    #[test]
+    fn test_parse_port_forward_line_new_format() {
+        // New format (ns_name:ip:hp:cp:proto).
+        let r = parse_port_forward_line("rem-1234-0:10.0.0.3:8080:80:tcp").unwrap();
+        assert_eq!(r.0, "rem-1234-0");
+        assert_eq!(r.1, "10.0.0.3".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(r.2, 8080);
+        assert_eq!(r.3, 80);
+        assert_eq!(r.4, PortProto::Tcp);
     }
 
     #[test]
