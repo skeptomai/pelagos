@@ -698,6 +698,20 @@ Creates a `config.json` with `linux.seccomp` using a default-allow policy that d
 Failure indicates that `linux.seccomp` parsing from OCI config, the `filter_from_oci()`
 function in `src/seccomp.rs`, or the `with_seccomp_program()` wiring is broken.
 
+### `test_oci_create_bundle_flag`
+**Requires:** root, rootfs
+
+Invokes `remora create --bundle <path> <id>` (named flag, OCI-standard form) and verifies the
+container reaches "created" state. Failure indicates the `--bundle` CLI flag is not accepted,
+which would prevent the `opencontainers/runtime-tools` conformance harness from invoking remora.
+
+### `test_oci_create_pid_file`
+**Requires:** root, rootfs
+
+Invokes `remora create --bundle <path> --pid-file <path> <id>` and verifies the pid file is
+written with a positive integer that matches the PID reported in `state.json`. Failure indicates
+`--pid-file` is not written or contains the wrong PID, which breaks containerd / CRI-O integration.
+
 ---
 
 ## Rootless Mode Tests

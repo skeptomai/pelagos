@@ -3626,6 +3626,103 @@ mod oci_lifecycle {
         let id = format!("test-oci-sec-{}", std::process::id());
         oci_run_to_completion(&id, bundle_dir.path(), 5);
     }
+
+    /// test_oci_create_bundle_flag
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Verifies that `remora create --bundle <path> <id>` works — i.e. the OCI-standard
+    /// named flag interface is accepted in addition to the legacy positional arg.
+    /// Failure indicates the CLI flag refactor broke the create subcommand invocation
+    /// expected by containerd, CRI-O, and the opencontainers/runtime-tools harness.
+    #[test]
+    fn test_oci_create_bundle_flag() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_create_bundle_flag: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_create_bundle_flag: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "2"]);
+        let id = format!("test-oci-bflag-{}", std::process::id());
+
+        // Use the --bundle flag (OCI standard) rather than positional arg.
+        let (_, stderr, ok) = run_remora(&[
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            &id,
+        ]);
+        assert!(ok, "remora create --bundle failed: {}", stderr);
+
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        assert!(stdout.contains("\"created\""), "expected created state, got: {}", stdout);
+
+        run_remora(&["kill", &id, "SIGKILL"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        run_remora(&["delete", &id]);
+    }
+
+    /// test_oci_create_pid_file
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Verifies that `remora create --pid-file <path>` writes the container's host PID
+    /// to the specified file. containerd and CRI-O rely on this to track container PIDs
+    /// without having to parse state.json.
+    /// Failure indicates the --pid-file implementation is missing or writes the wrong PID.
+    #[test]
+    fn test_oci_create_pid_file() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_create_pid_file: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_create_pid_file: alpine-rootfs not found");
+                return;
+            }
+        };
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "5"]);
+        let id = format!("test-oci-pidf-{}", std::process::id());
+        let pid_file = bundle_dir.path().join("container.pid");
+
+        let (_, stderr, ok) = run_remora(&[
+            "create",
+            "--bundle",
+            bundle_dir.path().to_str().unwrap(),
+            "--pid-file",
+            pid_file.to_str().unwrap(),
+            &id,
+        ]);
+        assert!(ok, "remora create --pid-file failed: {}", stderr);
+
+        // Verify pid file exists and contains a positive integer.
+        let pid_str = std::fs::read_to_string(&pid_file)
+            .expect("pid file not written");
+        let pid: i32 = pid_str.trim().parse().expect("pid file contains non-integer");
+        assert!(pid > 1, "pid file contains invalid PID {}", pid);
+
+        // Verify PID matches state.json.
+        let (state_out, _, _) = run_remora(&["state", &id]);
+        assert!(
+            state_out.contains(&pid.to_string()),
+            "pid file PID {} not found in state: {}",
+            pid, state_out
+        );
+
+        run_remora(&["kill", &id, "SIGKILL"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        run_remora(&["delete", &id]);
+    }
 }
 
 mod rootless {

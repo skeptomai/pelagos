@@ -153,11 +153,23 @@ pub(crate) enum CliCommand {
     /// Remove stale network namespaces, overlay dirs, and temp dirs from dead containers
     Cleanup,
 
-    // ── OCI lifecycle (unchanged) ─────────────────────────────────────────
+    // ── OCI lifecycle ─────────────────────────────────────────────────────
     /// OCI lifecycle: create a container (machine interface)
     Create {
+        /// Container ID
         id: String,
-        bundle: std::path::PathBuf,
+        /// Path to the OCI bundle directory (overrides positional bundle arg)
+        #[clap(long, short = 'b')]
+        bundle: Option<std::path::PathBuf>,
+        /// Path to a Unix socket for console I/O (when process.terminal is true)
+        #[clap(long)]
+        console_socket: Option<std::path::PathBuf>,
+        /// Write the container PID to this file after create
+        #[clap(long)]
+        pid_file: Option<std::path::PathBuf>,
+        /// Bundle path as a positional arg (deprecated; use --bundle)
+        #[clap(hide = true)]
+        bundle_positional: Option<std::path::PathBuf>,
     },
     /// OCI lifecycle: start a created container
     Start { id: String },
@@ -478,9 +490,22 @@ fn main() {
         CliCommand::Cleanup => cli::cleanup::cmd_cleanup(),
 
         // OCI lifecycle
-        CliCommand::Create { id, bundle } => {
-            remora::oci::cmd_create(&id, &bundle).map_err(|e| e.to_string().into())
-        }
+        CliCommand::Create {
+            id,
+            bundle,
+            bundle_positional,
+            console_socket,
+            pid_file,
+        } => match bundle.or(bundle_positional) {
+            None => Err("remora create: --bundle <path> is required".into()),
+            Some(bundle_path) => remora::oci::cmd_create(
+                &id,
+                &bundle_path,
+                console_socket.as_deref(),
+                pid_file.as_deref(),
+            )
+            .map_err(|e| e.to_string().into()),
+        },
         CliCommand::Start { id } => remora::oci::cmd_start(&id).map_err(|e| e.to_string().into()),
         CliCommand::State { id } => remora::oci::cmd_state(&id).map_err(|e| e.to_string().into()),
         CliCommand::Kill { id, signal } => {

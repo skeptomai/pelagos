@@ -820,13 +820,24 @@ fn find_child_of(parent_pid: i32) -> Option<i32> {
     None
 }
 
-/// `remora create <id> <bundle>` — set up container, suspend before exec.
+/// `remora create <id> --bundle <bundle>` — set up container, suspend before exec.
 ///
 /// Forks a shim that calls `command.spawn()`. The container's pre_exec writes
 /// its PID to a ready pipe (signalling "created"), then blocks on accept().
 /// The parent reads the PID, writes state.json, and exits. The shim is orphaned
 /// and waits for the container; `remora start` later unblocks it.
-pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
+///
+/// `console_socket` — if provided, the path to a Unix socket to which the
+/// PTY master fd will be sent when `process.terminal` is true (not yet implemented).
+///
+/// `pid_file` — if provided, the container's host PID is written to this file
+/// after the container is created, for use by higher-level runtimes (containerd, CRI-O).
+pub fn cmd_create(
+    id: &str,
+    bundle_path: &Path,
+    _console_socket: Option<&Path>,
+    pid_file: Option<&Path>,
+) -> io::Result<()> {
     let dir = state_dir(id);
     if dir.exists() {
         return Err(io::Error::new(
@@ -959,6 +970,11 @@ pub fn cmd_create(id: &str, bundle_path: &Path) -> io::Result<()> {
                 bridge_ip: None,
             };
             write_state(id, &state)?;
+
+            // Write PID to --pid-file if requested (used by containerd / CRI-O).
+            if let Some(pf) = pid_file {
+                fs::write(pf, format!("{}\n", container_pid))?;
+            }
 
             // Run prestart hooks (host namespace, after container is "created").
             if let Some(ref hooks) = config.hooks {

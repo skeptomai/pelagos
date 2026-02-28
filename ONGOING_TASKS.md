@@ -147,3 +147,24 @@ GitHub issue: #4 (closed by this work).
 ## All issues resolved
 
 All four open issues are now closed.
+
+---
+
+## Runtime Strategy Analysis (2026-02-28)
+
+A strategic analysis of the container runtime landscape, remora's position, and prioritized
+technical opportunities has been written to:
+
+**`docs/RUNTIME_STRATEGY_2026.md`**
+
+Key findings:
+
+- Remora is structurally immune to the November 2025 runc TOCTOU CVE cluster
+  (CVE-2025-31133, CVE-2025-52565, CVE-2025-52881) — worth documenting loudly.
+- Top gaps vs production runtimes: AppArmor/SELinux support; OCI lifecycle completeness.
+- Top differentiation opportunities: Landlock LSM (first Rust runtime), crates.io
+  publication for AI agent embedding, `SECCOMP_RET_USER_NOTIF` supervisor mode.
+- Performance target: ≤ 180 ms median cold-start (between crun ~153 ms and youki ~198 ms).
+
+See the doc for the full runtime comparison matrix, CVE analysis, Wasm/WASI trends,
+embedded/IoT landscape, and the ranked opportunity list.
