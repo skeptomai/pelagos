@@ -289,11 +289,12 @@ needed. The probe not being in the container's PID namespace does not affect cor
 | `SIGKILL` | P | Same effect |
 | `SIGTERM` | C (PID 1) | C handles or ignores per its signal handlers |
 
-If the watcher itself dies unexpectedly (e.g. OOM kill), P is re-parented to host init.
-P's `PR_SET_PDEATHSIG` on C was set relative to P's parent *at the time of the
-`prctl` call* — so P dying does not trigger pdeathsig for C in this scenario. This is a
-known limitation; a subreaper (`PR_SET_CHILD_SUBREAPER`) set on the watcher would
-address it. This is documented as future work.
+The watcher calls `prctl(PR_SET_CHILD_SUBREAPER, 1)` immediately after `setsid()`.
+This makes the watcher the reaper for all orphaned descendants (same role as
+`systemd` / `tini`).  If the watcher is killed (e.g. OOM), P is re-parented
+**to the watcher** rather than to host PID 1.  When the watcher then exits,
+P's `PR_SET_PDEATHSIG` fires in one hop and C receives `SIGKILL` — no fragile
+two-hop chain.
 
 ---
 
@@ -305,4 +306,4 @@ address it. This is documented as future work.
 | Probe timeout does not SIGKILL the probe child | Hung probes consume a thread until OS reaps them | Explicit SIGKILL on timeout |
 | Thread-per-fd log relay | O(2) threads per container for I/O | epoll-based relay (future) |
 | UDP reply threads are never explicitly reaped | Thread joins on stop flag only; idle sessions may linger until stop | Migrate UDP to async (tokio already used for TCP) |
-| Watcher death does not propagate to PID 1 | Container orphaned if watcher dies | `PR_SET_CHILD_SUBREAPER` on watcher |
+| ~~Watcher death does not propagate to PID 1~~ | ~~Container orphaned if watcher dies~~ | **Fixed** — `PR_SET_CHILD_SUBREAPER` on watcher (issue #5) |

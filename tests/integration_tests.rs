@@ -5087,6 +5087,136 @@ mod exec {
     }
 }
 
+mod watcher {
+    use super::*;
+
+    /// Verify that killing the watcher process propagates SIGKILL to the
+    /// container process (PID 1 inside the namespace / the intermediate P when
+    /// a PID namespace is in use).
+    ///
+    /// When `PR_SET_CHILD_SUBREAPER` is set on the watcher, orphaned
+    /// descendants are re-parented to the watcher rather than to host init.
+    /// This means C's `PR_SET_PDEATHSIG` fires in one hop when the watcher
+    /// dies, instead of relying on a fragile two-hop chain through P.
+    ///
+    /// Without the subreaper fix, killing the watcher would leave the
+    /// container process running (orphaned, adopted by host init).
+    #[test]
+    #[serial]
+    fn test_watcher_kill_propagates_to_container() {
+        if !is_root() {
+            eprintln!("Skipping test_watcher_kill_propagates_to_container (requires root)");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(r) => r,
+            None => {
+                eprintln!("Skipping test_watcher_kill_propagates_to_container (no rootfs)");
+                return;
+            }
+        };
+
+        let bin = env!("CARGO_BIN_EXE_remora");
+        let name = "remora-watcher-subreaper-test";
+
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        // Start a long-running container in detached mode.
+        let run_status = std::process::Command::new(bin)
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--rootfs",
+                rootfs.to_str().unwrap(),
+                "/bin/sleep",
+                "300",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("remora run -d");
+        assert!(run_status.success(), "remora run -d failed");
+
+        // Poll until the watcher writes state.json with a valid PID.
+        let state_path = format!("/run/remora/containers/{}/state.json", name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut container_pid: i32 = 0;
+        while std::time::Instant::now() < deadline {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    let pid = v["pid"].as_i64().unwrap_or(0) as i32;
+                    if pid > 0 {
+                        container_pid = pid;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(container_pid > 0, "container did not start within 10s");
+
+        // The PID stored in state.json is the intermediate process P (direct
+        // child of the watcher).  The watcher is P's parent.
+        let watcher_pid = {
+            let status_path = format!("/proc/{}/status", container_pid);
+            let status_data = std::fs::read_to_string(&status_path).expect("read /proc/<P>/status");
+            let ppid_line = status_data
+                .lines()
+                .find(|l| l.starts_with("PPid:"))
+                .expect("PPid line in /proc status");
+            ppid_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<i32>()
+                .unwrap()
+        };
+        assert!(watcher_pid > 1, "watcher PID should be > 1");
+
+        // Verify the container process is alive before we kill the watcher.
+        let alive_before = unsafe { libc::kill(container_pid, 0) == 0 };
+        assert!(
+            alive_before,
+            "container process should be alive before test"
+        );
+
+        // Kill the watcher with SIGKILL (simulates OOM kill or crash).
+        let kill_ret = unsafe { libc::kill(watcher_pid, libc::SIGKILL) };
+        assert_eq!(kill_ret, 0, "failed to kill watcher");
+
+        // Poll for up to 3 seconds: the container process should die because
+        // it is re-parented to the watcher (subreaper), and when the watcher
+        // exits, pdeathsig fires on P, which propagates to C.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut container_died = false;
+        while std::time::Instant::now() < deadline {
+            // kill(pid, 0) returns ESRCH when the process no longer exists.
+            let ret = unsafe { libc::kill(container_pid, 0) };
+            if ret != 0 {
+                container_died = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Cleanup regardless of outcome.
+        let _ = std::process::Command::new(bin)
+            .args(["rm", "-f", name])
+            .output();
+
+        assert!(
+            container_died,
+            "container process (pid {}) did not die within 3s after watcher (pid {}) was killed; \
+             PR_SET_CHILD_SUBREAPER may not be in effect",
+            container_pid, watcher_pid
+        );
+    }
+}
+
 mod dev {
     use super::*;
 

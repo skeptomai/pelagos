@@ -746,6 +746,13 @@ fn run_detached(
             // Detach from parent's session so we're adopted by init when parent exits.
             unsafe { libc::setsid() };
 
+            // Become a subreaper: any orphaned descendant is re-parented to us
+            // instead of host init.  This ensures that if the watcher is killed
+            // (e.g. OOM), the container process (C) is re-parented to us rather
+            // than to PID 1, so our eventual exit causes C's PR_SET_PDEATHSIG to
+            // fire directly — one hop, no fragile two-hop chain.
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+
             // Set up piped stdio so we can relay to log files.
             cmd = cmd
                 .stdin(Stdio::Null)

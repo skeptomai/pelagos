@@ -971,6 +971,28 @@ PIDs instead of container-scoped PIDs.
 
 ---
 
+## Watcher Process Tests (`watcher` module)
+
+### `test_watcher_kill_propagates_to_container`
+**Requires:** root, rootfs
+
+Starts a detached container with `remora run -d --rootfs alpine /bin/sleep 300`.
+Reads `state.pid` (the intermediate process P), then reads P's `PPid` from
+`/proc/<P>/status` to find the watcher PID.  Sends `SIGKILL` to the watcher
+and polls for up to 3 seconds to verify the container process P also dies.
+
+This tests that `PR_SET_CHILD_SUBREAPER` is effective: when the watcher is
+killed, P (and therefore C inside the PID namespace) is re-parented to the
+watcher rather than to host init, so the watcher's death triggers P's
+`PR_SET_PDEATHSIG` in one hop.
+
+Failure means the container process survives after the watcher is killed —
+either the subreaper prctl was not called, or the kernel did not honour it.
+A failing test indicates containers would become orphaned on an unexpected
+watcher crash (OOM kill, etc.).
+
+---
+
 ## Minimal /dev Tests (`dev` module)
 
 ### `test_dev_minimal_devices`

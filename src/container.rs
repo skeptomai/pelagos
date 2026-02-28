@@ -2235,8 +2235,15 @@ impl Command {
                         return Err(io::Error::last_os_error());
                     }
                     if inner_pid > 0 {
-                        // Intermediate: wait for the real container (PID 1) and exit
-                        // with its status.  Never returns from pre_exec.
+                        // Intermediate (P): wait for the real container (PID 1) and
+                        // exit with its status.  Never returns from pre_exec.
+                        //
+                        // Die if our parent (the watcher) is killed unexpectedly.
+                        // Without this, killing the watcher would orphan P → C would
+                        // survive indefinitely.  The watcher sets PR_SET_CHILD_SUBREAPER
+                        // so P is re-parented to the watcher (not init) if watcher dies,
+                        // ensuring this pdeathsig fires in one hop.
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                         //
                         // Close all fds > 2 first.  std::process::Command uses an
                         // internal CLOEXEC pipe to report pre_exec/exec errors back
@@ -2287,6 +2294,8 @@ impl Command {
                         return Err(io::Error::last_os_error());
                     }
                     if inner_pid > 0 {
+                        // Intermediate (P): die if watcher is killed.
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                         for fd in 3..1024 {
                             libc::close(fd);
                         }
@@ -3824,6 +3833,8 @@ impl Command {
                         return Err(io::Error::last_os_error());
                     }
                     if inner_pid > 0 {
+                        // Intermediate (P): die if watcher is killed.
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                         // Close all fds > 2 — see spawn() Step 1.65 for rationale.
                         for fd in 3..1024 {
                             libc::close(fd);
@@ -3863,6 +3874,8 @@ impl Command {
                         return Err(io::Error::last_os_error());
                     }
                     if inner_pid > 0 {
+                        // Intermediate (P): die if watcher is killed.
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                         for fd in 3..1024 {
                             libc::close(fd);
                         }

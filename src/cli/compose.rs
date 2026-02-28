@@ -218,6 +218,9 @@ fn cmd_compose_up(
             0 => {
                 // Child: detach from parent's session.
                 unsafe { libc::setsid() };
+                // Become a subreaper so orphaned container descendants are
+                // re-parented to us, not host init.
+                unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
                 if let Err(e) = run_supervisor(
                     &project,
                     file,
@@ -345,6 +348,9 @@ fn cmd_compose_up_reml(
             -1 => Err(std::io::Error::last_os_error().into()),
             0 => {
                 unsafe { libc::setsid() };
+                // Become a subreaper so orphaned container descendants are
+                // re-parented to us, not host init.
+                unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
                 if let Err(e) = run_compose_with_hooks(
                     &project,
                     file,
