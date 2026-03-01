@@ -688,6 +688,9 @@ pub struct Command {
     // OCI sync: (ready_write_fd, listen_fd). Used by cmd_create to block the container
     // in pre_exec until "remora start" connects to exec.sock.
     oci_sync: Option<(i32, i32)>,
+    // PTY slave fd for OCI terminal mode (process.terminal = true).
+    // When set, pre_exec calls setsid()+dup2(slave,0/1/2)+TIOCSCTTY before exec.
+    pty_slave: Option<i32>,
     // Container working directory (set after chroot; relative to new root).
     container_cwd: Option<PathBuf>,
     // Sysctl key=value pairs to write to /proc/sys/ in pre_exec.
@@ -743,6 +746,7 @@ impl Command {
             dns_servers: Vec::new(),
             overlay: None,
             oci_sync: None,
+            pty_slave: None,
             container_cwd: None,
             sysctl: Vec::new(),
             devices: Vec::new(),
@@ -1418,6 +1422,20 @@ impl Command {
         self
     }
 
+    /// Wire a PTY slave fd as the container's stdin/stdout/stderr.
+    ///
+    /// Used by `remora create` when `process.terminal: true`. The pre_exec
+    /// closure calls `setsid()`, `dup2(slave, 0/1/2)`, and `TIOCSCTTY` so the
+    /// container process gets a controlling terminal backed by the PTY.
+    ///
+    /// The slave fd must NOT be `O_CLOEXEC` — it must survive the fork chain
+    /// to reach pre_exec.  The caller closes the slave in the parent after fork
+    /// and sends the master fd to `--console-socket` via `SCM_RIGHTS`.
+    pub fn with_pty_slave(mut self, slave_fd: i32) -> Self {
+        self.pty_slave = Some(slave_fd);
+        self
+    }
+
     /// Apply Docker's default seccomp profile (recommended).
     ///
     /// This blocks ~44 dangerous syscalls commonly used in container escapes
@@ -2044,6 +2062,7 @@ impl Command {
 
         // Collect OCI sync fds (captured by value — i32 is Copy).
         let oci_sync = self.oci_sync;
+        let pty_slave = self.pty_slave;
         let container_cwd = self.container_cwd.clone();
 
         // DNS: auto-inject bridge gateway IP(s) as primary nameservers for the
@@ -3221,6 +3240,20 @@ impl Command {
                     }
                 }
 
+                // Step 6.6: PTY slave setup for OCI terminal mode.
+                // When the caller allocated a PTY (process.terminal = true), wire the
+                // slave fd as stdin/stdout/stderr and make it the controlling terminal.
+                if let Some(slave_fd) = pty_slave {
+                    libc::setsid();
+                    libc::dup2(slave_fd, 0);
+                    libc::dup2(slave_fd, 1);
+                    libc::dup2(slave_fd, 2);
+                    libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32);
+                    if slave_fd > 2 {
+                        libc::close(slave_fd);
+                    }
+                }
+
                 // Step 7: Apply seccomp filter if configured.
                 // CRITICAL: This MUST be before the OCI sync! Once seccomp is applied, many syscalls
                 // are blocked. All setup must be complete before signalling "created".
@@ -3706,6 +3739,7 @@ impl Command {
 
         // Collect OCI sync fds.
         let oci_sync = self.oci_sync;
+        let pty_slave = self.pty_slave;
         let container_cwd = self.container_cwd.clone();
 
         // DNS: auto-inject bridge gateway IP(s) as primary nameservers for the
@@ -4733,6 +4767,18 @@ impl Command {
                     let result = libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                     if result != 0 {
                         return Err(io::Error::last_os_error());
+                    }
+                }
+
+                // PTY slave setup for OCI terminal mode (same logic as spawn()).
+                if let Some(slave_fd) = pty_slave {
+                    libc::setsid();
+                    libc::dup2(slave_fd, 0);
+                    libc::dup2(slave_fd, 1);
+                    libc::dup2(slave_fd, 2);
+                    libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32);
+                    if slave_fd > 2 {
+                        libc::close(slave_fd);
                     }
                 }
 

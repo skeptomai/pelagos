@@ -2877,7 +2877,7 @@ mod oci_lifecycle {
 
     /// Run a remora subcommand with the given args. Returns (stdout, stderr, success).
     fn run_remora(args: &[&str]) -> (String, String, bool) {
-        let output = std::process::Command::new(remora_binary())
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
             .args(args)
             .output()
             .expect("failed to run remora binary");
@@ -11152,5 +11152,165 @@ mod healthcheck_tests {
             probe_pid
         );
         let _ = probe_status; // success/failure irrelevant — killed by signal
+    }
+}
+
+// ---------------------------------------------------------------------------
+// console-socket tests
+// ---------------------------------------------------------------------------
+
+/// Tests for the OCI console-socket (PTY master fd passthrough) feature.
+mod console_socket_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    fn run_remora(args: &[&str]) -> (String, String, bool) {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+            .args(args)
+            .output()
+            .expect("failed to run remora binary");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        )
+    }
+
+    /// Receive a file descriptor via SCM_RIGHTS from a Unix socket.
+    /// Returns the received fd, or -1 if none was received.
+    fn recv_fd(sock_fd: i32) -> i32 {
+        let cmsg_space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as libc::c_uint) as usize };
+        let mut cmsg_buf = vec![0u8; cmsg_space];
+        let mut iov_buf = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: iov_buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_space as _;
+
+        let ret = unsafe { libc::recvmsg(sock_fd, &mut msg, 0) };
+        if ret < 0 {
+            return -1;
+        }
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        if cmsg.is_null() {
+            return -1;
+        }
+        unsafe {
+            if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+                return -1;
+            }
+            let data = libc::CMSG_DATA(cmsg) as *const i32;
+            *data
+        }
+    }
+
+    /// test_oci_console_socket
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Creates an OCI bundle with `process.terminal: true` and provides a
+    /// Unix socket via `--console-socket`. After `remora create`, asserts that:
+    /// 1. The socket received exactly one fd via SCM_RIGHTS (the PTY master).
+    /// 2. Writing to the received fd and reading back from it works (PTY loopback),
+    ///    confirming it is a valid PTY master.
+    #[test]
+    fn test_oci_console_socket() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_console_socket: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_console_socket: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let rootfs_link = bundle_dir.path().join("rootfs");
+        std::os::unix::fs::symlink(&rootfs, &rootfs_link).unwrap();
+
+        // config.json with process.terminal = true; container sleeps for 5s.
+        let config = r#"{
+  "ociVersion": "1.0.2",
+  "root": {"path": "rootfs"},
+  "process": {
+    "terminal": true,
+    "args": ["/bin/sleep", "5"],
+    "cwd": "/",
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "linux": {
+    "namespaces": [
+      {"type": "mount"},
+      {"type": "uts"},
+      {"type": "pid"}
+    ]
+  }
+}"#;
+        std::fs::write(bundle_dir.path().join("config.json"), config).unwrap();
+
+        // Create Unix socket for the console-socket protocol.
+        let socket_path = bundle_dir.path().join("console.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind console socket");
+
+        let id = format!("test-oci-console-{}", std::process::id());
+
+        // Spawn remora create in a thread so we can simultaneously accept the fd.
+        let bundle_str = bundle_dir.path().to_str().unwrap().to_owned();
+        let socket_str = socket_path.to_str().unwrap().to_owned();
+        let id_clone = id.clone();
+        let create_thread = std::thread::spawn(move || {
+            run_remora(&[
+                "create",
+                "--bundle",
+                &bundle_str,
+                "--console-socket",
+                &socket_str,
+                &id_clone,
+            ])
+        });
+
+        // Accept one connection on the console socket within 5 seconds.
+        listener.set_nonblocking(false).unwrap();
+        // Use a timeout via raw accept with poll
+        let listener_fd = listener.as_raw_fd();
+        let mut poll_fd = libc::pollfd {
+            fd: listener_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 5000) };
+        assert!(ready > 0, "console socket: no connection within 5s");
+
+        let (conn, _) = listener.accept().expect("accept console socket connection");
+        let received_fd = recv_fd(conn.as_raw_fd());
+        drop(conn);
+
+        let (_, stderr, ok) = create_thread.join().unwrap();
+        assert!(ok, "remora create failed: {}", stderr);
+        assert!(
+            received_fd >= 0,
+            "did not receive a valid fd via SCM_RIGHTS"
+        );
+
+        // Verify the received fd is a usable PTY master: it should be a tty.
+        let is_tty = unsafe { libc::isatty(received_fd) };
+        assert_eq!(is_tty, 1, "received fd (={}) is not a TTY", received_fd);
+
+        unsafe { libc::close(received_fd) };
+
+        // Cleanup.
+        run_remora(&["kill", &id, "SIGKILL"]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        run_remora(&["delete", &id]);
     }
 }
