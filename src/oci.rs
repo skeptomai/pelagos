@@ -1157,6 +1157,55 @@ fn find_child_of(parent_pid: i32) -> Option<i32> {
     None
 }
 
+/// Send a file descriptor to a caller-created Unix socket via `SCM_RIGHTS`.
+///
+/// Used by `cmd_create` to hand the PTY master fd to the caller (e.g. containerd)
+/// when `process.terminal: true`.  The caller must already be listening on the
+/// socket; this function connects to it, sends a 1-byte dummy payload with the
+/// fd as ancillary data, then closes the connection.
+fn send_fd_to_console_socket(socket_path: &Path, fd: i32) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(socket_path)?;
+    let sock_fd = stream.as_raw_fd();
+
+    // Build the SCM_RIGHTS control message.
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as libc::c_uint) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut iov_buf = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: iov_buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space as _;
+
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
+    }
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
+        let data_ptr = libc::CMSG_DATA(cmsg) as *mut i32;
+        *data_ptr = fd;
+    }
+
+    let ret = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `remora create <id> --bundle <bundle>` — set up container, suspend before exec.
 ///
 /// Forks a shim that calls `command.spawn()`. The container's pre_exec writes
@@ -1164,15 +1213,16 @@ fn find_child_of(parent_pid: i32) -> Option<i32> {
 /// The parent reads the PID, writes state.json, and exits. The shim is orphaned
 /// and waits for the container; `remora start` later unblocks it.
 ///
-/// `console_socket` — if provided, the path to a Unix socket to which the
-/// PTY master fd will be sent when `process.terminal` is true (not yet implemented).
+/// `console_socket` — when `process.terminal: true` the runtime allocates a PTY,
+/// wires the slave to the container's stdio, and sends the master fd to this
+/// Unix socket via `sendmsg(SCM_RIGHTS)`.
 ///
 /// `pid_file` — if provided, the container's host PID is written to this file
 /// after the container is created, for use by higher-level runtimes (containerd, CRI-O).
 pub fn cmd_create(
     id: &str,
     bundle_path: &Path,
-    _console_socket: Option<&Path>,
+    console_socket: Option<&Path>,
     pid_file: Option<&Path>,
 ) -> io::Result<()> {
     let dir = state_dir(id);
@@ -1204,14 +1254,47 @@ pub fn cmd_create(
         libc::close(ready_w);
     })?;
 
-    // Build the container command with OCI sync hooks.
+    // Allocate PTY when the bundle requests a terminal (process.terminal = true)
+    // AND a console socket path was provided by the caller.
+    // master_raw: held by the parent until it is sent to console_socket.
+    // slave_raw:  inherited by the shim → container pre_exec wires it to 0/1/2.
+    let wants_terminal = config.process.terminal;
+    let pty_fds: Option<(i32, i32)> = if wants_terminal && console_socket.is_some() {
+        let pty =
+            nix::pty::openpty(None, None).map_err(|e| io::Error::other(format!("openpty: {e}")))?;
+        use std::os::fd::IntoRawFd;
+        let master_raw = pty.master.into_raw_fd();
+        let slave_raw = pty.slave.into_raw_fd();
+        // Master: CLOEXEC so the container's exec doesn't inherit it.
+        unsafe { libc::fcntl(master_raw, libc::F_SETFD, libc::FD_CLOEXEC) };
+        // Slave: explicitly NOT CLOEXEC — must survive the fork chain into pre_exec.
+        unsafe {
+            let flags = libc::fcntl(slave_raw, libc::F_GETFD);
+            libc::fcntl(slave_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
+        Some((master_raw, slave_raw))
+    } else {
+        None
+    };
+
+    // Build the container command with OCI sync hooks (and optional PTY slave).
     let command = match build_command(&config, &bundle) {
-        Ok(c) => c.with_oci_sync(ready_w, listen_fd),
+        Ok(mut c) => {
+            c = c.with_oci_sync(ready_w, listen_fd);
+            if let Some((_, slave_raw)) = pty_fds {
+                c = c.with_pty_slave(slave_raw);
+            }
+            c
+        }
         Err(e) => {
             unsafe {
                 libc::close(ready_r);
                 libc::close(ready_w);
                 libc::close(listen_fd);
+                if let Some((m, s)) = pty_fds {
+                    libc::close(m);
+                    libc::close(s);
+                }
             }
             let _ = fs::remove_dir_all(&dir);
             return Err(e);
@@ -1227,16 +1310,21 @@ pub fn cmd_create(
                 libc::close(ready_r);
                 libc::close(ready_w);
                 libc::close(listen_fd);
+                if let Some((m, s)) = pty_fds {
+                    libc::close(m);
+                    libc::close(s);
+                }
             }
             let _ = fs::remove_dir_all(&dir);
             Err(io::Error::last_os_error())
         }
         0 => {
-            // SHIM: detach from the parent's stdio so that the parent's
-            // `output()` / pipe can receive EOF as soon as the parent exits.
-            // Without this, the shim (and any grandchild) hold the write
-            // ends of the test's stdout/stderr pipes open indefinitely,
-            // causing `run_remora` to hang waiting for EOF.
+            // SHIM: close the master fd (only the parent sends it to console_socket).
+            if let Some((master_raw, _)) = pty_fds {
+                unsafe { libc::close(master_raw) };
+            }
+            // Detach from the parent's stdio so that the parent's `output()` / pipe
+            // can receive EOF as soon as the parent exits.
             unsafe {
                 libc::close(ready_r);
                 let dev_null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR, 0);
@@ -1262,8 +1350,12 @@ pub fn cmd_create(
         }
         shim_pid => {
             // PARENT: close the write ends (child has them).
+            // Also close the slave fd — only the container's pre_exec should use it.
             unsafe { libc::close(ready_w) };
             unsafe { libc::close(listen_fd) };
+            if let Some((_, slave_raw)) = pty_fds {
+                unsafe { libc::close(slave_raw) };
+            }
 
             // Wait for the ready signal (4 bytes) written by the container's pre_exec.
             // The bytes carry a PID, but after the PID-namespace double-fork the
@@ -1312,6 +1404,18 @@ pub fn cmd_create(
             // Write PID to --pid-file if requested (used by containerd / CRI-O).
             if let Some(pf) = pid_file {
                 fs::write(pf, format!("{}\n", container_pid))?;
+            }
+
+            // Send PTY master fd to caller via console_socket (SCM_RIGHTS).
+            // The container's stdio is already wired to the slave in pre_exec;
+            // now give the caller the master so it can relay I/O.
+            if let Some((master_raw, _)) = pty_fds {
+                if let Some(sock_path) = console_socket {
+                    if let Err(e) = send_fd_to_console_socket(sock_path, master_raw) {
+                        log::warn!("console-socket: failed to send PTY master fd: {}", e);
+                    }
+                }
+                unsafe { libc::close(master_raw) };
             }
 
             // Run lifecycle hooks after container is in "created" state.

@@ -2158,3 +2158,26 @@ state file.
 Failure indicates the `HealthStatus::Unhealthy` serde variant is broken
 (wrong serialized string or missing enum arm).
 
+
+---
+
+## Console-socket tests (`console_socket_tests`)
+
+### `console_socket_tests::test_oci_console_socket`
+**Requires:** root + rootfs
+
+Creates an OCI bundle with `process.terminal: true` and provides a Unix socket
+path via `--console-socket`. The test binds a `UnixListener` on that path before
+running `remora create`, then accepts one connection and calls `recvmsg` to
+receive the fd sent via `SCM_RIGHTS` ancillary data.
+
+Asserts:
+1. `remora create` exits 0.
+2. A connection is accepted within 5 seconds (the runtime connected and sent the fd).
+3. The received fd is `>= 0` (a valid file descriptor was transmitted).
+4. `isatty(received_fd) == 1` — the fd is a TTY, confirming it is the PTY master.
+
+Failure modes:
+- If the runtime ignores `--console-socket`, no connection arrives → poll timeout.
+- If no fd is sent via `SCM_RIGHTS`, `received_fd == -1`.
+- If the wrong fd is sent (not a PTY), `isatty` returns 0.
