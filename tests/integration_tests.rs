@@ -3265,6 +3265,172 @@ mod oci_lifecycle {
         );
     }
 
+    /// test_oci_state_dir_stable_until_delete
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts a short-lived container (`true`), waits for it to exit, then asserts
+    /// that the state directory and `remora state` output remain accessible — the
+    /// runtime must not clean up state automatically on container exit.
+    ///
+    /// This verifies the OCI spec requirement that `stopped` is a stable, inspectable
+    /// state that persists until `remora delete` is explicitly called. An orchestrator
+    /// (containerd, CRI-O) queries `remora state` after observing the process exit to
+    /// collect status, before calling `remora delete`.
+    ///
+    /// Failure indicates the runtime is removing state on container exit rather than
+    /// waiting for an explicit delete command.
+    #[test]
+    fn test_oci_state_dir_stable_until_delete() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_state_dir_stable_until_delete: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "Skipping test_oci_state_dir_stable_until_delete: alpine-rootfs not found"
+                );
+                return;
+            }
+        };
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
+        let id = format!("test-oci-stable-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Wait for `true` to exit.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // State directory must still exist — the runtime owns it until delete.
+        let state_dir = remora::oci::state_dir(&id);
+        assert!(
+            state_dir.exists(),
+            "state dir must persist until remora delete, not be cleaned up on container exit"
+        );
+
+        // `remora state` must succeed and report stopped.
+        let (stdout, stderr, ok) = run_remora(&["state", &id]);
+        assert!(ok, "remora state on stopped container failed: {}", stderr);
+        assert!(
+            stdout.contains("\"stopped\""),
+            "expected state=stopped, got: {}",
+            stdout
+        );
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+        assert!(!state_dir.exists(), "state dir should be gone after delete");
+    }
+
+    /// test_oci_kill_short_lived
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts a short-lived container (`true`) and immediately calls `remora kill`
+    /// without first calling `remora state`. Asserts kill returns success.
+    ///
+    /// This is the pidfile.t scenario: the container exits quickly but kill must still
+    /// succeed because state.json says "running" (cmd_state not yet called). With
+    /// zombie-keeper the container is a zombie and kill(zombie, SIGKILL) returns 0.
+    ///
+    /// Failure indicates cmd_kill is checking process liveness instead of state.json
+    /// status (issue #37 / #41).
+    #[test]
+    fn test_oci_kill_short_lived() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_kill_short_lived: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_kill_short_lived: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
+        let id = format!("test-oci-kill-sl-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Brief pause for `true` to exit. Do NOT call `remora state` first.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let (_, stderr, ok) = run_remora(&["kill", &id, "SIGKILL"]);
+        assert!(ok, "remora kill on short-lived container failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+    }
+
+    /// test_oci_kill_stopped_fails
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Starts a short-lived container (`true`), calls `remora state` to persist
+    /// "stopped" to state.json, then asserts that `remora kill` returns an error.
+    ///
+    /// This is the kill.t test 4 scenario: once cmd_state writes "stopped" to disk,
+    /// subsequent kill attempts must fail per the OCI spec.
+    ///
+    /// Failure indicates cmd_state is not persisting "stopped" to state.json (issue #40),
+    /// or cmd_kill is not reading that status (issue #41).
+    #[test]
+    fn test_oci_kill_stopped_fails() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_kill_stopped_fails: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_kill_stopped_fails: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
+        let id = format!("test-oci-kill-sf-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Call state — detects zombie, writes "stopped" to state.json.
+        let (stdout, _, _) = run_remora(&["state", &id]);
+        assert!(
+            stdout.contains("\"stopped\""),
+            "expected state=stopped, got: {}",
+            stdout
+        );
+
+        // Kill must fail — state.json now says "stopped".
+        let (_, _, ok) = run_remora(&["kill", &id, "SIGKILL"]);
+        assert!(!ok, "remora kill on stopped container should fail");
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
+    }
+
     /// test_oci_bundle_mounts
     ///
     /// Requires: root, alpine-rootfs.

@@ -666,6 +666,40 @@ the state dir path, runs `remora delete`, and asserts the directory is removed. 
 indicates `cmd_delete` is not calling `remove_dir_all`, or is checking liveness
 incorrectly and refusing to delete a stopped container.
 
+### `test_oci_state_dir_stable_until_delete`
+**Requires:** root, rootfs
+
+Starts `/bin/true`, waits 200ms for it to exit, then asserts: (1) the state directory
+still exists, and (2) `remora state` returns `"stopped"` without error. Then calls
+`remora delete` and verifies the state dir is removed.
+
+Verifies the OCI spec requirement that `stopped` is a stable inspectable state owned by
+the runtime until `remora delete` — not cleaned up automatically on process exit. An
+orchestrator queries `remora state` after observing process exit, before calling delete.
+Failure indicates the runtime is removing state too early (issue #37 / #40).
+
+### `test_oci_kill_short_lived`
+**Requires:** root, rootfs
+
+Starts `/bin/true`, waits 200ms (process exits), then calls `remora kill SIGKILL`
+*without* first calling `remora state`. Asserts kill returns success.
+
+This is the `pidfile.t` scenario: the container process is gone but `state.json` still
+says `"running"` (cmd_state hasn't been called). `cmd_kill` must succeed — it gates only
+on `state.json` status, not process liveness, and treats `ESRCH` as success (process died
+concurrently). Failure indicates cmd_kill is incorrectly checking liveness (issue #37 / #41).
+
+### `test_oci_kill_stopped_fails`
+**Requires:** root, rootfs
+
+Starts `/bin/true`, waits 200ms, calls `remora state` (which writes `"stopped"` to
+`state.json`), then asserts `remora kill SIGKILL` returns an error.
+
+This is the `kill.t test 4` scenario: once `cmd_state` has persisted `"stopped"` to disk,
+subsequent kill attempts must fail per the OCI spec. Failure indicates either `cmd_state`
+is not persisting the stopped status (issue #37 / #40), or `cmd_kill` is not reading it
+(issue #37 / #41).
+
 ### `test_oci_bundle_mounts`
 **Requires:** root, rootfs
 
