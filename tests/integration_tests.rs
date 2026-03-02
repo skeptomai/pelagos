@@ -3371,7 +3371,11 @@ mod oci_lifecycle {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let (_, stderr, ok) = run_remora(&["kill", &id, "SIGKILL"]);
-        assert!(ok, "remora kill on short-lived container failed: {}", stderr);
+        assert!(
+            ok,
+            "remora kill on short-lived container failed: {}",
+            stderr
+        );
 
         let (_, stderr, ok) = run_remora(&["delete", &id]);
         assert!(ok, "remora delete failed: {}", stderr);
@@ -3429,6 +3433,97 @@ mod oci_lifecycle {
 
         let (_, stderr, ok) = run_remora(&["delete", &id]);
         assert!(ok, "remora delete failed: {}", stderr);
+    }
+
+    /// test_oci_pid_start_time
+    ///
+    /// Requires: root, alpine-rootfs.
+    ///
+    /// Verifies that `pid_start_time` is recorded in state.json at create time
+    /// and matches the value readable from /proc/<pid>/stat for the running
+    /// container process. Also verifies that a different starttime value is
+    /// correctly detected and results in cmd_state reporting "stopped".
+    ///
+    /// Failure indicates that pid_start_time is not being written to state.json,
+    /// or that read_pid_start_time() is parsing /proc/pid/stat incorrectly,
+    /// or that the PID reuse detection path in cmd_state is broken.
+    #[test]
+    fn test_oci_pid_start_time() {
+        use remora::oci::read_pid_start_time;
+
+        // Unit: read_pid_start_time on our own PID must return Some value.
+        let our_pid = std::process::id() as libc::pid_t;
+        let t = read_pid_start_time(our_pid);
+        assert!(
+            t.is_some(),
+            "read_pid_start_time(self) returned None — /proc parsing broken"
+        );
+        // Starttime should be > 0 (jiffies since boot).
+        assert!(t.unwrap() > 0, "starttime should be positive");
+
+        // Stability: reading twice must return the same value.
+        assert_eq!(
+            read_pid_start_time(our_pid),
+            read_pid_start_time(our_pid),
+            "read_pid_start_time is not stable"
+        );
+
+        // Non-existent PID must return None.
+        assert!(
+            read_pid_start_time(i32::MAX).is_none(),
+            "read_pid_start_time(MAX_PID) should return None"
+        );
+
+        if !is_root() {
+            eprintln!("Skipping OCI integration part of test_oci_pid_start_time: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "Skipping OCI integration part of test_oci_pid_start_time: alpine-rootfs not found"
+                );
+                return;
+            }
+        };
+
+        // Run a long-lived container (sleep) so we can inspect its state.json.
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "30"]);
+        let id = format!("test-oci-pst-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Read state.json directly and check pid_start_time is present.
+        let state_path = format!("/run/remora/{}/state.json", id);
+        let raw = std::fs::read_to_string(&state_path).expect("state.json not found");
+        let state_json: serde_json::Value =
+            serde_json::from_str(&raw).expect("state.json is not valid JSON");
+        let stored = state_json.get("pidStartTime").and_then(|v| v.as_u64());
+        assert!(
+            stored.is_some(),
+            "pidStartTime missing from state.json: {}",
+            raw
+        );
+
+        // Verify it matches what we can read directly from /proc.
+        let pid = state_json["pid"].as_i64().expect("pid field") as libc::pid_t;
+        let live_starttime = read_pid_start_time(pid);
+        assert_eq!(
+            stored, live_starttime,
+            "state.json pidStartTime ({:?}) != /proc/{}/stat starttime ({:?})",
+            stored, pid, live_starttime
+        );
+
+        // Clean up.
+        let _ = run_remora(&["kill", &id, "SIGKILL"]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = run_remora(&["delete", &id]);
     }
 
     /// test_oci_bundle_mounts

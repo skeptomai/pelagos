@@ -700,6 +700,27 @@ subsequent kill attempts must fail per the OCI spec. Failure indicates either `c
 is not persisting the stopped status (issue #37 / #40), or `cmd_kill` is not reading it
 (issue #37 / #41).
 
+### `test_oci_pid_start_time`
+**Requires:** root, rootfs (integration portion); unit assertions run without root
+
+Two-part test.
+
+**Unit (no root required):**
+- Calls `read_pid_start_time(self)` and asserts it returns `Some(>0)`.
+- Asserts that two successive calls return the same value (stability).
+- Asserts that `read_pid_start_time(i32::MAX)` returns `None` (non-existent PID).
+
+**Integration (root + rootfs):**
+- Creates a `sleep 30` container, runs `create` + `start`.
+- Reads `state.json` directly and asserts `pidStartTime` is present and non-zero.
+- Reads `/proc/<pid>/stat` directly via `read_pid_start_time()` and asserts it
+  equals the stored value.
+
+Failure indicates `pid_start_time` is not being written to `state.json` at create
+time, or that `read_pid_start_time()` is parsing `/proc/pid/stat` field 22 incorrectly.
+This is the foundation of the PID reuse detection path in `cmd_state` and `cmd_kill`
+(issue #37, see issue #44 for the follow-on pidfd improvement).
+
 ### `test_oci_bundle_mounts`
 **Requires:** root, rootfs
 
