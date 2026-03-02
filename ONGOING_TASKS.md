@@ -1,29 +1,30 @@
 # Ongoing Tasks
 
-## Next: Epic #23 — OCI full compliance / runtime-tools conformance (2026-03-02)
+## Completed: Epic #23 — OCI runtime-tools conformance (2026-03-01)
 
-### Immediate next step (after reboot)
+### Final score: 33 PASS, 4 FAIL (up from 28 PASS, 9 FAIL)
 
-The machine needs a reboot before resuming work. Reason: kernel was updated from
-`6.18.7-arch1-1` to `6.18.13-arch1-1` but has not been rebooted. The `veth` kernel
-module is compiled as `=m` (loadable) but `/lib/modules/6.18.7-arch1-1/` has no module
-tree — only `6.18.13` does. This causes all 39 networking integration tests to fail with
-`"Unknown device type"` from `ip link add ... type veth`.
+All 4 remaining failures are known-unfixable:
+- `delete_only_create_resources` / `delete_resources`: runtime-tools cgroupv2 stub
+- `pidfile`: kill.t structural conflict (deletes state before --pid-file assertion)
+- `process_rlimits`: Go 1.21+ auto-raises RLIMIT_NOFILE; test expects raw kernel value
 
-After reboot, verify networking tests pass:
-```
-sudo -E cargo test --test integration_tests networking
-```
+### Tests fixed this session (2026-03-01)
 
-Then prosecute **issue #25**: run the `opencontainers/runtime-tools` conformance suite
-end-to-end and fix all failures. This closes issue #25, which closes epic #23.
+| Test | Root cause | Fix |
+|------|-----------|-----|
+| `linux_uid_mappings` | `mknod` for char/block devices fails with EPERM in user namespace (requires CAP_MKNOD in initial ns) | Pre-chroot bind-mount host devices (`/dev/<name>`) to container rootfs when USER namespace is active |
+| `linux_mounts` | Kernel mounts (proc, tmpfs) were post-chroot (higher `/proc/mountinfo` indices than bind mounts), violating OCI config order | Move kernel_mounts loop pre-chroot, before bind_mounts |
+| `linux_devices` | `mknod(2)` subject to umask; mode=0o660 masked to 0o640 | `umask(0)` before device loop, restore after |
+| `process_user` | `setuid(non-root)` clears permitted caps; ambient re-raise impossible | `prctl(PR_SET_KEEPCAPS, 1)` before `setuid` when switching to non-root with ambient caps |
+| `run-conformance.sh` | `sudo RUNTIME=remora` found `/usr/local/bin/remora` (stale installed binary) | Pass `PATH` explicitly to sudo |
 
-### Open issues (as of 2026-03-02)
+### Open issues (as of 2026-03-01)
 
 | Issue | Description | Action |
 |-------|-------------|--------|
-| #23 | Epic: OCI full compliance — console-socket + runtime-tools | Open; closes when #25 done |
-| #25 | Run runtime-tools conformance suite and fix all failures | **Next task** |
+| #23 | Epic: OCI full compliance — runtime-tools conformance | **CLOSED** — 33/37 pass (4 unfixable) |
+| #25 | Run runtime-tools conformance and fix all failures | **CLOSED** |
 | #37 | Zombie-keeper / PID stability — documented, non-blocking | Open marker; see #44 |
 | #44 | pidfd-based process identity hardening | Future work (needs shim mgmt socket) |
 
