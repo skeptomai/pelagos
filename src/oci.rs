@@ -51,6 +51,7 @@ pub struct OciProcess {
     pub capabilities: Option<OciCapabilities>,
     #[serde(default)]
     pub rlimits: Vec<OciRlimit>,
+    pub oom_score_adj: Option<i32>,
 }
 
 /// OCI rlimit entry from `process.rlimits`.
@@ -84,6 +85,9 @@ pub struct OciUser {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
+    #[serde(default)]
+    pub additional_gids: Vec<u32>,
+    pub umask: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -589,15 +593,29 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
             }
         }
 
-        // User (uid/gid)
+        // User (uid/gid/supplementary groups/umask)
         if let Some(ref user) = p.user {
             cmd = cmd.with_uid(user.uid).with_gid(user.gid);
+            if !user.additional_gids.is_empty() {
+                cmd = cmd.with_additional_gids(&user.additional_gids);
+            }
+            if let Some(mask) = user.umask {
+                cmd = cmd.with_umask(mask);
+            }
         }
 
         // Security flags
-        if p.no_new_privileges {
-            cmd = cmd.with_no_new_privileges(true);
+        cmd = cmd.with_no_new_privileges(p.no_new_privileges);
+
+        // OOM score adjustment
+        if let Some(score) = p.oom_score_adj {
+            cmd = cmd.with_oom_score_adj(score);
         }
+    }
+
+    // Hostname
+    if let Some(ref h) = config.hostname {
+        cmd = cmd.with_hostname(h);
     }
 
     if config.root.readonly {
@@ -695,6 +713,15 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
             }
             cmd = cmd.with_capabilities(keep);
         }
+
+        // process.capabilities.ambient → raise ambient caps in pre_exec.
+        // The cap number is the bit position in the Capability bitflag.
+        for name in &caps.ambient {
+            if let Some(flag) = oci_cap_to_flag(name) {
+                let cap_num = flag.bits().trailing_zeros() as u8;
+                cmd = cmd.with_ambient_capability(cap_num);
+            }
+        }
     }
 
     // linux.maskedPaths / linux.readonlyPaths / resources / sysctl / devices / seccomp
@@ -783,7 +810,8 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 let kind = dev.kind.chars().next().unwrap_or('a');
                 let major = dev.major.unwrap_or(-1);
                 let minor = dev.minor.unwrap_or(-1);
-                cmd = cmd.with_cgroup_device_rule(dev.allow, kind, major, minor, dev.access.clone());
+                cmd =
+                    cmd.with_cgroup_device_rule(dev.allow, kind, major, minor, dev.access.clone());
             }
             // Network (v1 only; silently skipped on v2)
             if let Some(ref net) = res.network {
@@ -929,7 +957,11 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 //
                 // Do NOT hardcode MS_NODEV here — /dev is a tmpfs that needs device nodes.
                 // Only apply MS_NODEV if the OCI config actually specified "nodev".
-                cmd = cmd.with_kernel_mount("tmpfs", "tmpfs", dest, flags, &extra_data);
+                //
+                // Use the config-specified source (e.g. "shm" for /dev/shm) so that
+                // /proc/mounts shows the correct source string, which runtimetest validates.
+                let src = mount.source.as_deref().unwrap_or("tmpfs");
+                cmd = cmd.with_kernel_mount("tmpfs", src, dest, flags, &extra_data);
             }
             "proc" => {
                 let f = libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | flags;
@@ -986,9 +1018,9 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
         }
     }
 
-    // When /dev is a fresh tmpfs, populate the standard OCI devices.
-    // Per the OCI Runtime Spec, the runtime MUST create these device nodes.
-    // mknod errors are ignored (with_device does this) in case they already exist.
+    // When /dev is a fresh tmpfs, populate the standard OCI devices and symlinks.
+    // Per the OCI Runtime Spec §4.5, the runtime MUST create these device nodes
+    // and symlinks. mknod/symlink errors are silently ignored (device may already exist).
     if dev_is_fresh_tmpfs {
         use crate::container::DeviceNode;
         let default_devices: &[(&str, char, u64, u64, u32)] = &[
@@ -1009,6 +1041,18 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
                 uid: 0,
                 gid: 0,
             });
+        }
+
+        // OCI spec §4.5: runtime MUST create these default symlinks in /dev.
+        let default_symlinks: &[(&str, &str)] = &[
+            ("/dev/fd", "/proc/self/fd"),
+            ("/dev/stdin", "/proc/self/fd/0"),
+            ("/dev/stdout", "/proc/self/fd/1"),
+            ("/dev/stderr", "/proc/self/fd/2"),
+            ("/dev/ptmx", "pts/ptmx"),
+        ];
+        for &(link, target) in default_symlinks {
+            cmd = cmd.with_dev_symlink(link, target);
         }
     }
 
@@ -1608,16 +1652,16 @@ pub fn cmd_create(
             if let Some((master_raw, _)) = pty_fds {
                 unsafe { libc::close(master_raw) };
             }
-            // Detach from the parent's stdio so that the parent's `output()` / pipe
-            // can receive EOF as soon as the parent exits.
+            // Close the read end of the ready pipe (shim doesn't need it).
+            // Keep fds 1 and 2 inherited so container output flows to whatever
+            // the caller (e.g. runtime-tools) has set as stdout/stderr.
+            // Redirect only stdin to /dev/null since the shim has no interactive input.
             unsafe {
                 libc::close(ready_r);
-                let dev_null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR, 0);
+                let dev_null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY, 0);
                 if dev_null >= 0 {
                     libc::dup2(dev_null, 0);
-                    libc::dup2(dev_null, 1);
-                    libc::dup2(dev_null, 2);
-                    if dev_null > 2 {
+                    if dev_null > 0 {
                         libc::close(dev_null);
                     }
                 }
@@ -1891,7 +1935,9 @@ pub fn cmd_state(id: &str) -> io::Result<()> {
             // Persist the stopped status to state.json so cmd_kill can observe it.
             // This is the authoritative state transition: once "stopped" is on disk,
             // subsequent kill calls will be refused (OCI spec compliance).
-            let _ = write_state(id, &state);
+            if let Err(e) = write_state(id, &state) {
+                log::warn!("container '{}': failed to persist stopped state: {}", id, e);
+            }
         }
     }
 

@@ -1012,6 +1012,42 @@ pub fn apply_filter(program: &BpfProgram) -> Result<(), io::Error> {
         .map_err(|e| io::Error::other(format!("Failed to apply seccomp filter: {}", e)))
 }
 
+/// Apply a seccomp BPF filter WITHOUT setting PR_SET_NO_NEW_PRIVS first.
+///
+/// Used when the OCI config has `noNewPrivileges: false` — the caller holds
+/// CAP_SYS_ADMIN (before capability drops) so the kernel allows the filter
+/// installation without requiring NNP to be set.  Unlike `apply_filter()`,
+/// this does NOT call `prctl(PR_SET_NO_NEW_PRIVS, 1, …)`, preserving the
+/// process's original NNP state.
+///
+/// # Safety
+/// Must be called in pre_exec (after fork, before exec) with CAP_SYS_ADMIN
+/// in the effective capability set.
+pub fn apply_filter_no_nnp(program: &BpfProgram) -> Result<(), io::Error> {
+    // BpfProgram is Vec<sock_filter>; build a sock_fprog pointing into it.
+    let fprog = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_ptr() as *mut libc::sock_filter,
+    };
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+            &fprog as *const libc::sock_fprog as libc::c_ulong,
+            0,
+            0,
+        )
+    };
+    if result != 0 {
+        Err(io::Error::other(format!(
+            "Failed to apply seccomp filter (no-nnp): {}",
+            io::Error::last_os_error()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

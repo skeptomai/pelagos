@@ -16,15 +16,9 @@
 use cgroups_rs::{
     fs::MaxValue,
     fs::{
-        cgroup_builder::CgroupBuilder,
-        cpu::CpuController,
-        cpuset::CpuSetController,
-        hierarchies,
-        memory::MemController,
-        net_cls::NetClsController,
-        net_prio::NetPrioController,
-        pid::PidController,
-        Cgroup,
+        cgroup_builder::CgroupBuilder, cpu::CpuController, cpuset::CpuSetController, hierarchies,
+        memory::MemController, net_cls::NetClsController, net_prio::NetPrioController,
+        pid::PidController, Cgroup,
     },
     CgroupPid,
 };
