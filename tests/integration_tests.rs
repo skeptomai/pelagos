@@ -3017,14 +3017,6 @@ mod oci_lifecycle {
         dir.to_path_buf()
     }
 
-    /// Helper: find the remora binary (built by cargo)
-    fn remora_binary() -> PathBuf {
-        // target/debug/remora relative to the workspace root
-        let mut p = std::env::current_dir().unwrap();
-        p.push("target/debug/remora");
-        p
-    }
-
     /// Run a remora subcommand with the given args. Returns (stdout, stderr, success).
     fn run_remora(args: &[&str]) -> (String, String, bool) {
         // `create` forks a long-lived shim that inherits the caller's pipe fds.
@@ -3543,6 +3535,187 @@ mod oci_lifecycle {
         let _ = run_remora(&["kill", &id, "SIGKILL"]);
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _ = run_remora(&["delete", &id]);
+    }
+
+    /// test_oci_pidfd_mgmt_socket
+    ///
+    /// Requires: root, alpine-rootfs, Linux ≥ 5.3 (pidfd_open).
+    ///
+    /// Verifies that after `remora create` + `remora start`, the shim has
+    /// created `mgmt.sock` inside the state directory and that connecting to
+    /// it returns a valid pidfd that `is_pidfd_alive` reports as alive.
+    /// After the container exits, the same pidfd (re-polled) must report
+    /// dead.
+    ///
+    /// Failure indicates that the shim failed to open the pidfd, failed to
+    /// bind the management socket, or that `is_pidfd_alive` mis-reads the
+    /// poll result.
+    #[test]
+    fn test_oci_pidfd_mgmt_socket() {
+        use remora::oci::{is_pidfd_alive, mgmt_sock_path};
+
+        if !is_root() {
+            eprintln!("Skipping test_oci_pidfd_mgmt_socket: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_pidfd_mgmt_socket: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/sleep", "30"]);
+        let id = format!("test-oci-pidfd-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Give the shim a moment to bind mgmt.sock (it's created after spawn()).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mgmt = mgmt_sock_path(&id);
+        assert!(
+            mgmt.exists(),
+            "mgmt.sock not found at {} — shim pidfd setup failed",
+            mgmt.display()
+        );
+
+        // Connect and receive pidfd.
+        let conn = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket() failed");
+            let path_bytes = mgmt.to_str().unwrap().as_bytes();
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            std::ptr::copy_nonoverlapping(
+                path_bytes.as_ptr() as *const libc::c_char,
+                addr.sun_path.as_mut_ptr(),
+                path_bytes.len(),
+            );
+            let r = libc::connect(
+                fd,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            );
+            assert_eq!(r, 0, "connect to mgmt.sock failed");
+            fd
+        };
+
+        // Receive the pidfd via SCM_RIGHTS.
+        let pidfd = unsafe {
+            let cmsg_space = libc::CMSG_SPACE(std::mem::size_of::<i32>() as libc::c_uint) as usize;
+            let mut cmsg_buf = vec![0u8; cmsg_space];
+            let mut iov_buf = [0u8; 1];
+            let mut iov = libc::iovec {
+                iov_base: iov_buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: 1,
+            };
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = cmsg_space as _;
+            let r = libc::recvmsg(conn, &mut msg, 0);
+            assert!(r >= 0, "recvmsg failed");
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!cmsg.is_null(), "no SCM_RIGHTS message received");
+            *(libc::CMSG_DATA(cmsg) as *const i32)
+        };
+        unsafe { libc::close(conn) };
+
+        assert!(pidfd >= 0, "received invalid pidfd {}", pidfd);
+
+        // Container is still running — pidfd must report alive.
+        assert!(
+            is_pidfd_alive(pidfd),
+            "is_pidfd_alive returned false while container is still running"
+        );
+
+        // Kill the container and wait for it to exit.
+        let _ = run_remora(&["kill", &id, "SIGKILL"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !is_pidfd_alive(pidfd) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                unsafe { libc::close(pidfd) };
+                let _ = run_remora(&["delete", &id]);
+                panic!("pidfd still reports alive 5s after SIGKILL");
+            }
+        }
+
+        // After exit, pidfd must report not alive.
+        assert!(
+            !is_pidfd_alive(pidfd),
+            "is_pidfd_alive returned true after container was killed"
+        );
+        unsafe { libc::close(pidfd) };
+
+        let _ = run_remora(&["delete", &id]);
+    }
+
+    /// test_oci_pidfd_state_liveness
+    ///
+    /// Requires: root, alpine-rootfs, Linux ≥ 5.3.
+    ///
+    /// Runs a short-lived container (`true`) and repeatedly calls `remora state`
+    /// until it reports "stopped".  Verifies that `cmd_state` correctly
+    /// transitions to "stopped" — which on Linux ≥ 5.3 is driven by
+    /// `is_pidfd_alive` via the shim's management socket.
+    ///
+    /// Failure indicates that the pidfd-based liveness path in `cmd_state`
+    /// misreports the container state, or the mgmt socket teardown race
+    /// prevents correct fallback to the starttime path.
+    #[test]
+    fn test_oci_pidfd_state_liveness() {
+        if !is_root() {
+            eprintln!("Skipping test_oci_pidfd_state_liveness: requires root");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_oci_pidfd_state_liveness: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        // Use `true` — exits immediately after start.
+        let bundle_dir = tempfile::tempdir().expect("tempdir");
+        let bundle = make_oci_bundle(bundle_dir.path(), &rootfs, &["/bin/true"]);
+        let id = format!("test-oci-pidfd-sl-{}", std::process::id());
+
+        let (_, stderr, ok) = run_remora(&["create", &id, bundle.to_str().unwrap()]);
+        assert!(ok, "remora create failed: {}", stderr);
+        let (_, stderr, ok) = run_remora(&["start", &id]);
+        assert!(ok, "remora start failed: {}", stderr);
+
+        // Poll state until stopped or timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (stdout, _, _) = run_remora(&["state", &id]);
+            if stdout.contains("\"stopped\"") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = run_remora(&["delete", &id]);
+                panic!(
+                    "container did not reach 'stopped' within 5s; last state: {}",
+                    stdout
+                );
+            }
+        }
+
+        let (_, stderr, ok) = run_remora(&["delete", &id]);
+        assert!(ok, "remora delete failed: {}", stderr);
     }
 
     /// test_oci_bundle_mounts

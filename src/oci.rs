@@ -421,6 +421,15 @@ pub fn exec_sock_path(id: &str) -> PathBuf {
     state_dir(id).join("exec.sock")
 }
 
+/// Path to the shim management socket for container `id`.
+///
+/// The shim creates this socket after spawning the container and uses it to
+/// hand out pidfds (via `SCM_RIGHTS`) to `cmd_state` and `cmd_kill`.  The
+/// socket is removed when the container process exits.
+pub fn mgmt_sock_path(id: &str) -> PathBuf {
+    state_dir(id).join("mgmt.sock")
+}
+
 // ---------------------------------------------------------------------------
 // State I/O
 // ---------------------------------------------------------------------------
@@ -1495,44 +1504,8 @@ fn find_child_of(parent_pid: i32) -> Option<i32> {
 fn send_fd_to_console_socket(socket_path: &Path, fd: i32) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
-
     let stream = UnixStream::connect(socket_path)?;
-    let sock_fd = stream.as_raw_fd();
-
-    // Build the SCM_RIGHTS control message.
-    let cmsg_space =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as libc::c_uint) as usize };
-    let mut cmsg_buf = vec![0u8; cmsg_space];
-
-    let mut iov_buf = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: iov_buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: 1,
-    };
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_space as _;
-
-    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if cmsg.is_null() {
-        return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
-    }
-    unsafe {
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
-        let data_ptr = libc::CMSG_DATA(cmsg) as *mut i32;
-        *data_ptr = fd;
-    }
-
-    let ret = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    send_fd_on_socket(stream.as_raw_fd(), fd)
 }
 
 /// `remora create <id> --bundle <bundle>` — set up container, suspend before exec.
@@ -1673,6 +1646,35 @@ pub fn cmd_create(
                     unsafe { libc::_exit(1) };
                 }
             };
+
+            // Open a pidfd for the direct child (intermediate P) and serve it via
+            // a management socket.  `cmd_state` and `cmd_kill` connect here to get
+            // the pidfd so they can use poll(POLLIN) for race-free liveness checks
+            // instead of kill(pid,0)+starttime comparison.
+            //
+            // We use `child.id()` (P's PID) rather than the grandchild container PID
+            // because P exits only after the container exits — it is an accurate
+            // proxy for container liveness.  On kernels < 5.3 (no pidfd_open) or on
+            // any failure we simply fall through; callers fall back to starttime.
+            let child_pid = child.pid() as libc::pid_t;
+            let maybe_pidfd = pidfd_open(child_pid, 0).ok();
+            let mgmt_path = mgmt_sock_path(id);
+            let maybe_mgmt_fd = create_listen_socket(&mgmt_path).ok();
+            if let (Some(pidfd), Some(mgmt_fd)) = (maybe_pidfd, maybe_mgmt_fd) {
+                log::debug!(
+                    "OCI shim: id={} pidfd={} mgmt={} serving",
+                    id,
+                    pidfd,
+                    mgmt_path.display()
+                );
+                run_shim_mgmt_loop(pidfd, mgmt_fd);
+                unsafe {
+                    libc::close(pidfd);
+                    libc::close(mgmt_fd);
+                }
+                let _ = fs::remove_file(&mgmt_path);
+            }
+
             // Container exec'd. Wait for it, then exit (shim is orphaned at this point).
             child.wait().ok();
             unsafe { libc::_exit(0) };
@@ -1890,48 +1892,230 @@ pub fn read_pid_start_time(pid: libc::pid_t) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
+// ---------------------------------------------------------------------------
+// pidfd-based process identity (issue #44)
+// ---------------------------------------------------------------------------
+
+/// Open a pidfd for `pid` via the `pidfd_open(2)` syscall (Linux ≥ 5.3).
+///
+/// Returns `Err` on older kernels (ENOSYS) or if the process has already
+/// exited (ESRCH).  Callers fall back to starttime-based detection on error.
+fn pidfd_open(pid: libc::pid_t, flags: libc::c_uint) -> io::Result<i32> {
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_open,
+            pid as libc::c_long,
+            flags as libc::c_long,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret as i32)
+    }
+}
+
+/// Send a single file descriptor over an already-connected Unix socket via
+/// `SCM_RIGHTS`.  A 1-byte dummy payload is required by `sendmsg`.
+fn send_fd_on_socket(sock_fd: i32, fd: i32) -> io::Result<()> {
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as libc::c_uint) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+    let mut iov_buf = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: iov_buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space as _;
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
+    }
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
+        let data_ptr = libc::CMSG_DATA(cmsg) as *mut i32;
+        *data_ptr = fd;
+    }
+    let ret = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Receive a single file descriptor from an already-connected Unix socket via
+/// `SCM_RIGHTS`.
+fn recv_fd_scm(sock_fd: i32) -> io::Result<i32> {
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as libc::c_uint) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+    let mut iov_buf = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: iov_buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space as _;
+    let ret = unsafe { libc::recvmsg(sock_fd, &mut msg, 0) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err(io::Error::other("recvmsg: no SCM_RIGHTS control message"));
+    }
+    let fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32) };
+    Ok(fd)
+}
+
+/// Shim management loop: serve pidfd requests until the container process exits.
+///
+/// Called from the shim (post-fork, after `command.spawn()`).  Polls the pidfd
+/// and the management listen socket concurrently.  On each incoming connection
+/// the pidfd is sent via `SCM_RIGHTS`.  Returns when the pidfd becomes readable
+/// (i.e. the container's direct child has exited).
+///
+/// This function uses only async-signal-safe primitives and never panics.
+fn run_shim_mgmt_loop(pidfd: i32, listen_fd: i32) {
+    loop {
+        let mut pollfds = [
+            libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: listen_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+        // Container's direct child exited — stop serving.
+        if pollfds[0].revents & libc::POLLIN != 0 {
+            break;
+        }
+        // New cmd_state / cmd_kill connection.
+        if pollfds[1].revents & libc::POLLIN != 0 {
+            let conn =
+                unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if conn >= 0 {
+                let _ = send_fd_on_socket(conn, pidfd);
+                unsafe { libc::close(conn) };
+            }
+        }
+    }
+}
+
+/// Connect to the shim management socket and receive a pidfd via `SCM_RIGHTS`.
+///
+/// Returns `None` if the socket does not exist (shim is gone or kernel < 5.3)
+/// or if the connection/receive fails.  Callers fall back to starttime-based
+/// liveness detection.
+///
+/// The caller is responsible for closing the returned fd.
+fn try_get_pidfd_from_shim(id: &str) -> Option<i32> {
+    let path = mgmt_sock_path(id);
+    if !path.exists() {
+        return None;
+    }
+    let conn = connect_socket(&path).ok()?;
+    let pidfd = recv_fd_scm(conn).ok();
+    unsafe { libc::close(conn) };
+    pidfd
+}
+
+/// Poll a pidfd with zero timeout to determine whether the process is still
+/// running.
+///
+/// `POLLIN` becoming readable on a pidfd means the process has exited (the
+/// kernel marks it readable when the process enters a terminated state).
+///
+/// Returns `true` if the process is still running, `false` if it has exited.
+/// On `poll(2)` error, conservatively returns `true` (assume alive).
+pub fn is_pidfd_alive(pidfd: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if ret < 0 {
+        return true; // conservative: assume alive on error
+    }
+    (pfd.revents & libc::POLLIN) == 0
+}
+
 pub fn cmd_state(id: &str) -> io::Result<()> {
     let mut state = read_state(id)?;
 
-    // Determine actual liveness via kill(pid, 0), zombie check, and PID reuse detection.
+    // Determine actual liveness.
+    //
+    // Preferred path (Linux ≥ 5.3): obtain a pidfd from the shim's mgmt socket.
+    // A pidfd is bound to a specific process instance — poll(POLLIN, timeout=0)
+    // returns readable when the process has exited, with no TOCTOU window.
+    //
+    // Fallback path (shim gone or kernel < 5.3): kill(pid, 0) + zombie check +
+    // starttime comparison (3-syscall window, still adequate for all practical use).
     if state.status == "created" || state.status == "running" {
-        let alive = unsafe { libc::kill(state.pid, 0) } == 0;
-        let zombie = alive && is_zombie_pid(state.pid);
-        log::debug!(
-            "OCI state: id={} state.pid={} alive={} zombie={}",
-            id,
-            state.pid,
-            alive,
-            zombie
-        );
-
-        // PID reuse detection: if the process appears alive but its starttime differs
-        // from what we recorded at create time, a new unrelated process has claimed
-        // state.pid — the original container has exited without us noticing.
-        let pid_reused = if alive && !zombie {
-            if let Some(stored) = state.pid_start_time {
-                match read_pid_start_time(state.pid) {
-                    Some(current) if current != stored => {
-                        log::warn!(
-                            "container '{}': PID {} reused (stored starttime={}, current={}); \
-                             treating as stopped",
-                            id,
-                            state.pid,
-                            stored,
-                            current
-                        );
-                        true
+        let stopped = if let Some(pidfd) = try_get_pidfd_from_shim(id) {
+            let alive = is_pidfd_alive(pidfd);
+            unsafe { libc::close(pidfd) };
+            log::debug!("OCI state: id={} pidfd-based alive={}", id, alive);
+            !alive
+        } else {
+            // Fallback: kill + zombie + starttime.
+            let alive = unsafe { libc::kill(state.pid, 0) } == 0;
+            let zombie = alive && is_zombie_pid(state.pid);
+            log::debug!(
+                "OCI state: id={} state.pid={} alive={} zombie={} (starttime fallback)",
+                id,
+                state.pid,
+                alive,
+                zombie
+            );
+            let pid_reused = if alive && !zombie {
+                if let Some(stored) = state.pid_start_time {
+                    match read_pid_start_time(state.pid) {
+                        Some(current) if current != stored => {
+                            log::warn!(
+                                "container '{}': PID {} reused (stored starttime={}, \
+                                 current={}); treating as stopped",
+                                id,
+                                state.pid,
+                                stored,
+                                current
+                            );
+                            true
+                        }
+                        _ => false,
                     }
-                    _ => false,
+                } else {
+                    false
                 }
             } else {
                 false
-            }
-        } else {
-            false
+            };
+            !alive || zombie || pid_reused
         };
 
-        if !alive || zombie || pid_reused {
+        if stopped {
             state.status = "stopped".to_string();
             // Persist the stopped status to state.json so cmd_kill can observe it.
             // This is the authoritative state transition: once "stopped" is on disk,
@@ -1968,15 +2152,31 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
         ));
     }
 
-    // PID reuse detection: before sending the signal, verify that state.pid still
-    // belongs to the original container process by comparing starttime. Only block
-    // the kill if we positively confirm a different process has claimed the PID.
+    // PID reuse / liveness guard before sending the signal.
     //
-    // If /proc/<pid>/stat is unreadable (process already gone), fall through to the
-    // actual kill() call, which will return ESRCH and be treated as success — the
-    // container's intent (stop it) is fulfilled. This preserves the short-lived
-    // container case (pidfile.t: `true` exits before kill is called).
-    if let Some(stored) = state.pid_start_time {
+    // Preferred path (Linux ≥ 5.3): poll the pidfd received from the shim.
+    // If POLLIN is set, the container's direct-child process (P) has already
+    // exited, meaning the container itself has exited and state.pid may have
+    // been recycled.  Refusing here prevents signalling an unrelated process.
+    //
+    // Fallback path (shim gone or kernel < 5.3): compare starttime.  If
+    // /proc/<pid>/stat is unreadable (process already gone) we fall through to
+    // the kill() call below, which returns ESRCH and is treated as success —
+    // the short-lived container case (pidfile.t: `true` exits before kill).
+    if let Some(pidfd) = try_get_pidfd_from_shim(id) {
+        let alive = is_pidfd_alive(pidfd);
+        unsafe { libc::close(pidfd) };
+        if !alive {
+            log::warn!(
+                "container '{}': shim reports container exited; refusing kill",
+                id
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("container '{}' is stopped (confirmed via pidfd)", id),
+            ));
+        }
+    } else if let Some(stored) = state.pid_start_time {
         if let Some(current) = read_pid_start_time(state.pid) {
             if current != stored {
                 log::warn!(

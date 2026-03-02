@@ -718,8 +718,34 @@ Two-part test.
 
 Failure indicates `pid_start_time` is not being written to `state.json` at create
 time, or that `read_pid_start_time()` is parsing `/proc/pid/stat` field 22 incorrectly.
-This is the foundation of the PID reuse detection path in `cmd_state` and `cmd_kill`
-(issue #37, see issue #44 for the follow-on pidfd improvement).
+This is the foundation of the PID reuse detection fallback path in `cmd_state` and
+`cmd_kill` (issue #37; pidfd-based primary path implemented in issue #44).
+
+### `test_oci_pidfd_mgmt_socket`
+**Requires:** root, rootfs, Linux ≥ 5.3
+
+After `create` + `start` of a `sleep 30` container, asserts that:
+- `mgmt.sock` exists under `/run/remora/<id>/` (shim created it).
+- Connecting to `mgmt.sock` and calling `recvmsg(SCM_RIGHTS)` yields a valid pidfd (≥ 0).
+- `is_pidfd_alive(pidfd)` returns `true` while the container is running.
+- After `remora kill SIGKILL`, `is_pidfd_alive` transitions to `false` within 5 s.
+
+Failure indicates the shim failed to call `pidfd_open(2)` (kernel < 5.3 would skip it
+silently; a failure here means the mgmt loop exited early or the socket was never
+created), `send_fd_on_socket` is broken, or `is_pidfd_alive` misreads the poll result.
+This is the primary test for issue #44.
+
+### `test_oci_pidfd_state_liveness`
+**Requires:** root, rootfs, Linux ≥ 5.3
+
+Runs a `true` container (exits immediately after start).  Polls `remora state` in a
+loop (100 ms intervals, 5 s timeout) and asserts it reaches `"stopped"`.
+
+Failure indicates that `cmd_state`'s pidfd-based liveness path (or its starttime
+fallback) fails to detect container exit — either `try_get_pidfd_from_shim` never
+finds a valid pidfd, `is_pidfd_alive` always returns `true`, or the fallback
+`kill(pid,0)` path is broken.  Complements `test_oci_create_start_state` which
+tests a longer-lived (`sleep 2`) container lifecycle.
 
 ### `test_oci_bundle_mounts`
 **Requires:** root, rootfs
