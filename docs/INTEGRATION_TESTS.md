@@ -185,6 +185,47 @@ Stacks all Phase 1 security features: `with_seccomp_default()`,
 `with_masked_paths_default()`, `drop_all_capabilities()`. Verifies they coexist
 and the container can still run `echo`.
 
+### `test_landlock_read_only_allows_read`
+**Requires:** root, rootfs, Linux ≥ 5.13
+
+Applies `with_landlock_ro("/")` (read-only Landlock rule on the entire container root)
+and runs `cat /etc/hostname`. Asserts the command succeeds. Skips if the kernel does
+not support Landlock (ABI version 0). Failure indicates `FS_ACCESS_RO` does not include
+`READ_FILE`/`READ_DIR`, or `apply_landlock` failed silently.
+
+### `test_landlock_denies_write`
+**Requires:** root, rootfs, Linux ≥ 5.13
+
+Applies `with_landlock_ro("/")` on a container with a tmpfs at `/tmp` and runs
+`touch /tmp/landlock_test`. Asserts the touch exits non-zero or the shell reports
+`exit=1`. Skips if the kernel does not support Landlock. Failure indicates the
+read-only rule is not blocking `WRITE_FILE`/`MAKE_REG` access as expected.
+
+### `test_landlock_rw_allows_write`
+**Requires:** root, rootfs, Linux ≥ 5.13
+
+Applies `with_landlock_rw("/")` (all Landlock rights) and runs
+`touch /tmp/landlock_rw_test && echo ok`. Asserts `ok` appears on stdout. Skips if
+the kernel does not support Landlock. Failure indicates `FS_ACCESS_RW` is missing
+write rights, or `apply_landlock` incorrectly denies writes when `MAKE_REG` is included.
+
+### `test_landlock_no_rules_no_effect`
+**Requires:** root, rootfs
+
+Spawns a container with no Landlock rules and runs both a read (`cat /etc/hostname`)
+and a write (`touch /tmp/noll`). Asserts both succeed. Does not skip on old kernels
+because it does not call Landlock at all. Failure indicates that `apply_landlock(&[])`
+is not a true no-op — a bug where an empty rule set applies a deny-all policy.
+
+### `test_landlock_partial_path_allow`
+**Requires:** root, rootfs, Linux ≥ 5.13
+
+Grants read-only access to `/etc`, `/bin`, `/lib`, and `/usr` only (no rule for `/tmp`).
+Runs `cat /etc/hostname && touch /tmp/partial_test; echo write_exit=$?`. Asserts
+`write_exit=1` — the `/tmp` write is denied because `/tmp` is not covered by any rule.
+Skips if the kernel does not support Landlock. Failure indicates Landlock rules are not
+scoped to the declared subtrees, or `/tmp` is inadvertently inheriting access.
+
 ---
 
 ## Phase 4: Filesystem Flexibility Tests

@@ -739,6 +739,8 @@ pub struct Command {
     additional_gids: Vec<u32>,
     // Process umask (process.user.umask in OCI spec).
     umask: Option<u32>,
+    // Landlock filesystem access rules applied in pre_exec before seccomp.
+    landlock_rules: Vec<crate::landlock::LandlockRule>,
 }
 
 impl Command {
@@ -792,6 +794,7 @@ impl Command {
             oom_score_adj: None,
             additional_gids: Vec::new(),
             umask: None,
+            landlock_rules: Vec::new(),
         }
     }
 
@@ -1701,6 +1704,34 @@ impl Command {
         self
     }
 
+    /// Add a Landlock read-only rule: allow the container to read and execute
+    /// files beneath `path` but not modify them.
+    ///
+    /// Landlock is applied in pre_exec before seccomp.  On kernels < 5.13
+    /// (no Landlock support) the rule is silently ignored.  Multiple calls
+    /// accumulate rules; access to paths not covered by any rule is denied.
+    ///
+    /// `path` is relative to the **container root** (resolved after chroot).
+    pub fn with_landlock_ro<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.landlock_rules.push(crate::landlock::LandlockRule {
+            path: path.as_ref().to_path_buf(),
+            access: crate::landlock::FS_ACCESS_RO,
+        });
+        self
+    }
+
+    /// Add a Landlock read-write rule: allow all filesystem operations beneath
+    /// `path`.
+    ///
+    /// `path` is relative to the **container root** (resolved after chroot).
+    pub fn with_landlock_rw<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+        self.landlock_rules.push(crate::landlock::LandlockRule {
+            path: path.as_ref().to_path_buf(),
+            access: crate::landlock::FS_ACCESS_RW,
+        });
+        self
+    }
+
     /// Make the root filesystem read-only.
     ///
     /// This prevents the container from modifying the filesystem, enforcing
@@ -2126,6 +2157,7 @@ impl Command {
         let oom_score_adj = self.oom_score_adj;
         let additional_gids = self.additional_gids.clone();
         let umask_val = self.umask;
+        let landlock_rules = self.landlock_rules.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
@@ -3496,6 +3528,16 @@ impl Command {
                     }
                 }
 
+                // Step 4.848: Apply Landlock (NNP=false path, CAP_SYS_ADMIN still held).
+                //
+                // landlock_restrict_self(2) requires either CAP_SYS_ADMIN or NNP.
+                // On this path we still hold CAP_SYS_ADMIN (caps dropped at 4.86).
+                // Must run before seccomp at step 4.849 (Landlock syscalls 444-446
+                // are not in the Docker default seccomp allowlist).
+                if !no_new_privileges && !landlock_rules.is_empty() {
+                    crate::landlock::apply_landlock(&landlock_rules)?;
+                }
+
                 // Step 4.849: Apply seccomp early when no_new_privileges=false.
                 //
                 // When no_new_privileges=false we still hold CAP_SYS_ADMIN here
@@ -3642,6 +3684,13 @@ impl Command {
                     if slave_fd > 2 {
                         libc::close(slave_fd);
                     }
+                }
+
+                // Step 6.55: Apply Landlock (NNP=true path; NNP set at 6.5 satisfies
+                // the restriction requirement for landlock_restrict_self).
+                // Must run before seccomp at step 7.
+                if no_new_privileges && !landlock_rules.is_empty() {
+                    crate::landlock::apply_landlock(&landlock_rules)?;
                 }
 
                 // Step 7: Apply seccomp filter (no_new_privileges=true path only).
@@ -4065,6 +4114,7 @@ impl Command {
         let oom_score_adj = self.oom_score_adj;
         let additional_gids = self.additional_gids.clone();
         let umask_val = self.umask;
+        let landlock_rules = self.landlock_rules.clone();
         let bind_mounts = self.bind_mounts.clone();
         let tmpfs_mounts = self.tmpfs_mounts.clone();
         let kernel_mounts = self.kernel_mounts.clone();
@@ -5248,6 +5298,11 @@ impl Command {
                     }
                 }
 
+                // Apply Landlock before early seccomp (mirrors spawn() step 4.848).
+                if !no_new_privileges && !landlock_rules.is_empty() {
+                    crate::landlock::apply_landlock(&landlock_rules)?;
+                }
+
                 // Apply seccomp early without NNP (mirrors spawn() step 4.849).
                 if !no_new_privileges {
                     if let Some(ref filter) = seccomp_filter {
@@ -5380,6 +5435,11 @@ impl Command {
                     if slave_fd > 2 {
                         libc::close(slave_fd);
                     }
+                }
+
+                // Apply Landlock (NNP=true path, mirrors spawn() step 6.55).
+                if no_new_privileges && !landlock_rules.is_empty() {
+                    crate::landlock::apply_landlock(&landlock_rules)?;
                 }
 
                 // Apply seccomp (no_new_privileges=true path only, mirrors spawn() step 7).

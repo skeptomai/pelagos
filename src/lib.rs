@@ -11,6 +11,7 @@ pub mod container;
 pub mod dns;
 pub mod idmap;
 pub mod image;
+pub mod landlock;
 pub mod lisp;
 pub mod network;
 pub mod oci;

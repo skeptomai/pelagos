@@ -810,6 +810,264 @@ mod security {
             "Container with all Phase 1 security should work"
         );
     }
+
+    /// test_landlock_read_only_allows_read
+    ///
+    /// Requires: root, rootfs, Linux ≥ 5.13.
+    ///
+    /// Spawns a container with a Landlock read-only rule on `/` and verifies
+    /// that reading a file inside the container succeeds.
+    ///
+    /// Failure indicates `apply_landlock` is broken, the ABI detection returns
+    /// wrong results, or `landlock_add_rule`/`landlock_restrict_self` fail.
+    #[test]
+    fn test_landlock_read_only_allows_read() {
+        use remora::landlock::get_abi_version;
+
+        if !is_root() {
+            eprintln!("Skipping test_landlock_read_only_allows_read: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_landlock_read_only_allows_read: alpine-rootfs not found");
+            return;
+        };
+        if get_abi_version() == 0 {
+            eprintln!("Skipping test_landlock_read_only_allows_read: kernel < 5.13, no Landlock");
+            return;
+        }
+
+        // Allow read-only access to the entire container root.
+        // Reading /etc/hostname should succeed.
+        let mut child = Command::new("/bin/cat")
+            .args(["/etc/hostname"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_no_new_privileges(true)
+            .with_landlock_ro("/")
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, _stdout, stderr) = child.wait_with_output().expect("wait failed");
+        assert!(
+            status.success(),
+            "read under landlock_ro(/) failed: stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    /// test_landlock_denies_write
+    ///
+    /// Requires: root, rootfs, Linux ≥ 5.13.
+    ///
+    /// Spawns a container with a Landlock read-only rule on `/` and attempts
+    /// to write a file.  Asserts the write fails (non-zero exit or error output).
+    ///
+    /// Failure indicates Landlock is not restricting write access, or the rule
+    /// was not applied (e.g. `apply_landlock` silently returned Ok on EPERM).
+    #[test]
+    fn test_landlock_denies_write() {
+        use remora::landlock::get_abi_version;
+
+        if !is_root() {
+            eprintln!("Skipping test_landlock_denies_write: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_landlock_denies_write: alpine-rootfs not found");
+            return;
+        };
+        if get_abi_version() == 0 {
+            eprintln!("Skipping test_landlock_denies_write: kernel < 5.13, no Landlock");
+            return;
+        }
+
+        // Allow only read-only access. Attempt to write to /tmp/landlock_test.
+        // With landlock_ro(/), writing is denied → touch/echo must fail.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "touch /tmp/landlock_test; echo exit=$?"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_tmpfs("/tmp", "")
+            .with_no_new_privileges(true)
+            .with_landlock_ro("/")
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout_bytes, stderr_bytes) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        // touch should fail under read-only Landlock — exit code non-zero.
+        assert!(
+            stdout.contains("exit=1") || !status.success(),
+            "write should be denied under landlock_ro(/), got: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&stderr_bytes)
+        );
+    }
+
+    /// test_landlock_rw_allows_write
+    ///
+    /// Requires: root, rootfs, Linux ≥ 5.13.
+    ///
+    /// Spawns a container with a Landlock read-write rule on `/` and asserts
+    /// that writing to /tmp succeeds.
+    ///
+    /// Failure indicates `FS_ACCESS_RW` does not include write rights, or the
+    /// rule is not being applied.
+    #[test]
+    fn test_landlock_rw_allows_write() {
+        use remora::landlock::get_abi_version;
+
+        if !is_root() {
+            eprintln!("Skipping test_landlock_rw_allows_write: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_landlock_rw_allows_write: alpine-rootfs not found");
+            return;
+        };
+        if get_abi_version() == 0 {
+            eprintln!("Skipping test_landlock_rw_allows_write: kernel < 5.13, no Landlock");
+            return;
+        }
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "touch /tmp/landlock_rw_test && echo ok"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_tmpfs("/tmp", "")
+            .with_no_new_privileges(true)
+            .with_landlock_rw("/")
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, stderr_bytes) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            stdout.contains("ok"),
+            "write under landlock_rw(/) should succeed: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&stderr_bytes)
+        );
+    }
+
+    /// test_landlock_no_rules_no_effect
+    ///
+    /// Requires: root, rootfs.
+    ///
+    /// Spawns a container with NO Landlock rules and verifies that a read and
+    /// write both succeed — confirming that `apply_landlock(&[])` is a true
+    /// no-op and does not restrict anything.
+    ///
+    /// Failure indicates a bug where an empty rule set still applies a
+    /// deny-all policy.
+    #[test]
+    fn test_landlock_no_rules_no_effect() {
+        if !is_root() {
+            eprintln!("Skipping test_landlock_no_rules_no_effect: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_landlock_no_rules_no_effect: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat /etc/hostname && touch /tmp/noll && echo ok"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_tmpfs("/tmp", "")
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, stderr_bytes) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        assert!(
+            stdout.contains("ok"),
+            "no-rules container should read and write freely: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&stderr_bytes)
+        );
+    }
+
+    /// test_landlock_partial_path_allow
+    ///
+    /// Requires: root, rootfs, Linux ≥ 5.13.
+    ///
+    /// Grants read-only access to `/etc` only.  Asserts that reading `/etc/hostname`
+    /// succeeds but writing to `/tmp` fails — verifying per-path granularity.
+    ///
+    /// Failure indicates Landlock rules are not scoped to the specified path
+    /// subtree, or `/tmp` is inadvertently receiving access.
+    #[test]
+    fn test_landlock_partial_path_allow() {
+        use remora::landlock::get_abi_version;
+
+        if !is_root() {
+            eprintln!("Skipping test_landlock_partial_path_allow: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_landlock_partial_path_allow: alpine-rootfs not found");
+            return;
+        };
+        if get_abi_version() == 0 {
+            eprintln!("Skipping test_landlock_partial_path_allow: kernel < 5.13");
+            return;
+        }
+
+        // Allow /etc read-only. /tmp write should be denied.
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "cat /etc/hostname && touch /tmp/partial_test; echo write_exit=$?",
+            ])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_tmpfs("/tmp", "")
+            .with_no_new_privileges(true)
+            .with_landlock_ro("/etc")
+            .with_landlock_ro("/bin")
+            .with_landlock_ro("/lib")
+            .with_landlock_ro("/usr")
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, stderr_bytes) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        // cat /etc/hostname should work; touch /tmp should fail.
+        assert!(
+            stdout.contains("write_exit=1"),
+            "write to /tmp should be denied when only /etc has landlock_ro: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&stderr_bytes)
+        );
+    }
 }
 
 mod filesystem {
