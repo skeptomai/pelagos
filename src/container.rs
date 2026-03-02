@@ -3638,7 +3638,7 @@ impl Command {
                     libc::dup2(slave_fd, 0);
                     libc::dup2(slave_fd, 1);
                     libc::dup2(slave_fd, 2);
-                    libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32);
+                    libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
                     if slave_fd > 2 {
                         libc::close(slave_fd);
                     }
@@ -5376,7 +5376,7 @@ impl Command {
                     libc::dup2(slave_fd, 0);
                     libc::dup2(slave_fd, 1);
                     libc::dup2(slave_fd, 2);
-                    libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32);
+                    libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
                     if slave_fd > 2 {
                         libc::close(slave_fd);
                     }
