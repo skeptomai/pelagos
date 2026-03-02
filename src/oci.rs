@@ -391,6 +391,14 @@ pub struct OciState {
     /// Bridge IP address, populated when using bridge networking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_ip: Option<String>,
+    /// Process start time in jiffies from /proc/<pid>/stat field 22.
+    ///
+    /// Stored at create time and compared at state/kill time to detect PID reuse.
+    /// If the current starttime differs from this value, the original container
+    /// process has exited and `state.pid` now belongs to an unrelated process.
+    /// See issue #44 for the longer-term pidfd-based approach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,6 +1715,7 @@ pub fn cmd_create(
                 bundle: bundle.to_string_lossy().into_owned(),
                 annotations: config.annotations.clone(),
                 bridge_ip: None,
+                pid_start_time: read_pid_start_time(container_pid),
             };
             write_state(id, &state)?;
 
@@ -1807,20 +1816,39 @@ fn is_zombie_pid(pid: libc::pid_t) -> bool {
     fs::read_to_string(&stat_path)
         .ok()
         .and_then(|s| {
-            // /proc/pid/stat format: pid (name) state ...
-            // name can contain spaces and ')', so find the last ')' to locate the state field.
+            // /proc/pid/stat: pid (comm) state ... — comm can contain spaces and ')',
+            // so find the last ')' to reliably locate the state character.
             s.rfind(')')
                 .map(|i| s[i + 1..].trim_start().starts_with('Z'))
         })
         .unwrap_or(false)
 }
 
+/// Read the process start time (field 22) from /proc/<pid>/stat.
+///
+/// The starttime field is the number of clock ticks since boot at which the
+/// process started. It is monotonic, never reused for a different process
+/// instance, and survives as long as the kernel holds the process table entry.
+///
+/// Used to detect PID reuse: if `state.pid_start_time` differs from the value
+/// read here, a new unrelated process has claimed the original container's PID.
+///
+/// Returns None if /proc/<pid>/stat is unreadable or unparseable.
+pub fn read_pid_start_time(pid: libc::pid_t) -> Option<u64> {
+    let stat_path = format!("/proc/{}/stat", pid);
+    let contents = fs::read_to_string(&stat_path).ok()?;
+    // Fields after the comm (which may contain spaces/parens) start after the last ')'.
+    let after_comm = contents.rfind(')')?;
+    let rest = contents[after_comm + 1..].trim_start();
+    // Remaining fields are space-separated: state ppid pgrp session tty_nr ...
+    // Field 22 in the full stat line = index 19 in the post-comm remainder (0-based).
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
 pub fn cmd_state(id: &str) -> io::Result<()> {
     let mut state = read_state(id)?;
 
-    // Determine actual liveness via kill(pid, 0).
-    // Zombie processes (state 'Z') pass kill(pid,0) but are effectively stopped —
-    // the container has exited but the shim hasn't reaped it yet (zombie-keeper design).
+    // Determine actual liveness via kill(pid, 0), zombie check, and PID reuse detection.
     if state.status == "created" || state.status == "running" {
         let alive = unsafe { libc::kill(state.pid, 0) } == 0;
         let zombie = alive && is_zombie_pid(state.pid);
@@ -1831,7 +1859,34 @@ pub fn cmd_state(id: &str) -> io::Result<()> {
             alive,
             zombie
         );
-        if !alive || zombie {
+
+        // PID reuse detection: if the process appears alive but its starttime differs
+        // from what we recorded at create time, a new unrelated process has claimed
+        // state.pid — the original container has exited without us noticing.
+        let pid_reused = if alive && !zombie {
+            if let Some(stored) = state.pid_start_time {
+                match read_pid_start_time(state.pid) {
+                    Some(current) if current != stored => {
+                        log::warn!(
+                            "container '{}': PID {} reused (stored starttime={}, current={}); \
+                             treating as stopped",
+                            id,
+                            state.pid,
+                            stored,
+                            current
+                        );
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !alive || zombie || pid_reused {
             state.status = "stopped".to_string();
             // Persist the stopped status to state.json so cmd_kill can observe it.
             // This is the authoritative state transition: once "stopped" is on disk,
@@ -1864,6 +1919,37 @@ pub fn cmd_kill(id: &str, signal: &str) -> io::Result<()> {
                 id
             ),
         ));
+    }
+
+    // PID reuse detection: before sending the signal, verify that state.pid still
+    // belongs to the original container process by comparing starttime. Only block
+    // the kill if we positively confirm a different process has claimed the PID.
+    //
+    // If /proc/<pid>/stat is unreadable (process already gone), fall through to the
+    // actual kill() call, which will return ESRCH and be treated as success — the
+    // container's intent (stop it) is fulfilled. This preserves the short-lived
+    // container case (pidfile.t: `true` exits before kill is called).
+    if let Some(stored) = state.pid_start_time {
+        if let Some(current) = read_pid_start_time(state.pid) {
+            if current != stored {
+                log::warn!(
+                    "container '{}': PID {} reused before kill (stored starttime={}, \
+                     current={}); refusing to signal unrelated process",
+                    id,
+                    state.pid,
+                    stored,
+                    current
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "container '{}' is stopped (PID {} reused by another process)",
+                        id, state.pid
+                    ),
+                ));
+            }
+        }
+        // None: process gone → kill() will return ESRCH → treated as success below.
     }
 
     // Accept signal as name (with or without "SIG" prefix) or number.
