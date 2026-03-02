@@ -3027,6 +3027,25 @@ mod oci_lifecycle {
 
     /// Run a remora subcommand with the given args. Returns (stdout, stderr, success).
     fn run_remora(args: &[&str]) -> (String, String, bool) {
+        // `create` forks a long-lived shim that inherits the caller's pipe fds.
+        // Using output() would block until the shim (and its container children)
+        // exit, because output() waits for EOF on stdout/stderr pipes and the shim
+        // keeps those write-ends open indefinitely. Instead use a temp file for
+        // stderr and status() which waits only for the direct create process to exit.
+        // Reading a file never blocks on EOF, so we return as soon as create exits.
+        if args.first() == Some(&"create") {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile for stderr");
+            let stderr_file = tmp.reopen().expect("reopen stderr tempfile");
+            let status = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(stderr_file))
+                .status()
+                .expect("failed to run remora create");
+            let stderr = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+            return (String::new(), stderr, status.success());
+        }
+
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
             .args(args)
             .output()
@@ -11638,6 +11657,21 @@ mod console_socket_tests {
     use std::os::unix::net::UnixListener;
 
     fn run_remora(args: &[&str]) -> (String, String, bool) {
+        // "create" spawns a long-lived shim that holds stdout/stderr pipe write-ends open.
+        // output() would block until the container exits. Use status() + temp-file for stderr
+        // so we return as soon as the create process itself exits.
+        if args.first() == Some(&"create") {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile for stderr");
+            let stderr_file = tmp.reopen().expect("reopen stderr tempfile");
+            let status = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(stderr_file))
+                .status()
+                .expect("failed to run remora create");
+            let stderr = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+            return (String::new(), stderr, status.success());
+        }
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_remora"))
             .args(args)
             .output()

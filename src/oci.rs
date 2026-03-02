@@ -1653,35 +1653,17 @@ pub fn cmd_create(
                 unsafe { libc::close(master_raw) };
             }
             // Close the read end of the ready pipe (shim doesn't need it).
-            // Redirect stdin, stdout, and stderr to /dev/null so the shim is
-            // fully daemonized and does NOT hold the caller's pipe fds open.
-            //
-            // If the caller uses std::process::Command::output() (or any pipe-based
-            // capture), it waits for EOF on stdout/stderr pipes. EOF only arrives
-            // when every holder of the write-end closes it. Without this redirect
-            // the shim (and all its forked children) keep those pipes open until the
-            // container exits, blocking the caller — e.g. `remora create` would not
-            // return until the container finished running.
-            //
-            // For the OCI create/start lifecycle the container's I/O is managed by
-            // the caller before `create` (via named pipes, log files, or the PTY
-            // console socket for terminal=true containers). The shim must not relay
-            // stdio back to the create caller.
+            // Keep fds 1 and 2 so container output flows to whatever the caller
+            // (e.g. runtime-tools) has set as stdout/stderr — the conformance test
+            // harness captures runtimetest's TAP output through this pipe chain.
+            // Redirect only stdin to /dev/null since the shim has no interactive input.
             unsafe {
                 libc::close(ready_r);
-                let dev_null_r = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY, 0);
-                if dev_null_r >= 0 {
-                    libc::dup2(dev_null_r, 0);
-                    if dev_null_r > 0 {
-                        libc::close(dev_null_r);
-                    }
-                }
-                let dev_null_w = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY, 0);
-                if dev_null_w >= 0 {
-                    libc::dup2(dev_null_w, 1);
-                    libc::dup2(dev_null_w, 2);
-                    if dev_null_w > 2 {
-                        libc::close(dev_null_w);
+                let dev_null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY, 0);
+                if dev_null >= 0 {
+                    libc::dup2(dev_null, 0);
+                    if dev_null > 0 {
+                        libc::close(dev_null);
                     }
                 }
             }
