@@ -11842,7 +11842,10 @@ mod healthcheck_tests {
             .args(["exec", name, "/bin/true"])
             .status()
             .expect("pelagos exec /bin/true");
-        assert!(true_result.success(), "pelagos exec /bin/true should exit 0");
+        assert!(
+            true_result.success(),
+            "pelagos exec /bin/true should exit 0"
+        );
 
         // /bin/false should exit non-zero
         let false_result = std::process::Command::new(bin)
