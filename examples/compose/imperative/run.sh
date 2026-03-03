@@ -25,7 +25,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 EXAMPLE="${1:-graph}"
-PELAGOS="${REMORA:-}"
+PELAGOS="${PELAGOS:-}"
 
 # Auto-detect pelagos binary.
 if [ -z "$PELAGOS" ]; then

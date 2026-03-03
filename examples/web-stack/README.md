@@ -1,6 +1,6 @@
 # Web Stack Example
 
-A 3-container blog application demonstrating Remora's multi-container and
+A 3-container blog application demonstrating Pelagos's multi-container and
 multi-network capabilities.
 
 ## Architecture
@@ -21,7 +21,7 @@ directly. The app container bridges both networks.
 
 ## Features Demonstrated
 
-- **Image build** — `remora build` with Remfiles (FROM, RUN, COPY, CMD, ENV, WORKDIR)
+- **Image build** — `pelagos build` with Remfiles (FROM, RUN, COPY, CMD, ENV, WORKDIR)
 - **Multi-network isolation** — frontend and backend networks with per-container attachment
 - **Container linking** — `--link name:alias` resolves to the correct IP on a shared network
 - **NAT** — outbound internet for `apk add` during builds
@@ -32,7 +32,7 @@ directly. The app container bridges both networks.
 ## Running
 
 ```bash
-# Build remora first
+# Build pelagos first
 cargo build --release
 export PATH=$PWD/target/release:$PATH
 

@@ -52,7 +52,7 @@ All resource limits in one place; no magic numbers inside service blocks.
 
 ```bash
 # Run on a non-default port
-JUPYTER_PORT=9999 sudo remora compose up -f compose.reml -p jupyter
+JUPYTER_PORT=9999 sudo pelagos compose up -f compose.reml -p jupyter
 ```
 
 ### `on-ready` — observable readiness
@@ -69,7 +69,7 @@ The log message confirms the notebook kernel will find redis on the first connec
 ## Running
 
 ```bash
-# Build remora first
+# Build pelagos first
 cargo build --release
 export PATH=$PWD/target/release:$PATH
 
@@ -82,10 +82,10 @@ open http://localhost:8888/lab
 
 The script:
 1. Pulls `alpine:latest` and builds both images
-2. Runs `remora compose up -f compose.reml -p jupyter` in foreground
+2. Runs `pelagos compose up -f compose.reml -p jupyter` in foreground
 3. Waits for JupyterLab to accept connections on port 8888
 4. Runs 4 smoke tests (API, UI, kernel specs, sessions)
-5. Tears down with `remora compose down -v`
+5. Tears down with `pelagos compose down -v`
 
 ## Using Redis from Notebooks
 

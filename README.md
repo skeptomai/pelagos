@@ -137,21 +137,21 @@ scripting reference.
 - **Overlay filesystem:** copy-on-write layered rootfs via overlayfs
 
 ### OCI Images
-- **Pull:** `remora image pull alpine` — anonymous pulls from any OCI registry
-- **Run:** `remora run alpine /bin/sh` — multi-layer overlay, image config applied
-- **Build:** `remora build -t myapp:latest` — Remfile (Dockerfile-compatible syntax)
+- **Pull:** `pelagos image pull alpine` — anonymous pulls from any OCI registry
+- **Run:** `pelagos run alpine /bin/sh` — multi-layer overlay, image config applied
+- **Build:** `pelagos build -t myapp:latest` — Remfile (Dockerfile-compatible syntax)
   with multi-stage builds, ARG, ADD (URLs + archives), `.remignore`, build cache
-- **Manage:** `remora image ls` / `remora image rm`
+- **Manage:** `pelagos image ls` / `pelagos image rm`
 
 ### Multi-Service Orchestration
-- **`remora compose up/down/ps/logs`:** dependency-ordered service lifecycle
+- **`pelagos compose up/down/ps/logs`:** dependency-ordered service lifecycle
 - **TCP readiness:** `:ready-port` polling before dependent services start
 - **Scoped resources:** networks, volumes, and container names prefixed per project
 - **Lifecycle hooks:** `on-ready` callbacks between startup tiers
 
 ### Other
 - **Interactive containers:** PTY, SIGWINCH relay, terminal restore
-- **`remora exec`:** run a command inside a running container (namespace join + PTY)
+- **`pelagos exec`:** run a command inside a running container (namespace join + PTY)
 - **OCI Runtime Spec:** `create` / `start` / `state` / `kill` / `delete` lifecycle
 - **Rootless:** pull, build, run, overlay, and pasta networking without root
 
@@ -178,35 +178,35 @@ cargo install --path .
 ### Rootless (no sudo)
 
 ```bash
-remora image pull alpine
-remora run alpine /bin/echo hello
+pelagos image pull alpine
+pelagos run alpine /bin/echo hello
 
 # Interactive shell with internet
-remora run -i --network pasta alpine /bin/sh
+pelagos run -i --network pasta alpine /bin/sh
 ```
 
 ### Root (full feature set)
 
 ```bash
-sudo remora run -i alpine /bin/sh
+sudo pelagos run -i alpine /bin/sh
 
 # Detached container with bridge networking
-sudo remora run -d --name mybox --network bridge --nat alpine \
+sudo pelagos run -d --name mybox --network bridge --nat alpine \
   /bin/sh -c 'while true; do echo tick; sleep 1; done'
 
-remora ps
-remora logs -f mybox
-sudo remora stop mybox && remora rm mybox
+pelagos ps
+pelagos logs -f mybox
+sudo pelagos stop mybox && pelagos rm mybox
 ```
 
 ### Multi-service stack
 
 ```bash
 # Declarative
-sudo -E remora compose up -f examples/compose/web-stack/compose.reml -p demo
+sudo -E pelagos compose up -f examples/compose/web-stack/compose.reml -p demo
 
 # Imperative
-sudo -E remora compose up -f examples/compose/imperative/compose.reml -p demo
+sudo -E pelagos compose up -f examples/compose/imperative/compose.reml -p demo
 ```
 
 ---
@@ -261,7 +261,7 @@ sudo -E make test-e2e
 # or: sudo -E bats tests/e2e/hardening.bats tests/e2e/lifecycle.bats
 ```
 
-The E2E suite verifies that `remora compose up` applies all four security
+The E2E suite verifies that `pelagos compose up` applies all four security
 hardening defaults to every container it starts, and exercises the full
 compose lifecycle (up / ps / down).
 

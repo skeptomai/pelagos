@@ -43,7 +43,7 @@ for arg in "$@"; do
 done
 
 BLOG_PORT="${BLOG_PORT:-8080}"
-REMORA="${REMORA:-./target/release/pelagos}"
+PELAGOS="${PELAGOS:-./target/release/pelagos}"
 COMPOSE_REML="examples/compose/web-stack/compose.reml"
 COMPOSE_REM="examples/compose/web-stack/compose.rem"
 WEB_STACK_DIR="examples/web-stack"
@@ -135,24 +135,24 @@ echo
 log "Phase 2a: build pelagos (release)"
 step "Running: cargo build --release"
 cargo build --release --quiet
-step "Binary: $REMORA"
+step "Binary: $PELAGOS"
 
 log "Phase 2b: build web-stack images"
 
-if ! "$REMORA" image ls 2>/dev/null | grep -q "alpine:latest"; then
+if ! "$PELAGOS" image ls 2>/dev/null | grep -q "alpine:latest"; then
     step "Pulling alpine:latest..."
-    "$REMORA" image pull alpine:latest
+    "$PELAGOS" image pull alpine:latest
 else
     step "alpine:latest already present"
 fi
 
 for svc in redis app proxy; do
     tag="web-stack-${svc}:latest"
-    if "$REMORA" image ls 2>/dev/null | grep -q "$tag"; then
+    if "$PELAGOS" image ls 2>/dev/null | grep -q "$tag"; then
         step "Image $tag already built"
     else
         step "Building $tag from $WEB_STACK_DIR/$svc/Remfile..."
-        "$REMORA" build -t "web-stack-$svc" --network bridge "$WEB_STACK_DIR/$svc"
+        "$PELAGOS" build -t "web-stack-$svc" --network bridge "$WEB_STACK_DIR/$svc"
         ok "$tag built"
     fi
 done
@@ -169,7 +169,7 @@ LOGFILE="$(mktemp /tmp/pelagos-reml-test-XXXXXX.log)"
 step "Log file: $LOGFILE"
 
 BLOG_PORT="$BLOG_PORT" RUST_LOG=info \
-    "$REMORA" compose up \
+    "$PELAGOS" compose up \
         -f "$COMPOSE_REML" \
         -p "$PROJECT" \
         --foreground \
@@ -178,7 +178,7 @@ COMPOSE_PID=$!
 
 cleanup() {
     log "Teardown"
-    "$REMORA" compose down -f "$COMPOSE_REML" -p "$PROJECT" -v 2>/dev/null || true
+    "$PELAGOS" compose down -f "$COMPOSE_REML" -p "$PROJECT" -v 2>/dev/null || true
     wait "$COMPOSE_PID" 2>/dev/null || true
     step "Log saved to $LOGFILE"
 }
@@ -275,7 +275,7 @@ fi
 # ── Service list ──────────────────────────────────────────────────
 log "Phase 2g: service list"
 echo
-"$REMORA" compose ps -f "$COMPOSE_REML" -p "$PROJECT"
+"$PELAGOS" compose ps -f "$COMPOSE_REML" -p "$PROJECT"
 
 # ── Summary ───────────────────────────────────────────────────────
 echo
@@ -287,8 +287,8 @@ else
     echo
     echo "  Full log: $LOGFILE"
     echo "  Service logs:"
-    echo "    RUST_LOG=info $REMORA compose logs -f $COMPOSE_REML -p $PROJECT redis"
-    echo "    RUST_LOG=info $REMORA compose logs -f $COMPOSE_REML -p $PROJECT app"
-    echo "    RUST_LOG=info $REMORA compose logs -f $COMPOSE_REML -p $PROJECT proxy"
+    echo "    RUST_LOG=info $PELAGOS compose logs -f $COMPOSE_REML -p $PROJECT redis"
+    echo "    RUST_LOG=info $PELAGOS compose logs -f $COMPOSE_REML -p $PROJECT app"
+    echo "    RUST_LOG=info $PELAGOS compose logs -f $COMPOSE_REML -p $PROJECT proxy"
     exit 1
 fi

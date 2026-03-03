@@ -6,15 +6,15 @@
 set -euo pipefail
 
 RUNTIME_TOOLS=/home/cb/Projects/runtime-tools
-REMORA=$(realpath "$(dirname "$0")/../target/debug/pelagos")
+PELAGOS=$(realpath "$(dirname "$0")/../target/debug/pelagos")
 RESULTS_FILE=$(realpath "$(dirname "$0")/../rt-results.txt")
 
-if [ ! -f "$REMORA" ]; then
-    echo "pelagos binary not found at $REMORA — run 'sudo -E cargo build' first" >&2
+if [ ! -f "$PELAGOS" ]; then
+    echo "pelagos binary not found at $PELAGOS — run 'sudo -E cargo build' first" >&2
     exit 1
 fi
 
-export PATH="$(dirname "$REMORA"):$PATH"
+export PATH="$(dirname "$PELAGOS"):$PATH"
 export RUNTIME=pelagos
 
 # Run from runtime-tools dir so tests find rootfs-amd64.tar.gz and runtimetest
@@ -41,7 +41,7 @@ for testbin in validation/*/*.t; do
         continue
     fi
 
-    output=$(sudo PATH="$(dirname "$REMORA"):$PATH" RUNTIME=pelagos "$testbin" 2>&1 || true)
+    output=$(sudo PATH="$(dirname "$PELAGOS"):$PATH" RUNTIME=pelagos "$testbin" 2>&1 || true)
     not_ok_count=$(echo "$output" | grep -c "^not ok" || true)
     ok_count=$(echo "$output" | grep -c "^ok" || true)
 

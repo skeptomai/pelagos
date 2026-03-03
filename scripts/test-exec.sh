@@ -7,16 +7,16 @@
 cd "$(dirname "$0")/.." || exit 1
 
 CARGO="cargo"
-REMORA="$CARGO run --"
+PELAGOS="$CARGO run --"
 CONTAINER="test-exec"
 RC=0
 
 cleanup() {
     echo ""
     echo "=== Cleanup ==="
-    $REMORA stop "$CONTAINER" 2>/dev/null || true
+    $PELAGOS stop "$CONTAINER" 2>/dev/null || true
     sleep 1
-    $REMORA rm -f "$CONTAINER" 2>/dev/null || true
+    $PELAGOS rm -f "$CONTAINER" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -27,25 +27,25 @@ $CARGO build
 
 echo ""
 echo "=== Starting detached container ==="
-$REMORA run --name "$CONTAINER" --detach alpine-rootfs /bin/sleep 300
+$PELAGOS run --name "$CONTAINER" --detach alpine-rootfs /bin/sleep 300
 
 sleep 1
 
 echo ""
 echo "=== Exec: echo hello ==="
-$REMORA exec "$CONTAINER" /bin/sh -c "echo hello from exec"
+$PELAGOS exec "$CONTAINER" /bin/sh -c "echo hello from exec"
 
 echo ""
 echo "=== Exec: read /etc/hostname ==="
-$REMORA exec "$CONTAINER" /bin/cat /etc/hostname
+$PELAGOS exec "$CONTAINER" /bin/cat /etc/hostname
 
 echo ""
 echo "=== Exec: env override ==="
-$REMORA exec -e FOO=bar "$CONTAINER" /bin/sh -c 'echo FOO=$FOO'
+$PELAGOS exec -e FOO=bar "$CONTAINER" /bin/sh -c 'echo FOO=$FOO'
 
 echo ""
 echo "=== Exec: ps inside container ==="
-$REMORA exec "$CONTAINER" /bin/ps aux
+$PELAGOS exec "$CONTAINER" /bin/ps aux
 
 # Cleanup the manual-test container before running integration tests
 # so they don't interfere with each other.

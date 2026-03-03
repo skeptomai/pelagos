@@ -1,6 +1,6 @@
-# Remora Monitoring Stack
+# Pelagos Monitoring Stack
 
-A three-service observability stack built with [Remora](../../../README.md):
+A three-service observability stack built with [Pelagos](../../../README.md):
 
 | Service | Port | Role |
 |---------|------|------|
@@ -36,21 +36,21 @@ sudo ./examples/compose/monitoring/run.sh --no-stack
 
 ```bash
 # Pull base image
-sudo remora image pull alpine:latest
+sudo pelagos image pull alpine:latest
 
 # Build images
-sudo remora build -t monitoring-prometheus --network bridge examples/compose/monitoring/prometheus
-sudo remora build -t monitoring-loki       --network bridge examples/compose/monitoring/loki
-sudo remora build -t monitoring-grafana    --network bridge examples/compose/monitoring/grafana
+sudo pelagos build -t monitoring-prometheus --network bridge examples/compose/monitoring/prometheus
+sudo pelagos build -t monitoring-loki       --network bridge examples/compose/monitoring/loki
+sudo pelagos build -t monitoring-grafana    --network bridge examples/compose/monitoring/grafana
 
 # Start stack
-sudo remora compose up -f examples/compose/monitoring/compose.reml -p monitoring
+sudo pelagos compose up -f examples/compose/monitoring/compose.reml -p monitoring
 
 # In another terminal: check status
-sudo remora compose ps -f examples/compose/monitoring/compose.reml -p monitoring
+sudo pelagos compose ps -f examples/compose/monitoring/compose.reml -p monitoring
 
 # Tear down
-sudo remora compose down -f examples/compose/monitoring/compose.reml -p monitoring -v
+sudo pelagos compose down -f examples/compose/monitoring/compose.reml -p monitoring -v
 ```
 
 ## Architecture

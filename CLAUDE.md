@@ -1,4 +1,4 @@
-# Remora - Linux Container Runtime
+# Pelagos - Linux Container Runtime
 
 ## ⚠️ CRITICAL RULES FOR CLAUDE ⚠️
 
@@ -25,12 +25,12 @@ value and violate the principle that every artifact ships with the code.
 - The file includes: context, API design, pre_exec sequence changes, exact file changes,
   test descriptions, verification steps, and notes/risks
 
-### `remora image pull` Does NOT Require Root
-**`remora image pull` works without sudo** for users in the `remora` group.
+### `pelagos image pull` Does NOT Require Root
+**`pelagos image pull` works without sudo** for users in the `pelagos` group.
 Never tell the user that image pulls require root — that is a documentation bug.
 
 If a non-root pull fails with "Permission denied":
-1. The shell session may predate group membership → `newgrp remora` or new login
+1. The shell session may predate group membership → `newgrp pelagos` or new login
 2. Existing dirs may have been created by root before `setup.sh` → `sudo ./scripts/setup.sh` repairs them
 
 Operations that **do** require root: `run`, `exec`, `compose`, `stop`, `rm`
@@ -75,7 +75,7 @@ This is a hard requirement, not optional cleanup.
 - ✅ `log::warn!("fuse unmount failed: {}", e)` — non-fatal problems
 - ❌ `eprintln!("[debug] ...")` — never, even temporarily
 
-`eprintln!` is reserved for **user-facing error messages** in the CLI binary (e.g. `eprintln!("remora: error: {}", e)`). Everything else goes through `log::*` so it respects `RUST_LOG` filtering and doesn't pollute stderr when users don't want it.
+`eprintln!` is reserved for **user-facing error messages** in the CLI binary (e.g. `eprintln!("pelagos: error: {}", e)`). Everything else goes through `log::*` so it respects `RUST_LOG` filtering and doesn't pollute stderr when users don't want it.
 
 ### User Macros
 
@@ -87,7 +87,7 @@ This is a hard requirement, not optional cleanup.
 
 **"So Long and Thanks for all the Fish"** — Wrap up session, document state, commit, and push:
 1. Remove any ephemeral session files (temp scripts, test output, session resume files)
-2. Commit any untracked config or doc files in both `remora` and `home-monitoring` repos
+2. Commit any untracked config or doc files in both `pelagos` and `home-monitoring` repos
 3. Update `ONGOING_TASKS.md` with:
    - Current date and git SHA for both repos
    - What was completed this session
@@ -124,7 +124,7 @@ Glob, WebSearch, WebFetch — use them freely without asking.
 
 ## Project Overview
 
-Remora is a modern, lightweight Linux container runtime written in Rust. It provides a safe, ergonomic API for creating containerized processes using Linux namespaces, seccomp filtering, capabilities, and resource limits.
+Pelagos is a modern, lightweight Linux container runtime written in Rust. It provides a safe, ergonomic API for creating containerized processes using Linux namespaces, seccomp filtering, capabilities, and resource limits.
 
 ## Current State (Updated Feb 17, 2026)
 
@@ -162,13 +162,13 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 **Filesystem Flexibility (Phase 4 COMPLETE ✅):**
 - **Bind mounts**: `with_bind_mount()` (RW) and `with_bind_mount_ro()` (RO) — map host dirs into container
 - **tmpfs mounts**: `with_tmpfs()` — in-memory writable scratch space (works with read-only rootfs)
-- **Named volumes**: `Volume::create/open/delete` backed by `/var/lib/remora/volumes/<name>/`; `with_volume()` builder method
-- **Overlay filesystem**: `with_overlay(upper_dir, work_dir)` — copy-on-write layered rootfs; requires `Namespace::MOUNT` + `with_chroot`; merged dir auto-managed at `/run/remora/overlay-{pid}-{n}/merged/`
+- **Named volumes**: `Volume::create/open/delete` backed by `/var/lib/pelagos/volumes/<name>/`; `with_volume()` builder method
+- **Overlay filesystem**: `with_overlay(upper_dir, work_dir)` — copy-on-write layered rootfs; requires `Namespace::MOUNT` + `with_chroot`; merged dir auto-managed at `/run/pelagos/overlay-{pid}-{n}/merged/`
 
 **OCI Image Layers (COMPLETE ✅):**
-- **Image pull**: `remora image pull alpine` — native OCI registry pulls via `oci-client`; anonymous auth; layers cached content-addressably at `/var/lib/remora/layers/<sha256>/`
-- **Image run**: `remora run alpine /bin/sh` — multi-layer overlayfs mount with ephemeral upper/work; image config (Env, Cmd, Entrypoint, WorkingDir) applied as defaults
-- **Image management**: `remora image ls`, `remora image rm <ref>` — list/remove locally stored images
+- **Image pull**: `pelagos image pull alpine` — native OCI registry pulls via `oci-client`; anonymous auth; layers cached content-addressably at `/var/lib/pelagos/layers/<sha256>/`
+- **Image run**: `pelagos run alpine /bin/sh` — multi-layer overlayfs mount with ephemeral upper/work; image config (Env, Cmd, Entrypoint, WorkingDir) applied as defaults
+- **Image management**: `pelagos image ls`, `pelagos image rm <ref>` — list/remove locally stored images
 - **Multi-layer overlay**: `with_image_layers(layer_dirs)` — API for mounting multiple overlay lower layers; auto-creates ephemeral upper/work dirs
 - **OCI whiteouts**: `.wh.*` files converted to overlayfs char device (0,0) whiteouts; `.wh..wh..opq` sets `trusted.overlay.opaque` xattr
 - **`src/image.rs`**: `ImageConfig`, `ImageManifest`, `extract_layer()`, `save_image()`, `load_image()`, `layer_dirs()`
@@ -176,23 +176,23 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 
 **Networking (Phase 6 COMPLETE ✅):**
 - **N1 Loopback**: `with_network(NetworkMode::Loopback)` — isolated NET namespace, lo brought up via ioctl (127.0.0.1 active)
-- **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `remora0` bridge (172.19.0.x/24), IPAM via per-network state files
+- **N2 Bridge**: `with_network(NetworkMode::Bridge)` — veth pair + `pelagos0` bridge (172.19.0.x/24), IPAM via per-network state files
 - **N2b Named Networks**: `with_network(NetworkMode::BridgeNamed("frontend"))` — user-defined bridge networks with custom subnets
 - **N3 NAT**: `with_nat()` — nftables MASQUERADE per-network, reference-counted via per-network state files
 - **N4 Port mapping**: `with_port_forward(host_port, container_port)` — TCP DNAT via nftables prerouting + userspace TCP proxy for localhost access
-- **N5 DNS**: `with_dns(&[...])` — writes to `/run/remora/dns-{pid}-{n}/resolv.conf` and bind-mounts it into the container; shared rootfs is never modified; requires `Namespace::MOUNT` + `with_chroot`
+- **N5 DNS**: `with_dns(&[...])` — writes to `/run/pelagos/dns-{pid}-{n}/resolv.conf` and bind-mounts it into the container; shared rootfs is never modified; requires `Namespace::MOUNT` + `with_chroot`
 - **N6 Pasta**: `with_network(NetworkMode::Pasta)` — user-mode networking via `pasta`; rootless-compatible full internet access; attaches to container netns via `/proc/{pid}/ns/net` after exec
-- **Multi-network**: `remora network create/ls/rm/inspect` — per-network `Ipv4Net` subnets, `NetworkDef` config, IPAM, NAT, nftables tables (`remora-<name>`); `--network <name>` on run/build
+- **Multi-network**: `pelagos network create/ls/rm/inspect` — per-network `Ipv4Net` subnets, `NetworkDef` config, IPAM, NAT, nftables tables (`pelagos-<name>`); `--network <name>` on run/build
 - **Multi-network containers**: `with_additional_network("backend")` — attach secondary bridge interfaces (eth1, eth2, ...) with subnet routes; `attach_network_to_netns()` / `teardown_secondary_network()` in network.rs; `--network frontend --network backend` CLI; smart link resolution via `network_ips` in state.json
-- **N7 DNS service discovery**: dual-backend DNS — `builtin` (`remora-dns` daemon, default) or `dnsmasq` (production-grade); automatic container name resolution on bridge networks; per-network config files at `/run/remora/dns/<network>.conf`; SIGHUP reload; upstream forwarding; `--dns-backend` CLI flag or `PELAGOS_DNS_BACKEND` env var; auto-start/stop lifecycle managed by `ensure_dns_daemon()` / container teardown
+- **N7 DNS service discovery**: dual-backend DNS — `builtin` (`pelagos-dns` daemon, default) or `dnsmasq` (production-grade); automatic container name resolution on bridge networks; per-network config files at `/run/pelagos/dns/<network>.conf`; SIGHUP reload; upstream forwarding; `--dns-backend` CLI flag or `PELAGOS_DNS_BACKEND` env var; auto-start/stop lifecycle managed by `ensure_dns_daemon()` / container teardown
 - **Automatic cleanup**: veth pair, netns, nftables rules, pasta relay, secondary networks, DNS entries cleaned up in `wait()` / `wait_with_output()`
 - **`src/network.rs`**: `NetworkMode`, `Ipv4Net`, `NetworkDef`, `bring_up_loopback()`, `setup_bridge_network()`, `teardown_network()`, `attach_network_to_netns()`, `teardown_secondary_network()`, `setup_pasta_network()`, `teardown_pasta_network()`, `is_pasta_available()`, `bootstrap_default_network()`, `load_network_def()`
 - **`src/dns.rs`**: DNS daemon management: `DnsBackend` enum, `active_backend()`, `ensure_dns_daemon()`, `dns_add_entry()`, `dns_remove_entry()`; dual-backend dispatch (builtin/dnsmasq)
-- **`src/bin/remora-dns.rs`**: DNS daemon binary: UDP server, A-record resolution, upstream forwarding, SIGHUP reload
+- **`src/bin/pelagos-dns.rs`**: DNS daemon binary: UDP server, A-record resolution, upstream forwarding, SIGHUP reload
 - **`src/cli/network.rs`**: `cmd_network_create()`, `cmd_network_ls()`, `cmd_network_rm()`, `cmd_network_inspect()`
 
 **Image Build (COMPLETE ✅):**
-- **`remora build -t <tag> [--file <path>] [--network bridge|pasta] [--build-arg KEY=VALUE] [context]`**: build images from Remfiles
+- **`pelagos build -t <tag> [--file <path>] [--network bridge|pasta] [--build-arg KEY=VALUE] [context]`**: build images from Remfiles
 - **Remfile parser**: FROM (+ `AS alias`), RUN, COPY (+ `--from=stage`), ADD, CMD, ENTRYPOINT (JSON + shell form), ENV, WORKDIR, EXPOSE, LABEL, USER, ARG
 - **Build engine**: overlay snapshot per RUN step, context COPY as layers, config-only instructions
 - **Multi-stage builds**: `FROM ... AS builder` / `COPY --from=builder`; stages split at FROM boundaries; only final stage produces output manifest
@@ -207,18 +207,18 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **`src/cli/build.rs`**: `BuildArgs`, `cmd_build()`
 
 **Container Exec (COMPLETE ✅):**
-- **`remora exec <name> <command>`**: run a command inside a running container
+- **`pelagos exec <name> <command>`**: run a command inside a running container
 - **Namespace discovery**: compares `/proc/{pid}/ns/*` inodes against `/proc/1/ns/*` to find container namespaces
 - **Environment inheritance**: reads `/proc/{pid}/environ` as base, CLI `-e` overrides
-- **Interactive mode**: `remora exec -i <name> /bin/sh` allocates a PTY
+- **Interactive mode**: `pelagos exec -i <name> /bin/sh` allocates a PTY
 - **User/workdir**: `--user UID[:GID]`, `--workdir /path` options
 - **`src/cli/exec.rs`**: `ExecArgs`, `cmd_exec()`, `discover_namespaces()`, `read_proc_environ()`
 
 **Compose (COMPLETE ✅):**
-- **`remora compose up [-f compose.rem] [-p project] [--foreground]`**: parse S-expression compose file, create scoped networks/volumes, start services in dependency order with TCP readiness polling, supervisor process with log relay
-- **`remora compose down [-f compose.rem] [-p project] [-v]`**: stop services in reverse topo order (SIGTERM → SIGKILL), remove networks/volumes/state
-- **`remora compose ps [-f compose.rem] [-p project]`**: list services with status
-- **`remora compose logs [-f compose.rem] [-p project] [--follow] [service]`**: view prefixed service logs
+- **`pelagos compose up [-f compose.rem] [-p project] [--foreground]`**: parse S-expression compose file, create scoped networks/volumes, start services in dependency order with TCP readiness polling, supervisor process with log relay
+- **`pelagos compose down [-f compose.rem] [-p project] [-v]`**: stop services in reverse topo order (SIGTERM → SIGKILL), remove networks/volumes/state
+- **`pelagos compose ps [-f compose.rem] [-p project]`**: list services with status
+- **`pelagos compose logs [-f compose.rem] [-p project] [--follow] [service]`**: view prefixed service logs
 - **S-expression format**: `(compose (network ...) (volume ...) (service ...))` — `;` comments, bare words, quoted strings, keyword args (`:ready-port`), nested lists
 - **Dependency management**: `(depends-on (db :ready-port 5432))` — topological sort (Kahn's), cycle detection, TCP readiness polling (250ms interval, 60s timeout)
 - **Scoped naming**: containers `{project}-{service}`, networks `{project}-{net}`, volumes `{project}-{vol}`; DNS uses bare service names for intra-project discovery
@@ -227,14 +227,14 @@ Remora is a modern, lightweight Linux container runtime written in Rust. It prov
 - **`src/cli/compose.rs`**: `ComposeCmd`, `cmd_compose()`, supervisor, TCP readiness, scoped naming
 
 **OCI Compliance (Phase 1 COMPLETE ✅):**
-- **`remora create <id> <bundle>`**: parse `config.json`, fork shim, block on `exec.sock` until `start`
-- **`remora start <id>`**: connect to `exec.sock`, send byte → container execs
-- **`remora state <id>`**: read `state.json`, check liveness via `kill(pid, 0)`, print JSON
-- **`remora kill <id> <sig>`**: send signal to container PID
-- **`remora delete <id>`**: remove `/run/remora/<id>/` after container is stopped
+- **`pelagos create <id> <bundle>`**: parse `config.json`, fork shim, block on `exec.sock` until `start`
+- **`pelagos start <id>`**: connect to `exec.sock`, send byte → container execs
+- **`pelagos state <id>`**: read `state.json`, check liveness via `kill(pid, 0)`, print JSON
+- **`pelagos kill <id> <sig>`**: send signal to container PID
+- **`pelagos delete <id>`**: remove `/run/pelagos/<id>/` after container is stopped
 - **`src/oci.rs`**: `OciConfig`, `OciState`, `build_command()`, all `cmd_*` functions
 - **Sync mechanism**: double-fork; grandchild pre_exec writes PID + blocks on `accept(exec.sock)`
-- **State persistence**: `/run/remora/<id>/state.json` (serde_json)
+- **State persistence**: `/run/pelagos/<id>/state.json` (serde_json)
 
 **Advanced:**
 - UID/GID mapping for user namespaces
@@ -259,21 +259,21 @@ src/
   pty.rs                  # PTY relay, TerminalGuard, InteractiveSession
   image.rs                # OCI image store: layer extraction, manifest persistence
   bin/
-    remora-dns.rs         # DNS daemon binary: UDP server, A-record resolution, upstream forwarding
+    pelagos-dns.rs         # DNS daemon binary: UDP server, A-record resolution, upstream forwarding
   cli/
     mod.rs                # Shared types: ContainerState, helpers, parsers
-    build.rs              # remora build — build images from Remfiles
-    compose.rs            # remora compose up/down/ps/logs — multi-service orchestration
-    exec.rs               # remora exec — run command in running container
-    run.rs                # remora run — build + launch containers
-    ps.rs                 # remora ps — list containers
-    stop.rs               # remora stop — SIGTERM a container
-    rm.rs                 # remora rm — remove a container
-    logs.rs               # remora logs [--follow] — view container output
-    network.rs            # remora network create/ls/rm/inspect
-    rootfs.rs             # remora rootfs import/ls/rm
-    volume.rs             # remora volume create/ls/rm
-    image.rs              # remora image pull/ls/rm — OCI registry pulls
+    build.rs              # pelagos build — build images from Remfiles
+    compose.rs            # pelagos compose up/down/ps/logs — multi-service orchestration
+    exec.rs               # pelagos exec — run command in running container
+    run.rs                # pelagos run — build + launch containers
+    ps.rs                 # pelagos ps — list containers
+    stop.rs               # pelagos stop — SIGTERM a container
+    rm.rs                 # pelagos rm — remove a container
+    logs.rs               # pelagos logs [--follow] — view container output
+    network.rs            # pelagos network create/ls/rm/inspect
+    rootfs.rs             # pelagos rootfs import/ls/rm
+    volume.rs             # pelagos volume create/ls/rm
+    image.rs              # pelagos image pull/ls/rm — OCI registry pulls
 
 tests/
   integration_tests.rs    # 84 integration tests (require root)
@@ -318,7 +318,7 @@ tar = "0.4"               # Tar extraction for OCI layers
 tempfile = "3"            # Temp files for layer downloads
 ```
 
-**Note:** The DNS service discovery feature (`remora-dns` daemon) requires no new dependencies — it uses only `std::net::UdpSocket` for the DNS server and existing `nix`/`libc` for signal handling.
+**Note:** The DNS service discovery feature (`pelagos-dns` daemon) requires no new dependencies — it uses only `std::net::UdpSocket` for the DNS server and existing `nix`/`libc` for signal handling.
 
 **Removed dependencies:**
 - ~~unshare~~ - Replaced with custom implementation using nix
@@ -328,7 +328,7 @@ tempfile = "3"            # Temp files for layer downloads
 
 ## Root Filesystem
 
-Remora requires an Alpine Linux rootfs to run containers.
+Pelagos requires an Alpine Linux rootfs to run containers.
 
 **Two build options:**
 
@@ -348,7 +348,7 @@ See `BUILD_ROOTFS.md` for detailed instructions.
 
 ### Basic Container
 ```rust
-use remora::container::{Command, Namespace, Stdio};
+use pelagos::container::{Command, Namespace, Stdio};
 
 let mut child = Command::new("/bin/sh")
     .with_chroot("/path/to/rootfs")
@@ -363,7 +363,7 @@ child.wait()?;
 
 ### Interactive Container (PTY)
 ```rust
-use remora::container::{Command, Namespace};
+use pelagos::container::{Command, Namespace};
 
 let session = Command::new("/bin/sh")
     .with_chroot("/path/to/rootfs")
@@ -479,7 +479,7 @@ The spawn process has a carefully orchestrated setup:
 - ✅ N3 NAT — `with_nat()`
 - ✅ N4 Port mapping — `with_port_forward(host_port, container_port)`
 - ✅ N5 DNS — `with_dns(&[...])`
-- ✅ N7 DNS service discovery — dual-backend (builtin `remora-dns` + dnsmasq), `--dns-backend` flag
+- ✅ N7 DNS service discovery — dual-backend (builtin `pelagos-dns` + dnsmasq), `--dns-backend` flag
 
 **Rootless Mode - Phase 2 (Pasta): COMPLETE ✅**
 - ✅ N6 Pasta — `with_network(NetworkMode::Pasta)` — rootless-compatible full internet via `pasta`
@@ -507,7 +507,7 @@ to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
 
 ## Comparison to Docker/runc
 
-| Feature | Remora | Docker |
+| Feature | Pelagos | Docker |
 |---------|--------|--------|
 | Namespaces | ✅ 6/7 | ✅ All |
 | Seccomp | ✅ Docker profile | ✅ |
@@ -521,10 +521,10 @@ to let PATH resolve them, or use the correct `/usr/bin/id` path. **Never assume
 | Networking | ✅ N1–N7 + multi-network containers (Loopback/Bridge/NAT/Ports/DNS/Pasta/Named/Multi-attach/DNS-SD) | ✅ Native libnetwork |
 | DNS service discovery | ✅ Dual-backend (builtin + dnsmasq) container name resolution | ✅ Embedded DNS server |
 | Rootless networking | ✅ pasta (full internet, no root) | ✅ |
-| OCI image pull | ✅ `remora image pull` (anonymous) | ✅ |
-| Image build | ✅ `remora build` (Remfile) | ✅ Dockerfile |
-| Container exec | ✅ `remora exec` (ns join + PTY) | ✅ |
-| Compose | ✅ `remora compose` (S-expression) | ✅ docker compose (YAML) |
+| OCI image pull | ✅ `pelagos image pull` (anonymous) | ✅ |
+| Image build | ✅ `pelagos build` (Remfile) | ✅ Dockerfile |
+| Container exec | ✅ `pelagos exec` (ns join + PTY) | ✅ |
+| Compose | ✅ `pelagos compose` (S-expression) | ✅ docker compose (YAML) |
 | OCI Compatible | 🔄 Partial | ✅ |
 
 **Current parity: ~80% of runc features**

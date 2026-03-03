@@ -29,16 +29,16 @@ fail() { echo -e "  ${RED}FAIL${NC} $*"; fail=$((fail + 1)); }
 
 cleanup() {
     log "Cleaning up..."
-    $REMORA stop proxy  2>/dev/null || true
-    $REMORA stop app    2>/dev/null || true
-    $REMORA stop redis  2>/dev/null || true
+    $PELAGOS stop proxy  2>/dev/null || true
+    $PELAGOS stop app    2>/dev/null || true
+    $PELAGOS stop redis  2>/dev/null || true
     sleep 1
-    $REMORA rm proxy    2>/dev/null || true
-    $REMORA rm app      2>/dev/null || true
-    $REMORA rm redis    2>/dev/null || true
-    $REMORA volume rm notes-data 2>/dev/null || true
-    $REMORA network rm frontend 2>/dev/null || true
-    $REMORA network rm backend  2>/dev/null || true
+    $PELAGOS rm proxy    2>/dev/null || true
+    $PELAGOS rm app      2>/dev/null || true
+    $PELAGOS rm redis    2>/dev/null || true
+    $PELAGOS volume rm notes-data 2>/dev/null || true
+    $PELAGOS network rm frontend 2>/dev/null || true
+    $PELAGOS network rm backend  2>/dev/null || true
     log "Done."
 }
 
@@ -51,27 +51,27 @@ log "Checking prerequisites..."
 command -v "$PELAGOS" >/dev/null 2>&1 || die "pelagos not found in PATH. Run: cargo build --release && export PATH=\$PWD/target/release:\$PATH"
 
 # Ensure alpine:latest is pulled
-if ! $REMORA image ls 2>/dev/null | grep -q "alpine:latest"; then
+if ! $PELAGOS image ls 2>/dev/null | grep -q "alpine:latest"; then
     log "Pulling alpine:latest..."
-    $REMORA image pull alpine:latest
+    $PELAGOS image pull alpine:latest
 fi
 
 # ── Build Phase ────────────────────────────────────────────────────────
 # pelagos build now enables NAT + DNS automatically for bridge RUN steps.
 
 log "Building ${BOLD}web-stack-redis${NC}..."
-$REMORA build -t web-stack-redis --network bridge "$SCRIPT_DIR/redis"
+$PELAGOS build -t web-stack-redis --network bridge "$SCRIPT_DIR/redis"
 
 log "Building ${BOLD}web-stack-app${NC}..."
-$REMORA build -t web-stack-app --network bridge "$SCRIPT_DIR/app"
+$PELAGOS build -t web-stack-app --network bridge "$SCRIPT_DIR/app"
 
 log "Building ${BOLD}web-stack-proxy${NC}..."
-$REMORA build -t web-stack-proxy --network bridge "$SCRIPT_DIR/proxy"
+$PELAGOS build -t web-stack-proxy --network bridge "$SCRIPT_DIR/proxy"
 
 # ── Create Volume ──────────────────────────────────────────────────────
 
 log "Creating volume ${BOLD}notes-data${NC}..."
-$REMORA volume create notes-data 2>/dev/null || true
+$PELAGOS volume create notes-data 2>/dev/null || true
 
 # ── Create Networks ───────────────────────────────────────────────────
 #
@@ -82,10 +82,10 @@ $REMORA volume create notes-data 2>/dev/null || true
 # Redis is isolated from proxy — they share no network.
 
 log "Creating ${BOLD}frontend${NC} network (10.88.1.0/24)..."
-$REMORA network create frontend --subnet 10.88.1.0/24 2>/dev/null || true
+$PELAGOS network create frontend --subnet 10.88.1.0/24 2>/dev/null || true
 
 log "Creating ${BOLD}backend${NC} network (10.88.2.0/24)..."
-$REMORA network create backend --subnet 10.88.2.0/24 2>/dev/null || true
+$PELAGOS network create backend --subnet 10.88.2.0/24 2>/dev/null || true
 
 # ── Launch Containers ──────────────────────────────────────────────────
 
@@ -94,10 +94,10 @@ trap cleanup EXIT
 start_container() {
     local name="$1"; shift
     log "Starting ${BOLD}${name}${NC}..."
-    $REMORA run -d --name "$name" "$@"
+    $PELAGOS run -d --name "$name" "$@"
     sleep 2
     # Verify container is still running.
-    if ! $REMORA ps 2>/dev/null | grep -q "$name"; then
+    if ! $PELAGOS ps 2>/dev/null | grep -q "$name"; then
         echo -e "  ${RED}Container '${name}' exited immediately!${NC}"
         echo "  stdout: $(cat /run/pelagos/containers/${name}/stdout.log 2>/dev/null || echo '<empty>')"
         echo "  stderr: $(cat /run/pelagos/containers/${name}/stderr.log 2>/dev/null || echo '<empty>')"
@@ -124,7 +124,7 @@ echo
 # Resolve the proxy container's bridge IP for direct access.
 # Port forwarding (localhost:8080) requires hairpin NAT which is not yet
 # implemented; for now we test via the bridge IP directly.
-PROXY_IP=$($REMORA ps 2>/dev/null | awk '/^proxy / {print $3}')
+PROXY_IP=$($PELAGOS ps 2>/dev/null | awk '/^proxy / {print $3}')
 PROXY_STATE="/run/pelagos/containers/proxy/state.json"
 if [ -f "$PROXY_STATE" ]; then
     PROXY_IP=$(python3 -c "import json; print(json.load(open('$PROXY_STATE')).get('bridge_ip',''))" 2>/dev/null || true)
@@ -196,7 +196,7 @@ if [ -f "$REDIS_STATE" ]; then
 fi
 if [ -n "$REDIS_IP" ]; then
     # Run a ping from proxy's network namespace — should fail
-    PROXY_NS=$($REMORA ps 2>/dev/null | awk '/^proxy / {print ""}')
+    PROXY_NS=$($PELAGOS ps 2>/dev/null | awk '/^proxy / {print ""}')
     # Use curl timeout to test TCP connectivity to redis port
     if $CURL "http://${REDIS_IP}:6379/" 2>/dev/null; then
         fail "Network isolation — proxy should NOT reach redis at ${REDIS_IP}:6379"
@@ -214,9 +214,9 @@ echo -e "${BOLD}Results: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}"
 
 if [ "$fail" -gt 0 ]; then
     echo -e "\n${YELLOW}Some tests failed. Check container logs:${NC}"
-    echo "  $REMORA logs redis"
-    echo "  $REMORA logs app"
-    echo "  $REMORA logs proxy"
+    echo "  $PELAGOS logs redis"
+    echo "  $PELAGOS logs app"
+    echo "  $PELAGOS logs proxy"
     # Keep containers running for debugging — cleanup runs on exit
     echo -e "\nPress Enter to clean up and exit..."
     read -r

@@ -44,18 +44,18 @@ command -v "$PELAGOS" >/dev/null 2>&1 || \
 # ── Build Phase ───────────────────────────────────────────────────
 
 if [ "$BUILD_STACK" -eq 1 ]; then
-    if ! $REMORA image ls 2>/dev/null | grep -q "alpine:latest"; then
+    if ! $PELAGOS image ls 2>/dev/null | grep -q "alpine:latest"; then
         log "Pulling alpine:latest..."
-        $REMORA image pull alpine:latest
+        $PELAGOS image pull alpine:latest
     fi
 
     for svc in redis jupyterlab; do
         tag="jupyter-${svc}:latest"
-        if $REMORA image ls 2>/dev/null | grep -q "$tag"; then
+        if $PELAGOS image ls 2>/dev/null | grep -q "$tag"; then
             log "Image ${BOLD}${tag}${NC} already built"
         else
             log "Building ${BOLD}${tag}${NC}..."
-            $REMORA build -t "jupyter-${svc}" --network bridge "$SCRIPT_DIR/${svc}"
+            $PELAGOS build -t "jupyter-${svc}" --network bridge "$SCRIPT_DIR/${svc}"
         fi
     done
 fi
@@ -64,12 +64,12 @@ fi
 
 log "Starting Jupyter stack (port ${BOLD}${JUPYTER_PORT}${NC})..."
 JUPYTER_PORT="$JUPYTER_PORT" \
-    $REMORA compose up -f "$SCRIPT_DIR/compose.reml" -p jupyter --foreground &
+    $PELAGOS compose up -f "$SCRIPT_DIR/compose.reml" -p jupyter --foreground &
 COMPOSE_PID=$!
 
 cleanup() {
     log "Tearing down..."
-    $REMORA compose down -f "$SCRIPT_DIR/compose.reml" -p jupyter -v 2>/dev/null || true
+    $PELAGOS compose down -f "$SCRIPT_DIR/compose.reml" -p jupyter -v 2>/dev/null || true
     wait "$COMPOSE_PID" 2>/dev/null || true
     log "Done."
 }
@@ -128,7 +128,7 @@ fi
 # Test 5: Service status
 echo
 log "Service status:"
-$REMORA compose ps -f "$SCRIPT_DIR/compose.reml" -p jupyter
+$PELAGOS compose ps -f "$SCRIPT_DIR/compose.reml" -p jupyter
 
 # ── Summary ───────────────────────────────────────────────────────
 
@@ -137,11 +137,11 @@ echo -e "${BOLD}Results: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}"
 
 if [ "$fail" -gt 0 ]; then
     echo -e "\nCheck service logs:"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p jupyter redis"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p jupyter jupyterlab"
+    echo "  $PELAGOS compose logs -f $SCRIPT_DIR/compose.reml -p jupyter redis"
+    echo "  $PELAGOS compose logs -f $SCRIPT_DIR/compose.reml -p jupyter jupyterlab"
 fi
 
 echo -e "\n${CYAN}JupyterLab:${NC} http://localhost:${JUPYTER_PORT}/lab  (no token required)"
-echo -e "${CYAN}Logs:${NC}       $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p jupyter jupyterlab"
+echo -e "${CYAN}Logs:${NC}       $PELAGOS compose logs -f $SCRIPT_DIR/compose.reml -p jupyter jupyterlab"
 echo -e "\nPress Enter to tear down..."
 read -r

@@ -30,7 +30,7 @@ SCRIPT_DIR="examples/compose/web-stack"
 WEB_STACK_DIR="examples/web-stack"
 BLOG_PORT="${BLOG_PORT:-8080}"
 PROJECT="web-graph"
-PELAGOS="${REMORA:-}"
+PELAGOS="${PELAGOS:-}"
 
 CYAN='\033[0;36m'
 BOLD='\033[1m'

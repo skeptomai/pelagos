@@ -1,7 +1,7 @@
 # Compose Web Stack Example
 
 The same 3-container blog stack as `examples/web-stack/`, but orchestrated
-with `remora compose`. Two compose files are provided side by side:
+with `pelagos compose`. Two compose files are provided side by side:
 
 | File | Format | Features |
 |------|--------|---------|
@@ -58,7 +58,7 @@ The published host port is read from the environment at startup:
 
 ```bash
 # Run on a non-default port — no file edit required
-BLOG_PORT=9090 sudo remora compose up -f compose.reml -p blog
+BLOG_PORT=9090 sudo pelagos compose up -f compose.reml -p blog
 ```
 
 ### `on-ready` — observable tier transitions
@@ -81,7 +81,7 @@ the next tier is allowed to start.
 ## Running
 
 ```bash
-# Build remora first
+# Build pelagos first
 cargo build --release
 export PATH=$PWD/target/release:$PATH
 
@@ -91,10 +91,10 @@ sudo ./examples/compose/web-stack/run.sh
 
 The script:
 1. Pulls `alpine:latest` and builds the 3 images (from `examples/web-stack/` Remfiles)
-2. Runs `remora compose up -f compose.reml` in foreground
+2. Runs `pelagos compose up -f compose.reml` in foreground
 3. Waits for the stack to accept connections on port 8080
 4. Runs 5 verification tests (static page, health check, CRUD, persistence)
-5. Tears down with `remora compose down -v`
+5. Tears down with `pelagos compose down -v`
 
 ## Comparison
 

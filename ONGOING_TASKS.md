@@ -25,7 +25,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 - Integration tests: **190/190 pass**
 - E2E tests: **81 pass, 1 skipped**
 - OCI conformance (runtime-tools): **33 PASS / 4 FAIL** (4 are unfixable upstream bugs — #47, #48, #49)
-- **Published to crates.io as `pelagos v0.1.0`** (crate name; CLI binary remains `remora`)
+- **Published to crates.io as `pelagos v0.1.0`** (crate name; CLI binary remains `pelagos`)
 
 ## Session Notes
 

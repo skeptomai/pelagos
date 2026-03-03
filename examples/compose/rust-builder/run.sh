@@ -44,29 +44,29 @@ command -v "$PELAGOS" >/dev/null 2>&1 || \
 # ── Build Phase ───────────────────────────────────────────────────
 
 if [ "$BUILD_STACK" -eq 1 ]; then
-    if ! $REMORA image ls 2>/dev/null | grep -q "alpine:latest"; then
+    if ! $PELAGOS image ls 2>/dev/null | grep -q "alpine:latest"; then
         log "Pulling alpine:latest..."
-        $REMORA image pull alpine:latest
+        $PELAGOS image pull alpine:latest
     fi
 
     tag="rust-builder:latest"
-    if $REMORA image ls 2>/dev/null | grep -q "$tag"; then
+    if $PELAGOS image ls 2>/dev/null | grep -q "$tag"; then
         log "Image ${BOLD}${tag}${NC} already built"
     else
         log "Building ${BOLD}${tag}${NC} (this may take a few minutes)..."
-        $REMORA build -t rust-builder --network bridge "$SCRIPT_DIR/rust-builder"
+        $PELAGOS build -t rust-builder --network bridge "$SCRIPT_DIR/rust-builder"
     fi
 fi
 
 # ── Compose Up ────────────────────────────────────────────────────
 
 log "Starting rust-builder container..."
-$REMORA compose up -f "$SCRIPT_DIR/compose.reml" -p "$PROJECT" --foreground &
+$PELAGOS compose up -f "$SCRIPT_DIR/compose.reml" -p "$PROJECT" --foreground &
 COMPOSE_PID=$!
 
 cleanup() {
     log "Tearing down..."
-    $REMORA compose down -f "$SCRIPT_DIR/compose.reml" -p "$PROJECT" -v 2>/dev/null || true
+    $PELAGOS compose down -f "$SCRIPT_DIR/compose.reml" -p "$PROJECT" -v 2>/dev/null || true
     wait "$COMPOSE_PID" 2>/dev/null || true
     log "Done."
 }
@@ -75,7 +75,7 @@ trap cleanup EXIT
 # Wait for the container to appear in `pelagos ps`
 log "Waiting for container to start..."
 for i in $(seq 1 30); do
-    if $REMORA ps 2>/dev/null | grep -q "$CONTAINER"; then
+    if $PELAGOS ps 2>/dev/null | grep -q "$CONTAINER"; then
         break
     fi
     sleep 1
@@ -87,7 +87,7 @@ echo
 log "${BOLD}Running verification tests...${NC}"
 echo
 
-exec_in() { $REMORA exec "$CONTAINER" sh -c "$1" 2>/dev/null; }
+exec_in() { $PELAGOS exec "$CONTAINER" sh -c "$1" 2>/dev/null; }
 
 # Test 1: Rust compiler installed
 if RUSTC_VER=$(exec_in 'rustc --version' 2>/dev/null); then
@@ -161,7 +161,7 @@ fi
 # Test 8: Service status
 echo
 log "Service status:"
-$REMORA compose ps -f "$SCRIPT_DIR/compose.reml" -p "$PROJECT"
+$PELAGOS compose ps -f "$SCRIPT_DIR/compose.reml" -p "$PROJECT"
 
 # ── Summary ───────────────────────────────────────────────────────
 
@@ -170,13 +170,13 @@ echo -e "${BOLD}Results: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}"
 
 if [ "$fail" -gt 0 ]; then
     echo -e "\nCheck container logs:"
-    echo "  $REMORA compose logs -f $SCRIPT_DIR/compose.reml -p $PROJECT rust-builder"
+    echo "  $PELAGOS compose logs -f $SCRIPT_DIR/compose.reml -p $PROJECT rust-builder"
 fi
 
 echo
-echo -e "${CYAN}Interactive shell:${NC}  sudo $REMORA exec $CONTAINER /bin/sh"
-echo -e "${CYAN}Build a project:${NC}    sudo $REMORA exec $CONTAINER cargo build --release"
-echo -e "${CYAN}Cache stats:${NC}        sudo $REMORA exec $CONTAINER sccache --show-stats"
+echo -e "${CYAN}Interactive shell:${NC}  sudo $PELAGOS exec $CONTAINER /bin/sh"
+echo -e "${CYAN}Build a project:${NC}    sudo $PELAGOS exec $CONTAINER cargo build --release"
+echo -e "${CYAN}Cache stats:${NC}        sudo $PELAGOS exec $CONTAINER sccache --show-stats"
 echo
 echo "Press Enter to tear down..."
 read -r

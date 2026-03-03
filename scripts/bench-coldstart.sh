@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-REMORA="${REMORA:-$(dirname "$0")/../target/release/pelagos}"
+PELAGOS="${PELAGOS:-$(dirname "$0")/../target/release/pelagos}"
 RUNS="${RUNS:-20}"
 WARMUP="${WARMUP:-3}"
 COMPARE=0
@@ -43,23 +43,23 @@ if ! command -v hyperfine &>/dev/null; then
     exit 1
 fi
 
-if [[ ! -x "$REMORA" ]]; then
-    echo "error: pelagos binary not found at $REMORA"
+if [[ ! -x "$PELAGOS" ]]; then
+    echo "error: pelagos binary not found at $PELAGOS"
     echo "       build with: cargo build --release"
     exit 1
 fi
 
-PELAGOS_VERSION="$("$REMORA" --version 2>/dev/null || echo unknown)"
+PELAGOS_VERSION="$("$PELAGOS" --version 2>/dev/null || echo unknown)"
 KERNEL="$(uname -r)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "=== pelagos cold-start benchmark ==="
-echo "Binary:  $REMORA ($PELAGOS_VERSION)"
+echo "Binary:  $PELAGOS ($PELAGOS_VERSION)"
 echo "Kernel:  $KERNEL"
 echo "Runs:    $RUNS (warmup: $WARMUP)"
 echo ""
 
-CMDS=("$REMORA run --rm alpine /bin/true")
+CMDS=("$PELAGOS run --rm alpine /bin/true")
 LABELS=("pelagos")
 
 if [[ $COMPARE -eq 1 ]]; then

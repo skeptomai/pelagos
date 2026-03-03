@@ -20,8 +20,8 @@ so every rebuild after the first is faster — even across `compose down` / `com
 sudo ./examples/compose/rust-builder/run.sh
 
 # Or: start the container and shell into it manually
-sudo remora compose up -f examples/compose/rust-builder/compose.reml -p rust-builder
-sudo remora exec rust-builder-rust-builder /bin/sh
+sudo pelagos compose up -f examples/compose/rust-builder/compose.reml -p rust-builder
+sudo pelagos exec rust-builder-rust-builder /bin/sh
 
 # Inside the container:
 cd /workspace
@@ -39,7 +39,7 @@ sccache --show-stats
 | `define` | `rust-edition`, `mem-builder`, `cpu-builder` defined at the top |
 | `env` with fallback | `MEM` / `CPU` / `SCCACHE_BUCKET` from host env, with safe defaults |
 | `:volume name path` | Named volumes mount cargo registry and sccache into the container |
-| `:command` | `sleep infinity` keeps the container alive for `remora exec` |
+| `:command` | `sleep infinity` keeps the container alive for `pelagos exec` |
 | `:env ("KEY" . value)` | Dotted pair syntax; `rust-edition` variable is evaluated at call-site |
 | `define-service` | Flat keyword-style service definition via the stdlib macro |
 
@@ -49,10 +49,10 @@ Override without editing `compose.reml`:
 
 ```bash
 # More memory and CPU
-MEM=8g CPU=8.0 sudo remora compose up -f compose.reml -p rust-builder
+MEM=8g CPU=8.0 sudo pelagos compose up -f compose.reml -p rust-builder
 
 # Distributed S3 sccache backend
-SCCACHE_BUCKET=my-bucket sudo remora compose up -f compose.reml -p rust-builder
+SCCACHE_BUCKET=my-bucket sudo pelagos compose up -f compose.reml -p rust-builder
 ```
 
 ## Volumes
@@ -65,5 +65,5 @@ SCCACHE_BUCKET=my-bucket sudo remora compose up -f compose.reml -p rust-builder
 Remove volumes on teardown with:
 
 ```bash
-sudo remora compose down -f compose.reml -p rust-builder -v
+sudo pelagos compose down -f compose.reml -p rust-builder -v
 ```

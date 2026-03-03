@@ -1,6 +1,6 @@
 # Multi-Stage Build Example
 
-Demonstrates multi-stage builds, `ARG`, `.remignore`, and `COPY --from` with Remora.
+Demonstrates multi-stage builds, `ARG`, `.remignore`, and `COPY --from` with Pelagos.
 
 ## What This Shows
 
@@ -14,27 +14,27 @@ Demonstrates multi-stage builds, `ARG`, `.remignore`, and `COPY --from` with Rem
 
 ```bash
 # Pull the base image
-sudo remora image pull alpine
+sudo pelagos image pull alpine
 
 # Build the image
-sudo remora build -t hello-server:latest examples/multi-stage/
+sudo pelagos build -t hello-server:latest examples/multi-stage/
 
 # Run with port mapping
-sudo remora run --name hello -p 8080:8080 hello-server:latest
+sudo pelagos run --name hello -p 8080:8080 hello-server:latest
 
 # Test it
 curl http://localhost:8080
 # => {"hostname":"...","version":"0.1.0","timestamp":...}
 
 # Clean up
-sudo remora stop hello
-sudo remora rm hello
+sudo pelagos stop hello
+sudo pelagos rm hello
 ```
 
 ## Debug Build
 
 ```bash
-sudo remora build -t hello-server:debug --build-arg PROFILE=debug examples/multi-stage/
+sudo pelagos build -t hello-server:debug --build-arg PROFILE=debug examples/multi-stage/
 ```
 
 ## Image Size
