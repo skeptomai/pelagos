@@ -1,9 +1,9 @@
-# Remora Cold-Start Benchmark Results
+# Pelagos Cold-Start Benchmark Results
 
 Measurements from `scripts/bench-coldstart.sh` — `pelagos run --rm alpine /bin/true`.
 
 For comparison: crun ~153 ms, youki ~198 ms, runc ~352 ms (standard OCI bundle, different hardware).
-Remora's numbers reflect cached image layers; the dominant cost is namespace + cgroup setup.
+Pelagos's numbers reflect cached image layers; the dominant cost is namespace + cgroup setup.
 
 ---
 

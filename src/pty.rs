@@ -49,7 +49,7 @@ impl Drop for TerminalGuard {
 ///
 /// Call `run()` to start the relay loop, which blocks until the container exits.
 pub struct InteractiveSession {
-    /// PTY master fd — Remora reads/writes this to communicate with the container.
+    /// PTY master fd — Pelagos reads/writes this to communicate with the container.
     pub(crate) master: OwnedFd,
     /// The spawned container process.
     pub child: Child,

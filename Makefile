@@ -1,4 +1,4 @@
-# Remora test targets
+# Pelagos test targets
 #
 # Usage:
 #   make test-unit          # No root required

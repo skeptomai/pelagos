@@ -1,4 +1,4 @@
-//! Remora - A modern container runtime library for Linux.
+//! Pelagos - A modern container runtime library for Linux.
 //!
 //! This library provides tools for creating and managing lightweight containers
 //! using Linux namespaces.

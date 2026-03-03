@@ -454,7 +454,7 @@ run_ecr() {
 
 REGISTRIES="${PELAGOS_E2E_REGISTRIES:-ghcr-private ghcr-public dockerhub-private dockerhub-public ecr}"
 
-echo "=== Remora registry auth E2E ==="
+echo "=== Pelagos registry auth E2E ==="
 echo "  Binary     : $BINARY"
 echo "  Creds file : $CREDS_FILE ($([ -f "$CREDS_FILE" ] && echo 'loaded' || echo 'not found'))"
 echo "  Profiles   : $REGISTRIES"

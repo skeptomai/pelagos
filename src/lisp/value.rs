@@ -47,7 +47,7 @@ pub enum Value {
         env: Env,
     },
     Native(String, NativeFn),
-    // ── Remora domain values ──────────────────────────────────────────────
+    // ── Pelagos domain values ──────────────────────────────────────────────
     ServiceSpec(Box<crate::compose::ServiceSpec>),
     NetworkSpec(Box<crate::compose::NetworkSpec>),
     VolumeSpec(String),
@@ -343,7 +343,7 @@ impl fmt::Debug for Value {
 /// Convert a Lisp `Value` back to an `SExpr` for macro expansion.
 ///
 /// Only pure-data values can be serialised.  Procedural values (`Lambda`,
-/// `Macro`, `Native`) and Remora domain values (`ServiceSpec`, etc.) cannot
+/// `Macro`, `Native`) and Pelagos domain values (`ServiceSpec`, etc.) cannot
 /// appear in a macro expansion — return an error if they do.
 ///
 /// Note: `SExpr` has no numeric variants; numbers and booleans are stored as

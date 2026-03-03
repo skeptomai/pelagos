@@ -1,4 +1,4 @@
-"""Remora Blog API — a simple note-taking REST API backed by Redis."""
+"""Pelagos Blog API — a simple note-taking REST API backed by Redis."""
 
 import json
 import os

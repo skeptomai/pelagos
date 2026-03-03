@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remora Jupyter Stack Demo
+# Pelagos Jupyter Stack Demo
 # =========================
 # Builds JupyterLab + Redis images, starts the stack with
 # `pelagos compose up`, and runs smoke tests against the live lab.

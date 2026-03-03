@@ -1,4 +1,4 @@
-;;; Remora Lisp standard macros — embedded at compile time, evaluated at startup.
+;;; Pelagos Lisp standard macros — embedded at compile time, evaluated at startup.
 ;;;
 ;;; These macros are available in every .reml file without any import.
 

@@ -230,10 +230,10 @@ CURL="curl -s --max-time 5"
 BASE="http://127.0.0.1:$BLOG_PORT"
 
 BODY=$($CURL "$BASE/" 2>/dev/null || true)
-if echo "$BODY" | grep -q "Remora Blog"; then
-    ok "GET /  →  contains 'Remora Blog'"
+if echo "$BODY" | grep -q "Pelagos Blog"; then
+    ok "GET /  →  contains 'Pelagos Blog'"
 else
-    fail "GET /  →  expected 'Remora Blog'"
+    fail "GET /  →  expected 'Pelagos Blog'"
 fi
 
 BODY=$($CURL "$BASE/health" 2>/dev/null || true)

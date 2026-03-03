@@ -1,4 +1,4 @@
-//! Remora-specific Lisp builtins: `service`, `network`, `volume`, `compose`,
+//! Pelagos-specific Lisp builtins: `service`, `network`, `volume`, `compose`,
 //! `compose-up`, `on-ready`, `env`, `log`.
 //!
 //! `compose-up` stores the requested spec in `PendingCompose` so the CLI can
@@ -30,7 +30,7 @@ pub struct PendingCompose {
     pub foreground: bool,
 }
 
-/// Register all Remora builtins into `env`.
+/// Register all Pelagos builtins into `env`.
 ///
 /// Hooks registered by `(on-ready ...)` are accumulated into `hooks`.
 /// A `compose-up` call stores its spec in `pending`.

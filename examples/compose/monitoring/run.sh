@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remora Monitoring Stack Demo
+# Pelagos Monitoring Stack Demo
 # ============================
 # Builds Prometheus + Loki + Grafana images, starts the stack with
 # `pelagos compose up`, and runs smoke tests against the live services.

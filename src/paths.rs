@@ -1,4 +1,4 @@
-//! Centralised path resolution for all Remora filesystem locations.
+//! Centralised path resolution for all Pelagos filesystem locations.
 //!
 //! Root mode uses system directories (`/var/lib/pelagos/`, `/run/pelagos/`).
 //! Rootless mode uses per-user XDG directories (`~/.local/share/pelagos/`,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remora Rust Builder Stack Demo
+# Pelagos Rust Builder Stack Demo
 # ==============================
 # Builds a Rust build environment with sccache, starts the container with
 # `pelagos compose up`, and runs smoke tests via `pelagos exec`.

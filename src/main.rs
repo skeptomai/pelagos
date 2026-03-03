@@ -52,7 +52,7 @@ impl Display for OutputFormat {
 #[clap(
     author,
     version,
-    about = "Remora container runtime",
+    about = "Pelagos container runtime",
     long_about = None,
 )]
 struct Cli {

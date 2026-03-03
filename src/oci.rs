@@ -455,11 +455,11 @@ pub fn config_from_bundle(bundle: &Path) -> io::Result<OciConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// Capability name → Remora Capability flag
+// Capability name → Pelagos Capability flag
 // ---------------------------------------------------------------------------
 
 /// Convert an OCI capability name (e.g. "CAP_CHOWN") to the corresponding
-/// Remora `Capability` bitflag. Returns `None` for unknown names.
+/// Pelagos `Capability` bitflag. Returns `None` for unknown names.
 fn oci_cap_to_flag(name: &str) -> Option<crate::container::Capability> {
     use crate::container::Capability;
     // Strip optional "CAP_" prefix — OCI bundles may include it or omit it.
@@ -706,7 +706,7 @@ pub fn build_command(config: &OciConfig, bundle: &Path) -> io::Result<crate::con
     if let Some(caps) = process.and_then(|p| p.capabilities.as_ref()) {
         use crate::container::Capability;
         // The OCI bounding set defines which capabilities can be in the effective set.
-        // We use it (falling back to effective) as the "keep" set for Remora's
+        // We use it (falling back to effective) as the "keep" set for Pelagos's
         // with_capabilities() which drops everything not in the set.
         let source = if !caps.bounding.is_empty() {
             &caps.bounding

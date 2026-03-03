@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remora Web Stack Demo
+# Pelagos Web Stack Demo
 # =====================
 # Builds and runs a 3-container blog stack:
 #   nginx (reverse proxy) → bottle (Python API) → redis (data store)
@@ -140,10 +140,10 @@ BASE="http://${PROXY_IP}:80"
 
 # Test 1: Static page
 BODY=$($CURL "$BASE/" 2>/dev/null || true)
-if echo "$BODY" | grep -q "Remora Blog"; then
-    ok "GET / — contains 'Remora Blog'"
+if echo "$BODY" | grep -q "Pelagos Blog"; then
+    ok "GET / — contains 'Pelagos Blog'"
 else
-    fail "GET / — expected 'Remora Blog' in response"
+    fail "GET / — expected 'Pelagos Blog' in response"
     echo "       body: $(echo "$BODY" | head -3)"
 fi
 

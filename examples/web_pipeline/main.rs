@@ -154,7 +154,7 @@ fn main() {
 
     let rootfs_str = rootfs.to_str().unwrap();
 
-    println!("=== Remora Multi-Container Web Pipeline ===\n");
+    println!("=== Pelagos Multi-Container Web Pipeline ===\n");
     println!("Architecture:");
     println!("  store (httpd :9000) --> processor (httpd :8080) --> frontend (wget)\n");
 

@@ -2,7 +2,7 @@
 //!
 //! Entry points:
 //! - [`Interpreter::new`] — create a fully-initialised interpreter with all
-//!   standard and Remora builtins registered.
+//!   standard and Pelagos builtins registered.
 //! - [`Interpreter::eval_str`] — evaluate a string of Lisp source.
 //! - [`Interpreter::eval_file`] — read and evaluate a file.
 //! - [`Interpreter::take_pending`] — retrieve a `compose-up` invocation.
@@ -622,7 +622,7 @@ mod tests {
         assert!(e.contains("procedure") || e.contains("not a"), "got: {}", e);
     }
 
-    // ── Remora builtins ───────────────────────────────────────────────────
+    // ── Pelagos builtins ───────────────────────────────────────────────────
     #[test]
     fn test_service_builtin() {
         let mut i = interp();

@@ -551,7 +551,7 @@ pub struct KernelMount {
 }
 
 /// Overlay filesystem configuration — lower layer is `chroot_dir`; upper and work
-/// are user-supplied. The merged mount point is managed by Remora.
+/// are user-supplied. The merged mount point is managed by Pelagos.
 #[derive(Debug, Clone)]
 pub struct OverlayConfig {
     /// Writable layer — container writes land here; persists after container exit.
@@ -1520,7 +1520,7 @@ impl Command {
     /// `upper_dir` and `work_dir` must be on the same filesystem and must not
     /// themselves reside on an overlayfs mount.
     ///
-    /// The merged mount point is created by Remora at
+    /// The merged mount point is created by Pelagos at
     /// `/run/pelagos/overlay-{pid}-{n}/merged/` and removed after `wait()`.
     ///
     /// # Examples

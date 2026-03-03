@@ -139,7 +139,7 @@ fn main() {
         std::fs::create_dir_all(d).expect("create overlay dir");
     }
 
-    println!("=== Remora Full-Stack Smoke Test ===\n");
+    println!("=== Pelagos Full-Stack Smoke Test ===\n");
     println!("Features under test:");
     println!("  - Overlay filesystem (copy-on-write)");
     println!("  - Bridge networking (172.19.0.x/24)");

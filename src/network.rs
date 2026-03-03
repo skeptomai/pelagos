@@ -1382,7 +1382,7 @@ fn disable_port_forwards(ns_name: &str, net: &NetworkDef) {
 /// nftables DNAT rules in the PREROUTING chain handle traffic from external
 /// hosts, but traffic originating from localhost bypasses PREROUTING entirely
 /// (it goes through OUTPUT). Docker solves this with `docker-proxy` — a
-/// userspace relay. This is Remora's equivalent for both TCP and UDP.
+/// userspace relay. This is Pelagos's equivalent for both TCP and UDP.
 ///
 /// TCP uses a tokio multi-threaded runtime: all accept loops and relay tasks
 /// run as async tasks distributed across `min(available_parallelism, 4)` worker
