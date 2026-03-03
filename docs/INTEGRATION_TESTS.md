@@ -228,6 +228,39 @@ scoped to the declared subtrees, or `/tmp` is inadvertently inheriting access.
 
 ---
 
+## `SECCOMP_RET_USER_NOTIF` Supervisor Tests
+
+### `test_user_notif_handler_invoked`
+**Requires:** root, rootfs, Linux ≥ 5.0
+
+Installs a `with_seccomp_user_notif` handler that intercepts `SYS_getuid` and
+allows all calls while incrementing an `AtomicUsize` counter. Runs `/usr/bin/id -u`
+inside the container. Asserts: (1) the container exits successfully, (2) stdout
+contains `"0"` (uid 0 returned normally), and (3) the counter is ≥ 1. Failure
+indicates the user_notif filter was not installed, or the supervisor thread did not
+receive notifications, or `SyscallResponse::Allow` is not passing the syscall through.
+
+### `test_user_notif_deny_syscall`
+**Requires:** root, rootfs, Linux ≥ 5.0
+
+Installs a handler that intercepts `SYS_chmod` and responds with
+`SyscallResponse::Deny(EPERM)` for all invocations. Runs a container that creates
+`/tmp/x` and then calls `chmod 700 /tmp/x`, printing the exit code. Asserts output
+contains `"exit=1"` — the chmod call returns EPERM. Failure indicates the deny
+response is not being delivered to the container thread, or the wrong syscall number
+was intercepted.
+
+### `test_user_notif_allow_passthrough`
+**Requires:** root, rootfs, Linux ≥ 5.0
+
+Installs a counting handler that intercepts `SYS_chmod` and responds with
+`SyscallResponse::Allow` for all calls. Runs the same chmod sequence. Asserts:
+(1) output contains `"exit=0"` (chmod succeeded), and (2) the handler counter is
+≥ 1. Failure indicates the allow response is not continuing the syscall through the
+filter chain, or the supervisor was not invoked.
+
+---
+
 ## Phase 4: Filesystem Flexibility Tests
 
 ### `test_bind_mount_rw`

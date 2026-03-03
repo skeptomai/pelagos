@@ -1070,6 +1070,167 @@ mod security {
     }
 }
 
+mod user_notif {
+    use super::*;
+    use remora::notif::{SyscallHandler, SyscallNotif, SyscallResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Handler that counts invocations and always allows the syscall through.
+    struct CountingAllow {
+        count: Arc<AtomicUsize>,
+    }
+    impl SyscallHandler for CountingAllow {
+        fn handle(&self, _n: &SyscallNotif) -> SyscallResponse {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            SyscallResponse::Allow
+        }
+    }
+
+    /// Handler that always denies the intercepted syscall with EPERM.
+    struct DenyAll;
+    impl SyscallHandler for DenyAll {
+        fn handle(&self, _n: &SyscallNotif) -> SyscallResponse {
+            SyscallResponse::Deny(libc::EPERM)
+        }
+    }
+
+    #[test]
+    fn test_user_notif_handler_invoked() {
+        // Verify that the supervisor handler is actually called when the
+        // intercepted syscall fires.  Intercept SYS_getuid and allow it;
+        // run `id -u` which calls getuid() and should print "0".
+        if !is_root() {
+            eprintln!("Skipping test_user_notif_handler_invoked: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_user_notif_handler_invoked: alpine-rootfs not found");
+            return;
+        };
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let handler = CountingAllow {
+            count: count.clone(),
+        };
+
+        let mut child = Command::new("/usr/bin/id")
+            .args(["-u"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_seccomp_user_notif(vec![libc::SYS_getuid], handler)
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(
+            status.success(),
+            "id -u should succeed when getuid is allowed: stdout={}",
+            stdout
+        );
+        assert!(
+            stdout.trim() == "0",
+            "expected uid 0, got: {}",
+            stdout.trim()
+        );
+        assert!(
+            count.load(Ordering::Relaxed) >= 1,
+            "handler should have been called at least once for getuid"
+        );
+    }
+
+    #[test]
+    fn test_user_notif_deny_syscall() {
+        // Verify that Deny(EPERM) causes the intercepted syscall to fail.
+        // Intercept SYS_fchmodat (what Alpine's chmod uses) and deny it.
+        // The container creates a file then tries to chmod it; chmod should fail.
+        if !is_root() {
+            eprintln!("Skipping test_user_notif_deny_syscall: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_user_notif_deny_syscall: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "touch /tmp/x && chmod 700 /tmp/x; echo exit=$?"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_tmpfs("/tmp", "")
+            .with_seccomp_user_notif(vec![libc::SYS_chmod], DenyAll)
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(
+            stdout.contains("exit=1"),
+            "chmod should fail (EPERM) when fchmodat is denied by supervisor: stdout={}",
+            stdout
+        );
+    }
+
+    #[test]
+    fn test_user_notif_allow_passthrough() {
+        // Verify that Allow lets the syscall proceed normally.
+        // Intercept SYS_fchmodat and allow it; chmod should succeed.
+        if !is_root() {
+            eprintln!("Skipping test_user_notif_allow_passthrough: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_user_notif_allow_passthrough: alpine-rootfs not found");
+            return;
+        };
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let handler = CountingAllow {
+            count: count.clone(),
+        };
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "touch /tmp/x && chmod 700 /tmp/x; echo exit=$?"])
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_namespaces(Namespace::UTS | Namespace::MOUNT)
+            .with_proc_mount()
+            .with_tmpfs("/tmp", "")
+            .with_seccomp_user_notif(vec![libc::SYS_chmod], handler)
+            .spawn()
+            .expect("spawn failed");
+
+        let (_status, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+        assert!(
+            stdout.contains("exit=0"),
+            "chmod should succeed when fchmodat is allowed by supervisor: stdout={}",
+            stdout
+        );
+        assert!(
+            count.load(Ordering::Relaxed) >= 1,
+            "handler should have been called at least once for fchmodat"
+        );
+    }
+}
+
 mod filesystem {
     use super::*;
 
@@ -10789,7 +10950,7 @@ fn test_hardening_combination() {
     // Run a command that dumps the relevant /proc/self/status fields and the
     // hostname, then exits.  The output is captured via Stdio::Piped.
     let mut child = Command::new("/bin/sh")
-        .args(&[
+        .args([
             "-c",
             "grep -E '^(Seccomp|CapEff|NoNewPrivs|NSpid):' /proc/self/status; \
              echo HOSTNAME=$(hostname)",

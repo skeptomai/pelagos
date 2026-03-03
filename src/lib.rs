@@ -14,6 +14,7 @@ pub mod image;
 pub mod landlock;
 pub mod lisp;
 pub mod network;
+pub mod notif;
 pub mod oci;
 pub mod paths;
 pub mod pty;

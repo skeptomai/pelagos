@@ -741,6 +741,10 @@ pub struct Command {
     umask: Option<u32>,
     // Landlock filesystem access rules applied in pre_exec before seccomp.
     landlock_rules: Vec<crate::landlock::LandlockRule>,
+    // Syscall numbers to intercept with SECCOMP_RET_USER_NOTIF.
+    user_notif_syscalls: Vec<i64>,
+    // Handler invoked by the supervisor thread for each intercepted syscall.
+    user_notif_handler: Option<std::sync::Arc<dyn crate::notif::SyscallHandler>>,
 }
 
 impl Command {
@@ -795,6 +799,8 @@ impl Command {
             additional_gids: Vec::new(),
             umask: None,
             landlock_rules: Vec::new(),
+            user_notif_syscalls: Vec::new(),
+            user_notif_handler: None,
         }
     }
 
@@ -1732,6 +1738,48 @@ impl Command {
         self
     }
 
+    /// Intercept specific syscalls via `SECCOMP_RET_USER_NOTIF` (Linux ≥ 5.0).
+    ///
+    /// For each syscall number in `syscalls`, the container thread is suspended
+    /// mid-call and a notification is delivered to a supervisor thread in the
+    /// parent process.  The `handler` is called with the syscall details and
+    /// must return [`crate::notif::SyscallResponse::Allow`],
+    /// [`crate::notif::SyscallResponse::Deny`], or
+    /// [`crate::notif::SyscallResponse::Return`].
+    ///
+    /// The user-notif filter is layered **on top of** any regular seccomp profile
+    /// (`with_seccomp_default()` etc.) — it intercepts listed syscalls before the
+    /// regular filter gets a chance to block them.
+    ///
+    /// Requires Linux ≥ 5.0 and either `CAP_SYS_ADMIN` or `no_new_privs`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use remora::notif::{SyscallHandler, SyscallNotif, SyscallResponse};
+    ///
+    /// struct DenyConnect;
+    /// impl SyscallHandler for DenyConnect {
+    ///     fn handle(&self, _: &SyscallNotif) -> SyscallResponse {
+    ///         SyscallResponse::Deny(libc::EPERM)
+    ///     }
+    /// }
+    ///
+    /// Command::new("/bin/server")
+    ///     .with_seccomp_default()
+    ///     .with_seccomp_user_notif(vec![libc::SYS_connect], DenyConnect)
+    ///     .spawn()?;
+    /// ```
+    pub fn with_seccomp_user_notif(
+        mut self,
+        syscalls: Vec<i64>,
+        handler: impl crate::notif::SyscallHandler,
+    ) -> Self {
+        self.user_notif_syscalls = syscalls;
+        self.user_notif_handler = Some(std::sync::Arc::new(handler));
+        self
+    }
+
     /// Make the root filesystem read-only.
     ///
     /// This prevents the container from modifying the filesystem, enforcing
@@ -2479,6 +2527,26 @@ impl Command {
             } else {
                 (-1, -1, -1, -1)
             };
+
+        // Pre-compile user_notif BPF filter and create socketpair for fd transfer.
+        // Done in parent (pre-fork) because BPF compilation requires allocation.
+        let user_notif_handler = self.user_notif_handler.take();
+        let (user_notif_bpf, notif_parent_sock, notif_child_sock): (
+            Vec<libc::sock_filter>,
+            i32,
+            i32,
+        ) = if user_notif_handler.is_some() && !self.user_notif_syscalls.is_empty() {
+            let bpf = crate::notif::build_user_notif_bpf(&self.user_notif_syscalls);
+            let mut sv = [-1i32; 2];
+            if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) }
+                != 0
+            {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            (bpf, sv[0], sv[1])
+        } else {
+            (Vec::new(), -1, -1)
+        };
 
         // Install our combined pre_exec hook
         unsafe {
@@ -3553,6 +3621,19 @@ impl Command {
                     }
                 }
 
+                // Step 4.850: Install user_notif filter (NNP=false path).
+                //
+                // Installed AFTER the regular filter so the kernel evaluates it FIRST
+                // (LIFO filter chain).  Returns a notification fd which is sent to the
+                // parent supervisor thread via SCM_RIGHTS.  Requires CAP_SYS_ADMIN
+                // (still held here since caps are dropped at step 4.86).
+                if !no_new_privileges && !user_notif_bpf.is_empty() {
+                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf)?;
+                    crate::notif::send_notif_fd(notif_child_sock, notif_fd)?;
+                    libc::close(notif_fd);
+                    libc::close(notif_child_sock);
+                }
+
                 // Step 4.86: Drop capabilities.
                 //
                 // MUST come after all mount operations (masked paths, readonly
@@ -3702,6 +3783,17 @@ impl Command {
                     if let Some(ref filter) = seccomp_filter {
                         crate::seccomp::apply_filter(filter)?;
                     }
+                }
+
+                // Step 7.1: Install user_notif filter (NNP=true path).
+                //
+                // NNP was set at step 6.5, so CAP_SYS_ADMIN is no longer required.
+                // Installed after regular seccomp (LIFO → evaluated first by kernel).
+                if no_new_privileges && !user_notif_bpf.is_empty() {
+                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf)?;
+                    crate::notif::send_notif_fd(notif_child_sock, notif_fd)?;
+                    libc::close(notif_fd);
+                    libc::close(notif_child_sock);
                 }
 
                 // Step 8: OCI create/start synchronization.
@@ -3911,6 +4003,33 @@ impl Command {
             None
         };
 
+        // Receive the user_notif fd from the child and start the supervisor thread.
+        // The child sent it via SCM_RIGHTS in pre_exec; we block here briefly until it
+        // arrives (pre_exec runs immediately after fork, so the wait is negligible).
+        let supervisor_thread: Option<std::thread::JoinHandle<()>> =
+            if let Some(handler) = user_notif_handler {
+                unsafe { libc::close(notif_child_sock) }; // parent doesn't use the child end
+                match crate::notif::recv_notif_fd(notif_parent_sock) {
+                    Ok(notif_fd) => {
+                        unsafe { libc::close(notif_parent_sock) };
+                        Some(std::thread::spawn(move || {
+                            crate::notif::run_supervisor_loop(notif_fd, handler);
+                            unsafe { libc::close(notif_fd) };
+                        }))
+                    }
+                    Err(e) => {
+                        log::warn!("failed to receive user_notif fd: {}", e);
+                        unsafe { libc::close(notif_parent_sock) };
+                        None
+                    }
+                }
+            } else {
+                if notif_parent_sock >= 0 {
+                    unsafe { libc::close(notif_parent_sock) };
+                }
+                None
+            };
+
         Ok(Child {
             inner: child_inner,
             cgroup,
@@ -3922,6 +4041,7 @@ impl Command {
             hosts_temp_dir,
             fuse_overlay_child,
             fuse_overlay_merged,
+            supervisor_thread,
         })
     }
 
@@ -4407,6 +4527,25 @@ impl Command {
             } else {
                 (-1, -1, -1, -1)
             };
+
+        // Pre-compile user_notif BPF filter and create socketpair for fd transfer.
+        let user_notif_handler_i = self.user_notif_handler.take();
+        let (user_notif_bpf_i, notif_parent_sock_i, notif_child_sock_i): (
+            Vec<libc::sock_filter>,
+            i32,
+            i32,
+        ) = if user_notif_handler_i.is_some() && !self.user_notif_syscalls.is_empty() {
+            let bpf = crate::notif::build_user_notif_bpf(&self.user_notif_syscalls);
+            let mut sv = [-1i32; 2];
+            if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) }
+                != 0
+            {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            (bpf, sv[0], sv[1])
+        } else {
+            (Vec::new(), -1, -1)
+        };
 
         unsafe {
             self.inner.pre_exec(move || {
@@ -5310,6 +5449,14 @@ impl Command {
                     }
                 }
 
+                // Install user_notif filter (NNP=false path, mirrors spawn() step 4.850).
+                if !no_new_privileges && !user_notif_bpf_i.is_empty() {
+                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf_i)?;
+                    crate::notif::send_notif_fd(notif_child_sock_i, notif_fd)?;
+                    libc::close(notif_fd);
+                    libc::close(notif_child_sock_i);
+                }
+
                 // Drop capabilities after all mount operations.
                 // Same logic as step 4.86 in the chroot path.
                 if let Some(keep_caps) = capabilities {
@@ -5447,6 +5594,14 @@ impl Command {
                     if let Some(ref filter) = seccomp_filter {
                         crate::seccomp::apply_filter(filter)?;
                     }
+                }
+
+                // Install user_notif filter (NNP=true path, mirrors spawn() step 7.1).
+                if no_new_privileges && !user_notif_bpf_i.is_empty() {
+                    let notif_fd = crate::notif::install_user_notif_filter(&user_notif_bpf_i)?;
+                    crate::notif::send_notif_fd(notif_child_sock_i, notif_fd)?;
+                    libc::close(notif_fd);
+                    libc::close(notif_child_sock_i);
                 }
 
                 // Step 8: OCI sync (same as spawn()).
@@ -5633,6 +5788,31 @@ impl Command {
             None
         };
 
+        // Receive the user_notif fd and start the supervisor thread.
+        let supervisor_thread: Option<std::thread::JoinHandle<()>> =
+            if let Some(handler) = user_notif_handler_i {
+                unsafe { libc::close(notif_child_sock_i) };
+                match crate::notif::recv_notif_fd(notif_parent_sock_i) {
+                    Ok(notif_fd) => {
+                        unsafe { libc::close(notif_parent_sock_i) };
+                        Some(std::thread::spawn(move || {
+                            crate::notif::run_supervisor_loop(notif_fd, handler);
+                            unsafe { libc::close(notif_fd) };
+                        }))
+                    }
+                    Err(e) => {
+                        log::warn!("failed to receive user_notif fd (interactive): {}", e);
+                        unsafe { libc::close(notif_parent_sock_i) };
+                        None
+                    }
+                }
+            } else {
+                if notif_parent_sock_i >= 0 {
+                    unsafe { libc::close(notif_parent_sock_i) };
+                }
+                None
+            };
+
         Ok(crate::pty::InteractiveSession {
             master,
             child: Child {
@@ -5646,6 +5826,7 @@ impl Command {
                 hosts_temp_dir,
                 fuse_overlay_child,
                 fuse_overlay_merged,
+                supervisor_thread,
             },
         })
     }
@@ -5699,6 +5880,9 @@ pub struct Child {
     /// Merged dir path for fuse-overlayfs unmount (needed because overlay_merged_dir is the
     /// parent's "merged" subdir, and we need the exact path for fusermount3).
     fuse_overlay_merged: Option<PathBuf>,
+    /// Supervisor thread for SECCOMP_RET_USER_NOTIF interception (if configured).
+    /// Joined when the child exits.
+    supervisor_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Child {
@@ -5924,6 +6108,11 @@ impl Child {
         }
         if let Some(ref dir) = self.hosts_temp_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
+        }
+        // Join the user_notif supervisor thread (it exits when the notif_fd is closed,
+        // which happens when the child process exits and the kernel drops the fd).
+        if let Some(thread) = self.supervisor_thread.take() {
+            let _ = thread.join();
         }
     }
 }
