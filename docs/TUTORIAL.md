@@ -83,22 +83,55 @@ pelagos build -t myserver:latest myapp/
 sudo pelagos run myserver:latest
 ```
 
-**Multi-stage build** — keep your images lean:
+**Multi-stage build** — keep your images lean.
 
+This is a separate example — create a new directory for it:
+
+```
+mygoapp/
+  main.go
+  Remfile
+```
+
+`main.go`:
+```go
+package main
+
+import (
+    "fmt"
+    "os"
+)
+
+func main() {
+    host, _ := os.Hostname()
+    fmt.Printf("Hello from Go! PID=%d Host=%s\n", os.Getpid(), host)
+}
+```
+
+`Remfile`:
 ```dockerfile
 FROM alpine AS builder
 RUN apk add --no-cache go
 COPY . /src
 WORKDIR /src
-RUN go build -o /app .
+RUN go mod init mygoapp && CGO_ENABLED=0 go build -o /app .
 
 FROM alpine
 COPY --from=builder /app /app
 CMD ["/app"]
 ```
 
-Pelagos handles the two-stage dance: builder's `/app` is copied into the
-final image without Go or the build cache.
+`apk add go` needs internet access, so pass `--network bridge`:
+
+```bash
+pelagos build --network bridge -t mygoapp:latest mygoapp/
+sudo pelagos run mygoapp:latest
+# Hello from Go! PID=1  Host=pelagos-12
+```
+
+Pelagos handles the two-stage dance: builder's `/app` (a static binary,
+`CGO_ENABLED=0`) is copied into the final image. Go, the build cache, and
+all intermediate files stay in the builder stage and never reach the output.
 
 ---
 
