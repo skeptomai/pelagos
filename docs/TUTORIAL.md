@@ -157,9 +157,17 @@ sudo pelagos run --memory 67108864 alpine /bin/sh -c \
 **Capabilities — drop everything, keep nothing:**
 
 ```bash
-sudo pelagos run --cap-drop ALL alpine /bin/sh -c "id && ip link"
-# uid=0 but ip link fails — no CAP_NET_ADMIN
+sudo pelagos run --network loopback --cap-drop ALL alpine /bin/sh -c \
+  "id && ip link set lo mtu 1280 2>&1 || echo 'ip link set: denied'"
+# uid=0(root) gid=0(root) groups=0(root)
+# ip: ioctl 0x8922 failed: Operation not permitted
+# ip link set: denied
 ```
+
+Two things to notice: `--network loopback` gives the container its own network
+namespace (without it the container sees all host interfaces). `ip link` alone
+(read-only listing) never requires any capability — you must attempt a *mutating*
+operation like setting the MTU to prove `CAP_NET_ADMIN` is gone.
 
 **Seccomp — Docker's default profile out of the box:**
 
