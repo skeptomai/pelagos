@@ -15,85 +15,111 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #62 | feat: minimal --features build for embedded/IoT | feat/low-pri |
 | #63 | feat(mac): AppArmor profile template (sub of #51) | feat |
 | #64 | feat(mac): SELinux process label support (sub of #51) | feat |
+| #67 | epic: deeper Wasm/WASI support | epic |
+| #69 | fix: integration test suite hangs locally (DNS tests) | bug/ACTIVE |
 
-## Current Baseline (2026-03-03, SHA b151b02)
+## Current Baseline (2026-03-03, SHA df18ca1)
 
-- Unit tests: **286/286 pass**
-- Integration tests: **198/198 pass**, 8 ignored (require external registries)
-- E2E tests (BATS): **12/12 pass**
-- OCI conformance (runtime-tools): **33 PASS / 4 FAIL** (failures are unfixable upstream bugs — #47, #48, #49)
-- **Published to crates.io as `pelagos v0.1.3`**
-- GitHub Release v0.1.3: static musl binaries for x86_64 and aarch64
+- Unit tests: **290/290 pass** (4 new wasm regression tests added this session)
+- Integration tests: should be ~202 but **suite hangs locally** in `dns::` module — see #69
+- CI (GitHub Actions): **all 5 jobs pass** (lint, unit-tests, integration-tests, e2e-tests, wasm-e2e-tests)
+- E2E tests: **7 Wasm e2e tests pass** (`scripts/test-wasm-e2e.sh`)
 
 ## Completed This Session (2026-03-03)
 
-**Wasm/WASI runtime support (epic #56, sub-issues #57, #58, #59)**
+**Wasm/WASI follow-on work (issues #65, #66, #68)**
 
-All three sub-issues implemented, tested, and merged to `main` in commit b151b02.
+### #65 — Wasm e2e test script + host→guest dir mapping bug fix
 
-### #57 — Binary detection + runtime dispatch (src/wasm.rs)
+- Fixed `WasiConfig.preopened_dirs`: changed from `Vec<PathBuf>` (identity-only)
+  to `Vec<(PathBuf, PathBuf)>` (host, guest pairs)
+- Updated `build_wasmtime_cmd`: `--dir host::guest` (double colon)
+- Updated `build_wasmedge_cmd`: `--dir host:guest` (single colon)
+- Added `with_wasi_preopened_dir_mapped(host, guest)` builder on `Command`
+- Fixed `src/cli/run.rs` fast-path to use mapped version for `--bind`
+- Fixed `src/bin/pelagos-shim-wasm.rs` rootfs identity tuple
+- Created `scripts/test-wasm-e2e.sh` — 7 tests covering: image ls TYPE column,
+  run basic output, env passthrough, --bind dir mapping, magic bytes
+- Added 4 unit regression tests in `src/wasm.rs`:
+  `test_wasmtime_cmd_identity_dir_mapping`, `test_wasmtime_cmd_mapped_dir`
+  (regression guard — asserts identity form NOT produced), `test_wasmedge_cmd_mapped_dir`,
+  `test_wasmtime_cmd_env_vars`
 
-New module `src/wasm.rs` providing the Wasm layer:
+### #66 — CI integration for e2e tests
 
-- `is_wasm_binary(path)` — reads 4-byte magic (`\0asm`); returns `Ok(false)` for
-  missing/too-short files, never errors on absent file
-- `WasmRuntime` enum — `Wasmtime | WasmEdge | Auto` (default)
-- `WasiConfig` struct — `{ runtime, env: Vec<(String,String)>, preopened_dirs: Vec<PathBuf> }`
-- `find_wasm_runtime(preferred)` — PATH search, preference order configurable
-- `spawn_wasm()` — dispatches to wasmtime or wasmedge subprocess
-- `build_wasmtime_cmd()` — wasmtime 14+ `--dir host::guest` identity-mapping syntax
-- `build_wasmedge_cmd()` — wasmedge `--dir` / `--env` syntax
+- Added `e2e-tests` job to `.github/workflows/ci.yml` (nftables, iproute2, passt,
+  rootfs build, reset, then `scripts/test-e2e.sh`)
+- Added `wasm-e2e-tests` job (wasm32-wasip1 target, wasmtime install, `scripts/test-wasm-e2e.sh`)
+- All 5 CI jobs green on first push
 
-`Command` struct in `container.rs` gained three builder methods:
-`with_wasm_runtime()`, `with_wasi_env()`, `with_wasi_preopened_dir()`.
-`spawn()` auto-detects Wasm (magic bytes or explicit config) and calls
-`spawn_wasm_impl()` instead of the Linux fork/namespace path.
-`Stdio` enum gained `Copy + Clone + PartialEq + Eq` to allow caching by value.
+### #68 — `pelagos build` Wasm target (P5-option-B)
 
-### #58 — OCI Wasm artifact support (src/image.rs, src/cli/image.rs, src/cli/run.rs)
+- `FROM scratch` support in `execute_stage()`: starts with empty layers + default
+  `ImageConfig` instead of pulling a base image
+- `detect_wasm_layers(layers)`: post-build scan of each layer dir; if a layer
+  contains exactly one `.wasm` file with valid magic bytes, renames it to
+  `module.wasm` and records `"application/wasm"` as the layer media type
+- Helper functions: `find_sole_wasm_file()`, `collect_layer_files()`
+- Used in `execute_build()`: `layer_types: detect_wasm_layers(&layers)`
+- 4 new integration tests in `wasm_build_tests` module:
+  `test_build_wasm_from_scratch_detects_mediatype`,
+  `test_build_wasm_second_layer_only`,
+  `test_build_non_wasm_layer_not_detected`,
+  `test_build_elf_with_wasm_extension_not_detected`
+- CI: all 5 jobs pass (SHA df18ca1)
 
-- `WASM_LAYER_MEDIA_TYPES` constant — three recognised Wasm OCI media types
-- `is_wasm_media_type()` — predicate on media type string
-- `ImageManifest.layer_types: Vec<String>` — new `#[serde(default)]` field;
-  backward-compatible with existing manifests on disk
-- `ImageManifest::is_wasm_image()` — true if any layer has a Wasm media type
-- `ImageManifest::wasm_module_path()` — path to the extracted `module.wasm` blob
-- `extract_wasm_layer()` — copies OCI blob as `<layer_dir>/module.wasm`
-  (no decompression needed; Wasm layers are raw blobs)
-- `cmd_image_ls()` — TYPE column now shows "wasm" or "linux"
-- `build_image_run()` — fast-path for Wasm images; skips overlayfs, calls
-  `spawn_wasm()` directly with preopened dirs from bind-mounts and env from image config
+Also: `docs/WASM_SUPPORT.md` created — three-layer architecture, CLI examples,
+comparison table vs runc/runwasi/Spin, limitations, roadmap pointing to epic #67.
 
-### #59 — containerd-shim-wasm (src/bin/pelagos-shim-wasm.rs)
+## Active Bug: Integration Test Suite Hangs (#69)
 
-New binary `containerd-shim-pelagos-wasm-v1` implementing the containerd shim v2
-protocol (ttrpc) via the `containerd-shim = "0.10"` crate:
+**Symptom:** Running the full integration test suite locally hangs indefinitely
+in the `dns::` module. The CI integration-tests job runs in 90s fine (different
+environment — GitHub Actions Ubuntu, no leftover network state).
 
-- Registers as `io.containerd.pelagos.wasm.v1`
-- `WasmState` — bundle path, spawned child, exit code
-- `WasmShim` — implements `shim::Shim` + `shim::Task`
-- Lifecycle: `create` records bundle, `start` calls `spawn_wasm()`, `state`
-  polls liveness, `kill` forwards signal via nix, `wait` blocks on child,
-  `delete` cleans up, `shutdown` signals shim exit
-- `parse_oci_config()` — extracts wasm path, argv, and WASI env from OCI
-  `config.json`
+**Diagnosis so far (2026-03-03):**
+- Confirmed via binary search: `dns::` module is the culprit
+- `dns::test_dns_daemon_lifecycle` — **passes individually** (~0s)
+- `dns::test_dns_dnsmasq_lifecycle` — **skipped** (dnsmasq not installed locally)
+- Remaining 6 DNS tests not yet individually confirmed before reboot
 
-Install (or symlink) as `containerd-shim-pelagos-wasm-v1` in PATH and add to
-containerd config:
-```toml
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.wasm]
-  runtime_type = "io.containerd.pelagos.wasm.v1"
-```
+**Root cause hypothesis:** An orphaned `pelagos-dns` process or a network
+namespace left over from a previous test run is blocking a subsequent test.
+The `reset-test-env.sh` script was also failing with exit 144 during this
+session, suggesting the local environment was in a bad state.
 
-### Tests
+**Plan after reboot:**
+1. Run `sudo scripts/reset-test-env.sh` (should work cleanly post-reboot)
+2. Run each DNS test individually with `timeout 30` to find the one that hangs:
+   ```bash
+   CARGO="$(rustup which cargo)"
+   for t in dns::test_dns_multi_network dns::test_dns_network_isolation \
+             dns::test_dns_resolves_container_name dns::test_dns_upstream_forward; do
+     echo -n "$t ... "
+     sudo env RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo PATH=$HOME/.cargo/bin:$PATH \
+       timeout 30 "$CARGO" test --test integration_tests "$t" -- --test-threads=1 2>&1 | tail -1
+     sudo killall pelagos-dns 2>/dev/null || true
+   done
+   ```
+3. Read the hanging test's implementation and fix: likely missing timeout on
+   DNS daemon wait, or blocking `wait()` with no cleanup path
+4. After fix, run full suite to confirm it completes
 
-8 new unit tests in `src/wasm.rs` (magic bytes, media types, PATH search).
-8 new integration tests in `tests/integration_tests.rs` (wasm_tests module).
-All documented in `docs/INTEGRATION_TESTS.md`.
+## Wasm Epic #67 — Sub-issues
 
-## Pending / Next Steps
+| # | Title | Priority |
+|---|-------|----------|
+| P2 | WASI preview 2 socket passthrough | Medium |
+| P3 | Wasm Component Model execution | Low (needs embedded crate) |
+| P4 | Persistent Wasm VM pool | Low |
+| P5 | `pelagos build` Wasm target | **DONE** (#68) |
 
-Suggested starting points:
+P1 (Mixed Linux+Wasm compose validation) dropped — needs P2 (sockets) first to
+be meaningful.
+
+## Suggested Next Steps (after DNS fix)
+
+- Fix #69 (DNS hang) — must do first; full integration suite must pass locally
 - #52 (AppArmor/SELinux) — highest real-world security impact
 - #60 (io_uring seccomp profile) — useful complement to existing seccomp work
 - #61 (CRIU) — complex but differentiating checkpoint/restore feature
