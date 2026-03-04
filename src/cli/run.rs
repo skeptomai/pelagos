@@ -293,10 +293,10 @@ fn build_image_run(
             }
         }
 
-        // Bind-mount requested dirs become WASI preopened dirs.
+        // Bind-mount requested dirs become WASI preopened dirs (host→guest mapping).
         for bind_str in &args.bind {
-            if let Some((host, _)) = bind_str.split_once(':') {
-                cmd = cmd.with_wasi_preopened_dir(host);
+            if let Some((host, guest)) = bind_str.split_once(':') {
+                cmd = cmd.with_wasi_preopened_dir_mapped(host, guest);
             }
         }
 

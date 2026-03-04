@@ -2085,13 +2085,29 @@ impl Command {
         self
     }
 
-    /// Preopen a host directory for WASI filesystem access.
+    /// Preopen a host directory for WASI filesystem access (identity mapping).
     ///
-    /// The directory is mapped with an identity mount (same path on host and
-    /// inside the Wasm module's WASI filesystem view).
+    /// The directory is visible inside the Wasm module at the same path as on
+    /// the host.  Use `with_wasi_preopened_dir_mapped` when the host and guest
+    /// paths differ.
     pub fn with_wasi_preopened_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        let p = path.into();
         let cfg = self.wasi_config.get_or_insert_with(Default::default);
-        cfg.preopened_dirs.push(path.into());
+        cfg.preopened_dirs.push((p.clone(), p));
+        self
+    }
+
+    /// Preopen a host directory for WASI filesystem access with an explicit guest path.
+    ///
+    /// `host` is the directory on the host filesystem; `guest` is the path
+    /// the Wasm module will see it under.
+    pub fn with_wasi_preopened_dir_mapped(
+        mut self,
+        host: impl Into<std::path::PathBuf>,
+        guest: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let cfg = self.wasi_config.get_or_insert_with(Default::default);
+        cfg.preopened_dirs.push((host.into(), guest.into()));
         self
     }
 

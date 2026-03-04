@@ -123,10 +123,11 @@ impl shim::Task for WasmShim {
 
         let (wasm_path, extra_args, wasi_env) = parse_oci_config(&config_json)?;
 
+        let rootfs = s.bundle.join("rootfs");
         let wasi = pelagos::wasm::WasiConfig {
             runtime: pelagos::wasm::WasmRuntime::Auto,
             env: wasi_env,
-            preopened_dirs: vec![s.bundle.join("rootfs")],
+            preopened_dirs: vec![(rootfs.clone(), rootfs)],
         };
 
         let child = pelagos::wasm::spawn_wasm(
@@ -279,9 +280,9 @@ impl shim::Task for WasmShim {
 
 /// Parsed fields from an OCI bundle `config.json`.
 type OciParsed = (
-    std::path::PathBuf,    // wasm binary path
+    std::path::PathBuf,      // wasm binary path
     Vec<std::ffi::OsString>, // extra argv
-    Vec<(String, String)>, // WASI env
+    Vec<(String, String)>,   // WASI env
 );
 
 /// Parse an OCI `config.json` bundle config to extract the Wasm executable,

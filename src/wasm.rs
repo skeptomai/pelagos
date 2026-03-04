@@ -13,7 +13,7 @@
 //! let wasi = WasiConfig {
 //!     runtime: WasmRuntime::Auto,
 //!     env: vec![("KEY".into(), "val".into())],
-//!     preopened_dirs: vec!["/data".into()],
+//!     preopened_dirs: vec![("/data".into(), "/data".into())],
 //! };
 //! let child = spawn_wasm(
 //!     Path::new("/app/module.wasm"),
@@ -62,8 +62,11 @@ pub struct WasiConfig {
     pub runtime: WasmRuntime,
     /// WASI environment variables (supplement to the process environment).
     pub env: Vec<(String, String)>,
-    /// Host directories to preopen for WASI filesystem access.
-    pub preopened_dirs: Vec<PathBuf>,
+    /// Host→guest directory mappings to preopen for WASI filesystem access.
+    ///
+    /// Each entry is `(host_path, guest_path)`.  For identity mappings
+    /// (host and guest are the same path) set both to the same value.
+    pub preopened_dirs: Vec<(PathBuf, PathBuf)>,
 }
 
 /// Returns `true` if the file at `path` begins with WebAssembly magic bytes.
@@ -169,10 +172,10 @@ fn build_wasmtime_cmd(
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(runtime);
     cmd.arg("run");
-    // wasmtime >= 14: --dir host::guest (identity mapping — same path on both sides).
-    for dir in &wasi.preopened_dirs {
-        let s = dir.to_string_lossy();
-        cmd.arg("--dir").arg(format!("{s}::{s}"));
+    // wasmtime >= 14: --dir host::guest
+    for (host, guest) in &wasi.preopened_dirs {
+        cmd.arg("--dir")
+            .arg(format!("{}::{}", host.display(), guest.display()));
     }
     for (k, v) in &wasi.env {
         cmd.arg("--env").arg(format!("{k}={v}"));
@@ -189,8 +192,10 @@ fn build_wasmedge_cmd(
     wasi: &WasiConfig,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(runtime);
-    for dir in &wasi.preopened_dirs {
-        cmd.arg("--dir").arg(dir);
+    // wasmedge: --dir host:guest (single colon)
+    for (host, guest) in &wasi.preopened_dirs {
+        cmd.arg("--dir")
+            .arg(format!("{}:{}", host.display(), guest.display()));
     }
     for (k, v) in &wasi.env {
         cmd.arg("--env").arg(format!("{k}={v}"));

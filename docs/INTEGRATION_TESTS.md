@@ -2463,3 +2463,62 @@ and waits for it to exit.
 Verifies that the Wasm fast-path in `spawn()` runs end-to-end without panicking.
 No assertion on exit code — an empty module may trap in the runtime, which is
 acceptable.
+
+---
+
+## E2E Wasm Tests (`scripts/test-wasm-e2e.sh`)
+
+Shell-level end-to-end tests that drive the `pelagos` CLI with a real Wasm
+module. Require root and `wasmtime` in PATH; skip automatically if either
+is absent.
+
+Run with:
+```
+sudo -E env PATH="$HOME/.wasmtime/bin:$PATH" scripts/test-wasm-e2e.sh
+```
+
+### `image ls — TYPE column`
+**Type:** E2E, requires root + wasmtime
+
+Seeds a synthetic Wasm image in the pelagos image store (manifest.json with
+`layer_types: ["application/wasm"]`) and runs `pelagos image ls`. Asserts the
+output contains the string `wasm` in the TYPE column and the image reference.
+
+Failure indicates `cmd_image_ls()` no longer renders the TYPE column, or
+`is_wasm_image()` detection is broken.
+
+### `run — basic output`
+**Type:** E2E, requires root + wasmtime
+
+Compiles a trivial Rust program to `wasm32-wasip1` and runs it via `pelagos run
+<image-ref>`. Asserts stdout contains `hello wasm` and no `error` strings.
+
+Failure indicates the Wasm fast-path in `build_image_run()` or the
+`spawn_wasm()` dispatch is broken.
+
+### `run — env passthrough`
+**Type:** E2E, requires root + wasmtime
+
+Runs the same Wasm module with `--env WASM_TEST_VAR=testvalue42`. Asserts the
+module prints `env:WASM_TEST_VAR=testvalue42`.
+
+Failure indicates `with_wasi_env()` is not forwarding `--env` values to the
+wasmtime `--env` flag, or that `WasiConfig.env` is not being populated in
+`build_image_run()`.
+
+### `run — preopened dir (--bind)`
+**Type:** E2E, requires root + wasmtime
+
+Creates a host directory containing `test.txt`, runs the Wasm module with
+`--bind <host>:/data`, and asserts the module can read `/data/test.txt` and
+prints `file:bind mount works`.
+
+Failure indicates `with_wasi_preopened_dir_mapped()` is not propagating
+the host→guest mapping to the wasmtime `--dir host::guest` flag.
+
+### `Wasm magic-byte detection`
+**Type:** Structural check, no runtime required
+
+Reads the first 4 bytes of the compiled `hello.wasm` and verifies they equal
+`00 61 73 6d` (`\0asm`). Confirms that `rustc --target wasm32-wasip1` produces
+a valid Wasm binary that `is_wasm_binary()` would recognise.
