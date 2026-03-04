@@ -14,6 +14,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
+      - run: cargo clippy --features embedded-wasm -- -D warnings
 
   unit-tests:
     runs-on: ubuntu-latest
@@ -22,6 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib
+      - run: cargo test --lib --features embedded-wasm
 
   integration-tests:
     runs-on: ubuntu-latest
@@ -75,3 +77,14 @@ jobs:
         run: cargo build
       - name: Run Wasm e2e tests
         run: sudo -E env "PATH=$PATH" bash scripts/test-wasm-e2e.sh
+
+  wasm-embedded-e2e-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run embedded Wasm e2e tests
+        run: sudo -E env "PATH=$PATH" bash scripts/test-wasm-embedded-e2e.sh
