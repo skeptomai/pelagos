@@ -18,12 +18,16 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #67 | epic: deeper Wasm/WASI support | epic |
 | #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
 
-## Current Baseline (2026-03-03, SHA df18ca1)
+## Current Baseline (2026-03-03, SHA 6e11187)
 
-- Unit tests: **290/290 pass** (4 new wasm regression tests added this session)
-- Integration tests: **202/202 pass, 8 ignored** (`--test-threads=1`, 37s) — #69 CLOSED (was env state, not code)
+- Unit tests: **290/290 pass**
+- Integration tests: **202/202 pass, 8 ignored** (`--test-threads=1`, 37s)
 - CI (GitHub Actions): **all 5 jobs pass** (lint, unit-tests, integration-tests, e2e-tests, wasm-e2e-tests)
 - E2E tests: **7 Wasm e2e tests pass** (`scripts/test-wasm-e2e.sh`)
+
+**Note for next session:** Run integration tests with `--test-threads=1` to avoid
+network-state races between DNS tests. Always `sudo scripts/reset-test-env.sh`
+if starting from a possibly dirty environment.
 
 ## Completed This Session (2026-03-03)
 
@@ -90,11 +94,13 @@ No code changes required. Issue closed.
 P1 (Mixed Linux+Wasm compose validation) dropped — needs P2 (sockets) first to
 be meaningful.
 
-## Suggested Next Steps
+## Next Session: Start Here
 
-- #52 (AppArmor/SELinux) — highest real-world security impact
-- #60 (io_uring seccomp profile) — useful complement to existing seccomp work
-- #61 (CRIU) — complex but differentiating checkpoint/restore feature
+1. **#52 — AppArmor/SELinux profile support** (highest real-world security impact)
+   - Sub-issues: #63 (AppArmor template), #64 (SELinux process label)
+   - Design choice to resolve: generate profiles at build time vs ship canned profiles
+2. #60 (io_uring seccomp profile) — useful complement to existing seccomp work
+3. #61 (CRIU checkpoint/restore) — complex but differentiating feature
 
 ## Session Notes
 
