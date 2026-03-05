@@ -149,9 +149,9 @@ sudo pelagos run --read-only alpine /bin/sh -c "echo test > /readonly.txt" || tr
 **Resource limits — cap memory at 64 MB:**
 
 ```bash
-sudo pelagos run --memory 67108864 alpine /bin/sh -c \
-  'dd if=/dev/zero bs=1M count=200 | cat > /dev/null'
-# Killed by OOM at 64 MB
+sudo pelagos run --memory 64m alpine /bin/sh -c \
+  'x=$(dd if=/dev/zero bs=1M count=200 2>/dev/null | tr "\0" "X"); echo done'
+# Killed by OOM — shell variable holds 200 MB, cgroup hard limit is 64 MB
 ```
 
 **Capabilities — drop everything, keep nothing:**
@@ -186,8 +186,8 @@ sudo pelagos run --network loopback alpine /bin/sh -c "ping -c1 8.8.8.8 || echo 
 sudo pelagos run --network pasta alpine /bin/sh -c "wget -qO- https://example.com | head -5"
 
 # Bridge with NAT and a port mapping
-sudo pelagos run --network bridge --nat --port 8080:80 alpine \
-  /bin/sh -c 'busybox httpd -f -p 80 -h /var/www &; sleep 5'
+sudo pelagos run --network bridge --nat --publish 8080:80 alpine \
+  /bin/sh -c 'busybox httpd -p 80 -h /var/www & sleep 10'
 ```
 
 ---
@@ -244,6 +244,9 @@ This is where Pelagos diverges from every other Linux runtime.
 
 ### 5.1 Run a Wasm module directly
 
+Pelagos packages Wasm binaries as OCI images (FROM scratch) and runs them
+without a Linux rootfs — no Alpine layers, no kernel image loading.
+
 ```bash
 # Compile a Rust program to WASI P1 (plain module)
 cat > hello.rs << 'EOF'
@@ -255,32 +258,35 @@ EOF
 rustup target add wasm32-wasip1
 rustc --target wasm32-wasip1 --edition 2021 -o hello.wasm hello.rs
 
-# Run it — pelagos detects the \0asm magic bytes automatically
-sudo pelagos run --wasm hello.wasm
-```
-
-No Alpine rootfs.  No kernel image loading.  The module runs directly via
-an installed Wasm runtime (`wasmtime` or `wasmedge`) — or in-process if you
-built Pelagos with `--features embedded-wasm`.
-
-**Environment variables and bind mounts work exactly like Linux containers:**
-
-```bash
-sudo pelagos run --wasm \
-  --env MY_VAR=hello \
-  --bind /tmp/data:/data \
-  hello.wasm
-```
-
-### 5.2 Build a Wasm OCI image
-
-```bash
-pelagos build -t my-wasm-app:latest - << 'EOF'
+# Package it as a Wasm OCI image
+mkdir wasm-ctx
+cp hello.wasm wasm-ctx/
+cat > wasm-ctx/Remfile << 'EOF'
 FROM scratch
 COPY hello.wasm /hello.wasm
 EOF
 
-sudo pelagos image ls
+pelagos build -t my-wasm-app:latest wasm-ctx/
+sudo pelagos run my-wasm-app:latest
+```
+
+Pelagos detects the `\0asm` magic bytes in the layer and routes execution to
+the installed Wasm runtime (`wasmtime` or `wasmedge`), or runs in-process if
+you built with `--features embedded-wasm`.
+
+**Environment variables and bind mounts work exactly like Linux containers:**
+
+```bash
+sudo pelagos run \
+  --env MY_VAR=hello \
+  --bind /tmp/data:/data \
+  my-wasm-app:latest
+```
+
+### 5.2 Inspect the image type
+
+```bash
+pelagos image ls
 # REPOSITORY        TAG     TYPE    SIZE
 # my-wasm-app       latest  wasm    1.8 MB
 ```
@@ -288,10 +294,6 @@ sudo pelagos image ls
 The `TYPE` column shows `wasm` — the layer is stored with media type
 `application/wasm` and the runtime knows to execute it without a Linux
 environment.
-
-```bash
-sudo pelagos run my-wasm-app:latest
-```
 
 ### 5.3 Wasm Component Model (P3b)
 
@@ -516,9 +518,8 @@ pelagos image rm alpine
 # Run
 sudo pelagos run alpine /bin/sh
 sudo pelagos run --env FOO=bar --bind /data:/data alpine /bin/sh
-sudo pelagos run --network pasta --port 8080:80 myserver:latest
-sudo pelagos run --memory 134217728 --read-only alpine /bin/sh
-sudo pelagos run --wasm hello.wasm          # Wasm module
+sudo pelagos run --network pasta --publish 8080:80 myserver:latest
+sudo pelagos run --memory 128m --read-only alpine /bin/sh
 sudo pelagos run my-wasm-app:latest         # Wasm OCI image
 
 # Lifecycle

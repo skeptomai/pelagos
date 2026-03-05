@@ -550,6 +550,10 @@ fn apply_cli_options(
     if let Some(ref m) = args.memory {
         let bytes = parse_memory(m)?;
         cmd = cmd.with_cgroup_memory(bytes);
+        // Disable swap for the cgroup so the memory limit acts as a hard
+        // ceiling and the OOM killer fires instead of paging to swap.
+        // (Matches Docker's --memory-only behaviour on systems with swap.)
+        cmd = cmd.with_cgroup_memory_swap(0);
     }
     if let Some(ref c) = args.cpus {
         let (quota, period) = parse_cpus(c)?;
