@@ -114,24 +114,38 @@ pub struct CgroupDeviceRule {
     pub access: String,
 }
 
-/// Create a cgroup named `pelagos-{child_pid}`, apply configured limits, and add
-/// the child process to it.
+/// Create a cgroup, apply configured limits, and return the handle and
+/// `cgroup.procs` path **without** adding any process.
 ///
-/// Returns the live [`Cgroup`] handle — the caller must call [`teardown_cgroup`]
-/// after the child exits.
+/// The caller passes `cgroup_procs_path` to the container's `pre_exec` hook so
+/// the container process can add its own PID before doing any memory-intensive
+/// work, eliminating the parent-side race in [`setup_cgroup`].
 ///
-/// # Errors
+/// `name` must be unique — use [`cgroup_unique_name`] to generate one before
+/// fork when the child PID is not yet known.
+pub fn create_cgroup_no_task(cfg: &CgroupConfig, name: &str) -> io::Result<(Cgroup, String)> {
+    let cg = build_cgroup(cfg, name)?;
+    let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
+    Ok((cg, procs_path))
+}
+
+/// Generate a unique cgroup name before fork (when the child PID is not yet known).
 ///
-/// Returns an error if the cgroup cannot be created (e.g. missing permissions,
-/// cgroup fs not mounted) or if the PID cannot be added.
-pub fn setup_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<Cgroup> {
-    let name = cfg
-        .path
-        .clone()
-        .unwrap_or_else(|| format!("pelagos-{}", child_pid));
+/// Uses the current PID plus an atomic counter so names never collide between
+/// concurrent spawns in the same process.
+pub fn cgroup_unique_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("pelagos-{}-{}", unsafe { libc::getpid() }, n)
+}
+
+/// Internal helper: build a [`Cgroup`] with all configured limits but without
+/// adding any process.  Shared by [`setup_cgroup`] and [`create_cgroup_no_task`].
+fn build_cgroup(cfg: &CgroupConfig, name: &str) -> io::Result<Cgroup> {
     let hier = hierarchies::auto();
 
-    let mut builder = CgroupBuilder::new(&name);
+    let mut builder = CgroupBuilder::new(name);
 
     // --- Memory ---
     if cfg.memory_limit.is_some()
@@ -274,9 +288,39 @@ pub fn setup_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<Cgroup> {
         log::debug!("net_prio controller unavailable (v2-only system); priorities not applied");
     }
 
+    // Enable OOM group killing when a memory limit is configured: the OOM killer
+    // will send SIGKILL to ALL processes in the cgroup, not just the one that
+    // triggered the OOM event.  This matches Docker's behaviour and ensures the
+    // limit is enforced even when memory-intensive work happens in a child
+    // process of a longer-lived shell.
+    if cfg.memory_limit.is_some() {
+        let oom_group_path = format!("/sys/fs/cgroup/{}/memory.oom.group", name);
+        if let Err(e) = std::fs::write(&oom_group_path, b"1\n") {
+            log::debug!("memory.oom.group not available (non-fatal): {}", e);
+        }
+    }
+
+    Ok(cg)
+}
+
+/// Create a cgroup named `pelagos-{child_pid}`, apply configured limits, and add
+/// the child process to it.
+///
+/// Returns the live [`Cgroup`] handle — the caller must call [`teardown_cgroup`]
+/// after the child exits.
+///
+/// # Errors
+///
+/// Returns an error if the cgroup cannot be created (e.g. missing permissions,
+/// cgroup fs not mounted) or if the PID cannot be added.
+pub fn setup_cgroup(cfg: &CgroupConfig, child_pid: u32) -> io::Result<Cgroup> {
+    let name = cfg
+        .path
+        .clone()
+        .unwrap_or_else(|| format!("pelagos-{}", child_pid));
+    let cg = build_cgroup(cfg, &name)?;
     cg.add_task_by_tgid(CgroupPid::from(child_pid as u64))
         .map_err(|e| io::Error::other(format!("cgroup add_task pid={}: {}", child_pid, e)))?;
-
     Ok(cg)
 }
 

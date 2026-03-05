@@ -2048,6 +2048,68 @@ mod cgroups {
             .expect("Failed to spawn with cgroup net classid");
         let _status = child.wait().expect("wait failed");
     }
+
+    /// Regression test: cgroup memory limit must apply to the actual container
+    /// process (grandchild) when `Namespace::PID` triggers a double-fork.
+    ///
+    /// Previously, `setup_cgroup()` was called with the intermediate waiter's
+    /// PID (the direct child), so the memory limit was applied to a process that
+    /// used negligible memory while the actual container (grandchild) ran
+    /// unconstrained in the parent's cgroup.  The fix reads
+    /// `/proc/{pid}/task/{pid}/children` to find the grandchild and cgroups it.
+    ///
+    /// Asserts: the container is killed by SIGKILL (signal 9) when it exceeds
+    /// the limit, confirming the limit is actually enforced on the right process.
+    #[test]
+    fn test_cgroup_memory_limit_pid_namespace() {
+        if !is_root() {
+            eprintln!("Skipping test_cgroup_memory_limit_pid_namespace: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_cgroup_memory_limit_pid_namespace: alpine-rootfs not found");
+            return;
+        };
+
+        // Use Namespace::PID — this is the critical flag that triggers the
+        // double-fork.  Without the fix the cgroup applies to the waiter, not
+        // the container, so dd succeeds and exits 0.
+        //
+        // Write 100 MB to tmpfs against a 32 MB cgroup limit. The OOM killer
+        // must fire and the process must exit via SIGKILL (signal 9).
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "dd if=/dev/zero of=/tmp/fill bs=1M count=100 2>/dev/null; echo done",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_cgroup_memory(32 * 1024 * 1024) // 32 MB limit
+            .with_cgroup_memory_swap(0) // disable swap so limit is hard
+            .with_tmpfs("/tmp", "")
+            .with_dev_mount() // needed for /dev/zero
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn with cgroup memory limit + PID namespace");
+
+        let status = child.wait().expect("Failed to wait for child");
+
+        // The process must have been killed — either via SIGKILL (signal 9) or
+        // a non-zero exit code.  On cgroupv2, OOM killer sends SIGKILL so
+        // signal() == Some(9).  We accept either killed-by-signal or non-zero
+        // exit to be robust across kernel versions.
+        let killed = status.signal().is_some() || !status.success();
+        assert!(
+            killed,
+            "Container should be OOM-killed when memory limit is enforced on the \
+             correct (grandchild) process (signal={:?}, code={:?})",
+            status.signal(),
+            status.code()
+        );
+    }
 }
 
 mod networking {

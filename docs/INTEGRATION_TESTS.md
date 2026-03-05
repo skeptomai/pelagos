@@ -319,6 +319,25 @@ Because `dd` streams data without accumulating RSS, it typically won't OOM, but 
 important thing is that the cgroup is created and the container runs under it without
 error. Verifies the cgroup setup path works end-to-end.
 
+### `test_cgroup_memory_limit_pid_namespace`
+**Requires:** root, rootfs
+
+Regression test for the cgroup race condition when `Namespace::PID` is used. With a PID
+namespace, `spawn()` performs a double-fork: an intermediate waiter process (B) forks the
+real container process (C). The parent previously set up the cgroup after `spawn()` returned,
+creating a window where C ran unconstrained and could exhaust memory before being added to
+the cgroup.
+
+This test verifies the fix: the cgroup is now pre-created before fork and the container
+process adds its own PID to `cgroup.procs` during pre_exec before exec, eliminating the
+race entirely.
+
+Sets `with_cgroup_memory(32MB)` and `with_cgroup_memory_swap(0)` (to prevent swap escape),
+uses `with_dev_mount()` for `/dev/zero`, and runs `dd if=/dev/zero of=/tmp/fill bs=1M count=100`
+writing 100 MB into a tmpfs. If the memory limit is not enforced, dd completes successfully
+(exit 0). A correctly working limit OOM-kills the container (non-zero exit / signal). Failure
+would indicate the cgroup setup race has regressed.
+
 ### `test_cgroup_pids_limit`
 **Requires:** root, rootfs
 

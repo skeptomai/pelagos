@@ -2629,11 +2629,46 @@ impl Command {
             (Vec::new(), -1, -1)
         };
 
+        // Pre-create the cgroup BEFORE fork (root mode only) so the container
+        // process can add its own PID during pre_exec — before any exec'd code
+        // runs — eliminating the race between the parent's post-fork cgroup
+        // assignment and the container starting memory-intensive work.
+        //
+        // Rootless cgroups are still set up parent-side (handled below).
+        let (pre_cgroup_handle, pre_cgroup_procs_path): (
+            Option<cgroups_rs::fs::Cgroup>,
+            Option<String>,
+        ) = if let Some(ref cfg) = self.cgroup_config {
+            if !is_rootless {
+                let cg_name = crate::cgroup::cgroup_unique_name();
+                let (cg, procs_path) =
+                    crate::cgroup::create_cgroup_no_task(cfg, &cg_name).map_err(Error::Io)?;
+                (Some(cg), Some(procs_path))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         // Install our combined pre_exec hook
         unsafe {
             self.inner.pre_exec(move || {
                 use std::ffi::CString;
                 use std::ptr;
+
+                // Step 0: For non-PID-namespace containers (single fork), add ourselves
+                // to the pre-created cgroup immediately so all subsequent memory
+                // allocations (including from exec'd code) are charged to it.
+                // For PID-namespace containers, this happens in the grandchild at step 1.65.
+                if !namespaces.contains(Namespace::PID) {
+                    if let Some(ref procs_path) = pre_cgroup_procs_path {
+                        let pid = libc::getpid();
+                        let pid_str = format!("{}\n", pid);
+                        std::fs::write(procs_path, pid_str.as_bytes())
+                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                    }
+                }
 
                 // Step 1: Unshare namespaces.
                 if !namespaces.is_empty() {
@@ -2867,6 +2902,16 @@ impl Command {
                     // Child: we are now PID 1 in the new PID namespace.
                     // Ensure we die if the intermediate (our parent) is killed.
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    // Add ourselves to the pre-created cgroup immediately, before any
+                    // mounts, chroot, or exec.  This ensures all memory allocations
+                    // from the container's init process onwards are charged to the
+                    // cgroup, with no race against the parent's post-fork setup.
+                    if let Some(ref procs_path) = pre_cgroup_procs_path {
+                        let pid = libc::getpid();
+                        let pid_str = format!("{}\n", pid);
+                        std::fs::write(procs_path, pid_str.as_bytes())
+                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                    }
                 } else if let Some(&(pid_join_fd, _)) =
                     join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
                 {
@@ -4051,10 +4096,15 @@ impl Command {
         // Keep join_ns_files alive until here so file descriptors remain valid
         drop(join_ns_files);
 
-        // Create cgroup and add child PID (parent-side, after fork)
+        // For rootless containers, set up the cgroup parent-side (user namespace
+        // cgroup delegation; cannot be done in pre_exec).
+        // For root containers, the cgroup was pre-created before fork and the
+        // container process added its own PID during pre_exec — use the handle
+        // directly without any parent-side PID assignment.
+        let cgroup_pid = find_container_pid(child_inner.id()).unwrap_or_else(|| child_inner.id());
         let cgroup = if let Some(ref cfg) = self.cgroup_config {
             if is_rootless {
-                match crate::cgroup_rootless::setup_rootless_cgroup(cfg, child_inner.id()) {
+                match crate::cgroup_rootless::setup_rootless_cgroup(cfg, cgroup_pid) {
                     Ok(cg) => Some(CgroupHandle::Rootless(cg)),
                     Err(e) => {
                         log::warn!("rootless cgroup setup failed, skipping: {}", e);
@@ -4062,10 +4112,8 @@ impl Command {
                     }
                 }
             } else {
-                match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
-                    Ok(cg) => Some(CgroupHandle::Root(cg)),
-                    Err(e) => return Err(Error::Io(e)),
-                }
+                // The cgroup was pre-created; the container added itself in pre_exec.
+                pre_cgroup_handle.map(CgroupHandle::Root)
             }
         } else {
             None
@@ -4705,6 +4753,23 @@ impl Command {
             (Vec::new(), -1, -1)
         };
 
+        // Pre-create the cgroup before fork (root mode only) — same as spawn().
+        let (pre_cgroup_handle_i, pre_cgroup_procs_path_i): (
+            Option<cgroups_rs::fs::Cgroup>,
+            Option<String>,
+        ) = if let Some(ref cfg) = self.cgroup_config {
+            if !is_rootless {
+                let cg_name = crate::cgroup::cgroup_unique_name();
+                let (cg, procs_path) =
+                    crate::cgroup::create_cgroup_no_task(cfg, &cg_name).map_err(Error::Io)?;
+                (Some(cg), Some(procs_path))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         unsafe {
             self.inner.pre_exec(move || {
                 use std::ffi::CString;
@@ -4730,6 +4795,17 @@ impl Command {
                     }
                 }
                 libc::close(slave_raw_fd);
+
+                // For non-PID-namespace containers, add ourselves to the pre-created
+                // cgroup immediately (same pattern as spawn() Step 0).
+                if !namespaces.contains(Namespace::PID) {
+                    if let Some(ref procs_path) = pre_cgroup_procs_path_i {
+                        let pid = libc::getpid();
+                        let pid_str = format!("{}\n", pid);
+                        std::fs::write(procs_path, pid_str.as_bytes())
+                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                    }
+                }
 
                 // Steps 1–7: identical to spawn() from here
                 if !namespaces.is_empty() {
@@ -4901,6 +4977,13 @@ impl Command {
                         }
                     }
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    // Grandchild: add ourselves to the pre-created cgroup immediately.
+                    if let Some(ref procs_path) = pre_cgroup_procs_path_i {
+                        let pid = libc::getpid();
+                        let pid_str = format!("{}\n", pid);
+                        std::fs::write(procs_path, pid_str.as_bytes())
+                            .map_err(|e| io::Error::other(format!("cgroup self-assign: {}", e)))?;
+                    }
                 } else if let Some(&(pid_join_fd, _)) =
                     join_ns_fds.iter().find(|(_, ns)| *ns == Namespace::PID)
                 {
@@ -5913,10 +5996,11 @@ impl Command {
         drop(slave);
         drop(join_ns_files);
 
-        // Create cgroup and add child PID (parent-side, after fork)
+        // For rootless: set up cgroup parent-side; for root: use the pre-created handle.
+        let cgroup_pid = find_container_pid(child_inner.id()).unwrap_or_else(|| child_inner.id());
         let cgroup = if let Some(ref cfg) = self.cgroup_config {
             if is_rootless {
-                match crate::cgroup_rootless::setup_rootless_cgroup(cfg, child_inner.id()) {
+                match crate::cgroup_rootless::setup_rootless_cgroup(cfg, cgroup_pid) {
                     Ok(cg) => Some(CgroupHandle::Rootless(cg)),
                     Err(e) => {
                         log::warn!("rootless cgroup setup failed, skipping: {}", e);
@@ -5924,10 +6008,8 @@ impl Command {
                     }
                 }
             } else {
-                match crate::cgroup::setup_cgroup(cfg, child_inner.id()) {
-                    Ok(cg) => Some(CgroupHandle::Root(cg)),
-                    Err(e) => return Err(Error::Io(e)),
-                }
+                // The cgroup was pre-created; the container added itself in pre_exec.
+                pre_cgroup_handle_i.map(CgroupHandle::Root)
             }
         } else {
             None
@@ -6053,6 +6135,26 @@ pub struct Child {
     /// Supervisor thread for SECCOMP_RET_USER_NOTIF interception (if configured).
     /// Joined when the child exits.
     supervisor_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Find the actual container process PID when a PID-namespace double-fork is used.
+///
+/// With `Namespace::PID`, `spawn()` returns an intermediate waiter (the direct
+/// child) that forks the real container as a grandchild and immediately calls
+/// `waitpid`. Cgroup limits must target the grandchild, not the waiter.
+///
+/// Reads `/proc/{pid}/task/{pid}/children`, which is populated as soon as the
+/// fork completes — guaranteed by the time `spawn()` returns, because the
+/// intermediate only closes the CLOEXEC error pipe *after* forking the grandchild.
+///
+/// Returns `None` for single-fork containers (no PID namespace → no grandchild).
+fn find_container_pid(intermediate_pid: u32) -> Option<u32> {
+    let path = format!(
+        "/proc/{}/task/{}/children",
+        intermediate_pid, intermediate_pid
+    );
+    let contents = std::fs::read_to_string(&path).ok()?;
+    contents.split_whitespace().next()?.parse::<u32>().ok()
 }
 
 impl Child {
