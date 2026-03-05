@@ -12135,7 +12135,6 @@ mod healthcheck_tests {
     /// Failure indicates the exec namespace-join path is broken or the
     /// container's `/bin/true`/`/bin/false` are not present.
     #[test]
-    #[ignore]
     fn test_healthcheck_exec_true() {
         if !is_root() {
             return;
@@ -12240,7 +12239,6 @@ mod healthcheck_tests {
     /// Failure indicates the health monitor thread is not running or not
     /// writing state.json correctly.
     #[test]
-    #[ignore]
     fn test_healthcheck_healthy() {
         if !is_root() {
             return;
@@ -12360,7 +12358,6 @@ mod healthcheck_tests {
     ///
     /// Failure indicates the health state format or serde handling is broken.
     #[test]
-    #[ignore]
     fn test_healthcheck_unhealthy() {
         if !is_root() {
             return;

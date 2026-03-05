@@ -2707,3 +2707,38 @@ format error or silent empty output instead of the expected string.
 Failure indicates: the file written by a COPY instruction loses its content
 after a subsequent `RUN chmod` step — the container returns no output or an
 exec error instead of the expected string.
+
+---
+
+## healthcheck_tests
+
+### `test_healthcheck_exec_true`
+**Requires:** root, rootfs
+
+Starts a detached container (`sleep 30`) via `pelagos run -d`, polls state.json
+until the watcher child has written a non-zero PID (up to 10s), then runs
+`pelagos exec <name> /bin/true` and asserts exit 0, and `pelagos exec <name>
+/bin/false` and asserts non-zero exit.
+
+Exercises the full `pelagos exec` namespace-join path against a live container.
+Failure indicates exec is broken, the container binary paths are missing in
+Alpine, or the watcher is not writing state.json correctly.
+
+### `test_healthcheck_healthy`
+**Requires:** root, rootfs
+
+Starts a detached container, waits for state.json to appear, patches it to
+inject a `health_config` JSON object and sets `health = "starting"`, then
+manually writes `health = "healthy"` and asserts the round-trip through
+`serde_json` is correct.
+
+This test validates the state.json JSON schema for health fields (`health`,
+`health_config`), not the live health-monitor execution. Failure indicates
+a serde serialization regression in the health-related state.json fields.
+
+### `test_healthcheck_unhealthy`
+**Requires:** root, rootfs
+
+Same as `test_healthcheck_healthy` but writes `health = "unhealthy"`. Asserts
+the value round-trips correctly through state.json. Failure indicates a serde
+regression in the unhealthy health state field.
