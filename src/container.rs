@@ -126,45 +126,109 @@ pub use crate::seccomp::SeccompProfile;
 
 /// Probe whether native overlayfs with `userxattr` is supported (kernel 5.11+).
 ///
-/// Forks a child that enters a new user + mount namespace, attempts a tiny
-/// overlay mount with `,userxattr`, and exits 0 on success. The parent reads
-/// the exit code. Result is cached in a `OnceLock` so the probe runs at most
-/// once per process.
+/// A child enters a new user+mount namespace; the PARENT writes uid/gid maps
+/// to `/proc/<child_pid>/uid_map` (only the parent namespace can do this —
+/// after `unshare(NEWUSER)`, the child cannot write its own uid_map).
+/// The child then attempts a tiny overlay mount with `userxattr`. Result is
+/// cached in a `OnceLock` so the probe runs at most once per process.
 fn native_rootless_overlay_supported() -> bool {
     use std::sync::OnceLock;
     static RESULT: OnceLock<bool> = OnceLock::new();
     *RESULT.get_or_init(|| {
+        // Upper/work/merged on /tmp (tmpfs) — supports user xattrs needed by userxattr overlayfs.
         let Ok(tmp) = tempfile::TempDir::new() else {
             return false;
         };
         let base = tmp.path();
-        let lower = base.join("lower");
         let upper = base.join("upper");
         let work = base.join("work");
         let merged = base.join("merged");
+
+        // Lower dir MUST be on the same filesystem as the actual layer store so
+        // the probe reflects real usage.  Native overlay on btrfs lower dirs can
+        // return EOVERFLOW on mkdir even when the mount itself succeeds (kernel
+        // inode-encoding incompatibility between btrfs and tmpfs).  Probing on
+        // tmpfs would give a false-positive; probing on the real layer fs catches it.
+        let layer_store = crate::paths::layers_dir();
+        let lower_tmp_result = tempfile::TempDir::new_in(&layer_store);
+        // If we can't create a temp dir in the layer store (e.g., permission denied
+        // before setup.sh has run), fall back to /tmp — this gives a best-effort
+        // result; the real overlay will fail later if the fs is incompatible.
+        // Keep TempDir alive until after probe completes — dropping it removes
+        // the directory, which would break the forked child.
+        let _lower_storage;
+        let lower: std::path::PathBuf = match lower_tmp_result {
+            Ok(d) => {
+                let p = d.path().join("lower");
+                _lower_storage = Some(d);
+                p
+            }
+            Err(_) => {
+                _lower_storage = None::<tempfile::TempDir>;
+                base.join("lower_fallback")
+            }
+        };
+
+        // Create all directories.
         for d in [&lower, &upper, &work, &merged] {
-            if std::fs::create_dir(d).is_err() {
+            if std::fs::create_dir_all(d).is_err() {
                 return false;
             }
         }
+        // Create a subdirectory inside lower so the probe can test copy-up (the
+        // scenario that triggers EOVERFLOW on btrfs lower dirs).
+        let lower_sub = lower.join("probedir");
+        if std::fs::create_dir(&lower_sub).is_err() {
+            return false;
+        }
 
-        // Fork a child that unshares user+mount namespaces and tries the mount.
+        let host_uid = unsafe { libc::getuid() };
+        let host_gid = unsafe { libc::getgid() };
+
+        // Pipes for parent↔child synchronisation.
+        // ready_pipe: child sends its PID to parent after unshare.
+        // done_pipe:  parent signals child after writing uid/gid maps.
+        let mut ready_pipe = [0i32; 2];
+        let mut done_pipe = [0i32; 2];
+        if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(done_pipe.as_mut_ptr()) } != 0
+        {
+            return false;
+        }
+        let (ready_r, ready_w) = (ready_pipe[0], ready_pipe[1]);
+        let (done_r, done_w) = (done_pipe[0], done_pipe[1]);
+
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return false;
         }
         if pid == 0 {
-            // Child: unshare user + mount namespaces, try overlay mount.
-            let ret = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
-            if ret != 0 {
+            // Child: close unused pipe ends.
+            unsafe {
+                libc::close(ready_r);
+                libc::close(done_w);
+            }
+            // Unshare user + mount namespaces.
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
                 unsafe { libc::_exit(1) };
             }
-            // Write uid/gid mappings — mount() requires them after unshare(NEWUSER).
-            let uid = unsafe { libc::getuid() };
-            let gid = unsafe { libc::getgid() };
-            let _ = std::fs::write("/proc/self/setgroups", "deny\n");
-            let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid));
-            let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid));
+            // Send our PID to the parent so it can write uid/gid maps.
+            let my_pid: u32 = unsafe { libc::getpid() } as u32;
+            unsafe {
+                libc::write(
+                    ready_w,
+                    my_pid.to_ne_bytes().as_ptr() as *const libc::c_void,
+                    4,
+                );
+                libc::close(ready_w);
+            }
+            // Block until parent has written the maps.
+            let mut buf = [0u8; 1];
+            unsafe {
+                libc::read(done_r, buf.as_mut_ptr() as *mut libc::c_void, 1);
+                libc::close(done_r);
+            }
+            // Mount overlay with userxattr.
             let opts = format!(
                 "lowerdir={},upperdir={},workdir={},userxattr,metacopy=off",
                 lower.display(),
@@ -175,10 +239,11 @@ fn native_rootless_overlay_supported() -> bool {
                 Ok(c) => c,
                 Err(_) => unsafe { libc::_exit(1) },
             };
-            let merged_c = match std::ffi::CString::new(merged.as_os_str().as_encoded_bytes()) {
-                Ok(c) => c,
-                Err(_) => unsafe { libc::_exit(1) },
-            };
+            let merged_c =
+                match std::ffi::CString::new(merged.as_os_str().as_encoded_bytes()) {
+                    Ok(c) => c,
+                    Err(_) => unsafe { libc::_exit(1) },
+                };
             let ov_type = c"overlay";
             let ret = unsafe {
                 libc::mount(
@@ -189,15 +254,69 @@ fn native_rootless_overlay_supported() -> bool {
                     opts_c.as_ptr() as *const libc::c_void,
                 )
             };
-            unsafe { libc::_exit(if ret == 0 { 0 } else { 1 }) };
+            if ret != 0 {
+                unsafe { libc::_exit(1) };
+            }
+            // Probe mkdir inside the overlay's lower-originated directory.
+            // This catches EOVERFLOW on btrfs lower dirs (copy-up failure).
+            let test_dir =
+                match std::ffi::CString::new(merged.join("probedir/sub").as_os_str().as_encoded_bytes())
+                {
+                    Ok(c) => c,
+                    Err(_) => unsafe { libc::_exit(1) },
+                };
+            let mkdir_ret = unsafe { libc::mkdir(test_dir.as_ptr(), 0o700) };
+            unsafe { libc::_exit(if mkdir_ret == 0 { 0 } else { 1 }) };
         }
-        // Parent: wait for child and check exit code.
+
+        // Parent: close unused pipe ends.
+        unsafe {
+            libc::close(ready_w);
+            libc::close(done_r);
+        }
+        // Read the child's PID.
+        let mut pid_bytes = [0u8; 4];
+        let n = unsafe {
+            libc::read(
+                ready_r,
+                pid_bytes.as_mut_ptr() as *mut libc::c_void,
+                4,
+            )
+        };
+        unsafe { libc::close(ready_r) };
+        if n != 4 {
+            let _ = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            return false;
+        }
+        let child_pid = u32::from_ne_bytes(pid_bytes);
+
+        // Write uid/gid maps from the parent namespace — only the parent
+        // namespace process can write uid_map for a child's new user namespace.
+        let _ = std::fs::write(
+            format!("/proc/{}/setgroups", child_pid),
+            "deny\n",
+        );
+        let _ = std::fs::write(
+            format!("/proc/{}/uid_map", child_pid),
+            format!("0 {} 1\n", host_uid),
+        );
+        let _ = std::fs::write(
+            format!("/proc/{}/gid_map", child_pid),
+            format!("0 {} 1\n", host_gid),
+        );
+
+        // Signal child to proceed.
+        unsafe {
+            libc::write(done_w, [1u8].as_ptr() as *const libc::c_void, 1);
+            libc::close(done_w);
+        }
+
+        // Wait for child and check exit code.
         let mut status: libc::c_int = 0;
         let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
         if ret < 0 {
             return false;
         }
-        // WIFEXITED && WEXITSTATUS == 0
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
     })
 }
@@ -222,11 +341,31 @@ fn spawn_fuse_overlayfs(
     work: &std::path::Path,
     merged: &std::path::Path,
 ) -> io::Result<std::process::Child> {
+    // Squash all lower-layer uid/gid ownership to the host user's own uid/gid.
+    //
+    // Why not squash_to_root (uid 0)?
+    //   fuse-overlayfs runs as HOST_UID (e.g. 1000) in rootless mode.  FUSE kernel
+    //   delivers access requests with the caller's host uid, which is also HOST_UID
+    //   (because the user namespace maps container uid 0 → HOST_UID on the host).
+    //   If files are presented as uid 0 (squash_to_root), the caller appears as
+    //   "other" relative to uid-0-owned files with mode 755, so writes fail EPERM.
+    //
+    // With squash_to_uid=HOST_UID / squash_to_gid=HOST_GID:
+    //   - All lower-layer files appear to be owned by HOST_UID:HOST_GID.
+    //   - The calling process IS HOST_UID, so it is the owner → rwx permission.
+    //   - Inside the user namespace, HOST_UID maps to uid 0, so the container
+    //     still perceives all files as owned by root.
+    //   - New files created in the upper layer are stored as HOST_UID:HOST_GID,
+    //     which fuse-overlayfs can write without CAP_CHOWN.
+    let host_uid = unsafe { libc::getuid() };
+    let host_gid = unsafe { libc::getgid() };
     let opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
+        "lowerdir={},upperdir={},workdir={},squash_to_uid={},squash_to_gid={}",
         lower,
         upper.display(),
-        work.display()
+        work.display(),
+        host_uid,
+        host_gid,
     );
     std::process::Command::new("fuse-overlayfs")
         .args(["-o", &opts])
@@ -2173,8 +2312,13 @@ impl Command {
             let host_gid = unsafe { libc::getgid() };
 
             // Try multi-range subordinate UID/GID mapping via newuidmap/newgidmap.
+            // Skip if egid ≠ passwd pw_gid (e.g. newgrp shell) — newuidmap/newgidmap
+            // reject processes where effective GID doesn't match the passwd primary GID.
             if self.uid_maps.is_empty() {
-                if crate::idmap::has_newuidmap() && crate::idmap::has_newgidmap() {
+                if crate::idmap::has_newuidmap()
+                    && crate::idmap::has_newgidmap()
+                    && crate::idmap::newuidmap_will_work()
+                {
                     if let Ok(username) = crate::idmap::current_username() {
                         let uid_ranges = crate::idmap::parse_subid_file(
                             std::path::Path::new("/etc/subuid"),
@@ -4328,8 +4472,12 @@ impl Command {
             let host_gid = unsafe { libc::getgid() };
 
             // Try multi-range subordinate UID/GID mapping via newuidmap/newgidmap.
+            // Skip if egid ≠ passwd pw_gid (e.g. newgrp shell).
             if self.uid_maps.is_empty() {
-                if crate::idmap::has_newuidmap() && crate::idmap::has_newgidmap() {
+                if crate::idmap::has_newuidmap()
+                    && crate::idmap::has_newgidmap()
+                    && crate::idmap::newuidmap_will_work()
+                {
                     if let Ok(username) = crate::idmap::current_username() {
                         let uid_ranges = crate::idmap::parse_subid_file(
                             std::path::Path::new("/etc/subuid"),

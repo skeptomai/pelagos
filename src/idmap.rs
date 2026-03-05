@@ -74,16 +74,19 @@ fn which(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Get the current username by looking up the real UID in `/etc/passwd`.
-pub fn current_username() -> io::Result<String> {
+/// Get the current username and primary GID by looking up the real UID in `/etc/passwd`.
+///
+/// Returns `(username, primary_gid)`.
+pub fn current_user_info() -> io::Result<(String, u32)> {
     let uid = unsafe { libc::getuid() };
     let contents = std::fs::read_to_string("/etc/passwd")?;
     for line in contents.lines() {
         let parts: Vec<&str> = line.splitn(7, ':').collect();
-        if parts.len() >= 3 {
+        if parts.len() >= 4 {
             if let Ok(file_uid) = parts[2].parse::<u32>() {
                 if file_uid == uid {
-                    return Ok(parts[0].to_string());
+                    let pw_gid = parts[3].parse::<u32>().unwrap_or(uid);
+                    return Ok((parts[0].to_string(), pw_gid));
                 }
             }
         }
@@ -92,6 +95,25 @@ pub fn current_username() -> io::Result<String> {
         io::ErrorKind::NotFound,
         format!("no /etc/passwd entry for uid {}", uid),
     ))
+}
+
+/// Get the current username by looking up the real UID in `/etc/passwd`.
+pub fn current_username() -> io::Result<String> {
+    current_user_info().map(|(name, _)| name)
+}
+
+/// Returns `true` when `newuidmap`/`newgidmap` will accept the current process.
+///
+/// Both helpers check that the target process's effective GID matches the primary
+/// GID from `/etc/passwd`.  This fails when the caller is running inside a
+/// `newgrp <group>` shell — the effective GID is the new group, not `pw_gid`.
+/// In that case we must fall back to single-UID direct mapping.
+pub fn newuidmap_will_work() -> bool {
+    let Ok((_, pw_gid)) = current_user_info() else {
+        return false;
+    };
+    let egid = unsafe { libc::getegid() };
+    egid == pw_gid
 }
 
 /// Run `newuidmap <pid> <inside> <outside> <count> ...` to write UID maps.

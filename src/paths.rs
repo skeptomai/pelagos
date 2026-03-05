@@ -89,9 +89,13 @@ pub fn rootfs_store_dir() -> PathBuf {
     data_dir().join("rootfs")
 }
 
-/// Auto-incrementing container name counter file: `<data>/container_counter`.
+/// Auto-incrementing container name counter file: `<runtime>/container_counter`.
+///
+/// This is ephemeral per-user state (container naming), not persistent data, so
+/// it lives in the runtime dir. Rootless users write to their own runtime dir
+/// (`$XDG_RUNTIME_DIR/pelagos/` or `/tmp/pelagos-<uid>/`); root uses `/run/pelagos/`.
 pub fn counter_file() -> PathBuf {
-    data_dir().join("container_counter")
+    runtime_dir().join("container_counter")
 }
 
 /// Build cache directory: `<data>/build-cache/`.
@@ -273,7 +277,6 @@ mod tests {
         assert!(layers_dir().starts_with(&data));
         assert!(volumes_dir().starts_with(&data));
         assert!(rootfs_store_dir().starts_with(&data));
-        assert!(counter_file().starts_with(&data));
         assert!(blobs_dir().starts_with(&data));
     }
 
@@ -296,6 +299,7 @@ mod tests {
         assert!(ipam_file().starts_with(&rt));
         assert!(nat_refcount_file().starts_with(&rt));
         assert!(port_forwards_file().starts_with(&rt));
+        assert!(counter_file().starts_with(&rt));
     }
 
     #[test]

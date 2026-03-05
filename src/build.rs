@@ -1132,10 +1132,16 @@ fn execute_run(
         .collect();
 
     // Note: with_image_layers sets Namespace::MOUNT internally, so we must
-    // add UTS|IPC *before* it (with_namespaces does assignment, not |=).
+    // add UTS|IPC|PID *before* it (with_namespaces does assignment, not |=).
+    // PID namespace is required for rootless builds: it is owned by the user
+    // namespace, which allows mounting a fresh procfs inside the container.
+    // Without it, mount("proc") fails (EPERM) and /proc/self/exe is absent,
+    // breaking Go's GOROOT detection and similar tools.  The library's
+    // double-fork mechanism (spawn() step 1.65) ensures the build command runs
+    // as PID 1 in the new namespace without additional caller changes.
     let mut cmd = Command::new("/bin/sh")
         .args(["-c", cmd_text])
-        .with_namespaces(Namespace::UTS | Namespace::IPC)
+        .with_namespaces(Namespace::UTS | Namespace::IPC | Namespace::PID)
         .with_image_layers(layer_dirs)
         .stdin(Stdio::Null)
         .stdout(Stdio::Inherit)
@@ -1264,10 +1270,20 @@ fn execute_copy(
     let tmp = tempfile::tempdir()?;
 
     // Resolve destination: handle relative paths and directory destinations.
-    let src_basename = Path::new(src)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(src);
+    //
+    // Docker semantics: a trailing slash on `src` means "copy the CONTENTS of
+    // this directory into dest", not "copy the directory itself".
+    //   COPY mygoapp/ .  →  /app/main.go   (contents, no extra nesting)
+    //   COPY mygoapp .   →  /app/mygoapp/main.go  (directory itself)
+    let src_basename = if src.ends_with('/') {
+        // Trailing slash → contents mode; don't append the dir name.
+        ""
+    } else {
+        Path::new(src)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(src)
+    };
     let resolved = resolve_copy_dest(dest, src_basename, working_dir);
     let relative_dest = resolved.trim_start_matches('/');
     let dest_in_tmp = tmp.path().join(relative_dest);
@@ -2382,5 +2398,30 @@ HEALTHCHECK CMD ["pg_isready", "-U", "postgres"]"#;
         assert_eq!(parse_duration_str("30").unwrap(), 30);
         assert!(parse_duration_str("").is_err());
         assert!(parse_duration_str("30x").is_err());
+    }
+
+    /// Docker rule: trailing slash on COPY src means "copy contents, not
+    /// directory itself".  `COPY myapp/ .` → dest = /app/ (no src_basename
+    /// appended), so files land directly in WORKDIR.
+    ///
+    /// We test `resolve_copy_dest` directly because `execute_copy` writes to
+    /// the layer store (requires pelagos group write access).
+    #[test]
+    fn test_copy_trailing_slash_dest_resolution() {
+        // COPY myapp/ .  →  dest should be /app/ (no "myapp" appended)
+        let dest = resolve_copy_dest(".", "", "/app");
+        assert_eq!(dest, "/app/", "trailing slash src should yield /app/");
+
+        // verify round-trip: relative_dest strip gives "app/" → copy_dir goes into app/
+        let relative = dest.trim_start_matches('/');
+        assert_eq!(relative, "app/");
+    }
+
+    /// Without trailing slash: directory name IS appended to dest, creating a
+    /// subdirectory.  `COPY myapp .` → dest = /app/myapp.
+    #[test]
+    fn test_copy_no_trailing_slash_dest_resolution() {
+        let dest = resolve_copy_dest(".", "myapp", "/app");
+        assert_eq!(dest, "/app/myapp");
     }
 }
