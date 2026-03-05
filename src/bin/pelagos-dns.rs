@@ -385,7 +385,14 @@ fn forward_upstream(raw: &[u8], upstream: &[Ipv4Addr]) -> Option<Vec<u8>> {
         }
 
         let mut buf = [0u8; 4096];
-        match sock.recv_from(&mut buf) {
+        // Retry on EINTR (e.g. SIGHUP delivered during the blocking recv).
+        let result = loop {
+            match sock.recv_from(&mut buf) {
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                other => break other,
+            }
+        };
+        match result {
             Ok((n, _)) => return Some(buf[..n].to_vec()),
             Err(_) => continue,
         }
