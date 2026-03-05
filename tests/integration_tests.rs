@@ -11642,9 +11642,15 @@ mod registry_auth {
             ls_json
         );
 
-        // Cleanup.
+        // Cleanup: remove re-tagged ref, the pulled alpine, the pulled registry:2, and the container.
         let _ = std::process::Command::new(bin)
             .args(["image", "rm", &dest_ref])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", "alpine"])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", "registry:2"])
             .output();
         cleanup_container(&registry_name);
     }
@@ -11906,6 +11912,12 @@ mod registry_auth {
         // ── Cleanup ────────────────────────────────────────────────────────────
         let _ = std::process::Command::new(bin)
             .args(["image", "rm", &dest_ref])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", "alpine"])
+            .output();
+        let _ = std::process::Command::new(bin)
+            .args(["image", "rm", "registry:2"])
             .output();
         cleanup_container(&registry_name);
     }

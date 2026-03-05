@@ -36,12 +36,41 @@ the container), and a real Alpine environment — all without Docker.  Pass
 
 ```bash
 # In one terminal:
-sudo pelagos run alpine /bin/sleep 30 &
+sudo pelagos run --name mybox alpine /bin/sleep 30 &
 
 # In another:
 sudo pelagos ps
-sudo pelagos logs <name>
-sudo pelagos stop <name>
+sudo pelagos logs mybox
+sudo pelagos stop mybox
+```
+
+**Exec into a running container:**
+
+Use `pelagos exec` to run a command inside a container that's already started,
+without interrupting its main process.
+
+```bash
+# Start a long-running container
+sudo pelagos run --detach --name mybox alpine /bin/sleep 120
+
+# Open a shell inside it (interactive PTY)
+sudo pelagos exec -i mybox /bin/sh
+
+# Run a one-off command (non-interactive)
+sudo pelagos exec mybox /bin/sh -c "ps aux && cat /etc/hostname"
+
+# Override working directory or user
+sudo pelagos exec --workdir /tmp --user 1000 mybox id
+```
+
+`exec` discovers the container's namespaces automatically from `/proc/<pid>/ns/`
+and joins them — the same isolation without spinning up a second rootfs.
+
+**Auto-remove on exit:**
+
+```bash
+sudo pelagos run --rm alpine /bin/echo "I vanish when I'm done"
+# No cleanup needed — container state is deleted automatically
 ```
 
 ---
@@ -132,6 +161,23 @@ sudo pelagos run mygoapp:latest
 Pelagos handles the two-stage dance: builder's `/app` (a static binary,
 `CGO_ENABLED=0`) is copied into the final image. Go, the build cache, and
 all intermediate files stay in the builder stage and never reach the output.
+
+**Sharing and distributing images:**
+
+```bash
+# Push to a registry (tag first if the registry needs a full reference)
+pelagos image tag mygoapp:latest ghcr.io/myuser/mygoapp:latest
+pelagos image push ghcr.io/myuser/mygoapp:latest
+
+# Log in to a private registry first
+echo "$TOKEN" | pelagos image login --username myuser --password-stdin ghcr.io
+
+# Save to a tar archive for offline transfer
+pelagos image save mygoapp:latest -o mygoapp.tar
+
+# Load on another machine
+pelagos image load -i mygoapp.tar
+```
 
 ---
 

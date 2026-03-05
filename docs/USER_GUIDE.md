@@ -127,6 +127,68 @@ Entrypoint, WorkingDir) is applied as defaults that CLI flags override.
 Root and rootless image stores are separate (matching Podman behavior). An image pulled
 as root is not visible rootless, and vice versa.
 
+### Tagging Images
+
+```bash
+# Create a new tag pointing to an existing image
+pelagos image tag alpine:latest myapp:v1.0
+pelagos image tag alpine myregistry.example.com/library/alpine:latest
+```
+
+Tags are references — no data is copied or duplicated.
+
+### Pushing Images
+
+```bash
+# Push to Docker Hub (requires login)
+pelagos image push myuser/myapp:v1.0
+
+# Push to a different destination
+pelagos image push myapp:v1.0 --dest myregistry.example.com/myapp:v1.0
+
+# Push to an insecure (HTTP) registry
+pelagos image push myapp:v1.0 --dest 127.0.0.1:5000/myapp:v1.0 --insecure
+
+# Push with explicit credentials (without logging in first)
+pelagos image push myapp:v1.0 --username myuser --password mypassword
+```
+
+### Registry Authentication
+
+Credentials are stored in `~/.docker/config.json` (same format as Docker and Podman).
+
+```bash
+# Log in — reads password from stdin (recommended; avoids shell history)
+echo "mypassword" | pelagos image login --username myuser --password-stdin ghcr.io
+
+# Log out — removes stored credentials for the registry
+pelagos image logout ghcr.io
+```
+
+### Saving and Loading Images
+
+Save an image to an OCI Image Layout tar archive for offline transfer or backup:
+
+```bash
+# Save to a file
+pelagos image save alpine:latest -o alpine.tar
+
+# Save to stdout (pipe to ssh, s3, etc.)
+pelagos image save alpine:latest | gzip > alpine.tar.gz
+
+# Load from a file
+pelagos image load -i alpine.tar
+
+# Load from stdin
+gunzip -c alpine.tar.gz | pelagos image load
+
+# Load and apply a specific tag (overrides any tag in the archive)
+pelagos image load -i alpine.tar --tag myalpine:imported
+```
+
+The tar format is the OCI Image Layout specification — archives produced by
+`docker image save` and `skopeo copy oci-archive:` are compatible.
+
 ---
 
 ## WebAssembly / WASI
@@ -1324,6 +1386,7 @@ pelagos run [OPTIONS] --rootfs <ROOTFS> [COMMAND [ARGS...]]
 | `--security-opt <OPT>` | | `seccomp=default\|minimal\|none`, `no-new-privileges` |
 | `--sysctl <K=V>` | | Kernel parameter (repeatable) |
 | `--masked-path <PATH>` | | Path to mask inside container (repeatable) |
+| `--rm` | | Remove container automatically when it exits |
 
 ---
 
