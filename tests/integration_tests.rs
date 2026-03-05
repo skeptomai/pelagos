@@ -11916,6 +11916,8 @@ mod registry_auth {
 // ============================================================================
 
 mod image_save_load {
+    use super::*;
+
     /// Pull alpine, save it to a tar file, remove it from the local store,
     /// load it back, and verify the image is usable by running a command.
     ///
@@ -11924,6 +11926,7 @@ mod image_save_load {
     ///   sudo -E cargo test --test integration_tests image_save_load -- --ignored --nocapture
     #[test]
     #[ignore]
+    #[serial]
     fn test_image_save_load_roundtrip() {
         let bin = env!("CARGO_BIN_EXE_pelagos");
         let reference = "docker.io/library/alpine:latest";
@@ -12030,6 +12033,8 @@ mod image_save_load {
 // ============================================================================
 
 mod image_tag {
+    use super::*;
+
     /// Pull alpine, tag it to a new reference, verify both appear in ls,
     /// and confirm the tagged image is runnable.
     ///
@@ -12038,6 +12043,7 @@ mod image_tag {
     ///   sudo -E cargo test --test integration_tests image_tag -- --ignored --nocapture
     #[test]
     #[ignore]
+    #[serial]
     fn test_image_tag_roundtrip() {
         let bin = env!("CARGO_BIN_EXE_pelagos");
         let source = "docker.io/library/alpine:latest";
