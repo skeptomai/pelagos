@@ -43,7 +43,7 @@ pelagos run --detach --name mybox alpine /bin/sleep 30
 
 pelagos ps
 pelagos logs mybox
-sudo pelagos stop mybox   # stop sends a signal — requires root for root containers
+pelagos stop mybox
 ```
 
 **Exec into a running container:**
