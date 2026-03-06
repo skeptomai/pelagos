@@ -13853,6 +13853,17 @@ mod tutorial_e2e_p1 {
         false
     }
 
+    /// Pull the alpine OCI image if it is not already cached locally.
+    /// Idempotent: fast no-op when alpine is already in the image store.
+    /// Ensures tests are self-contained when run in isolation.
+    fn ensure_alpine() {
+        let status = std::process::Command::new(bin())
+            .args(["image", "pull", "alpine"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "pre-test alpine pull failed");
+    }
+
     /// test_tut_p1_echo
     ///
     /// Rootless. Runs `pelagos run alpine /bin/echo "hello from a container"` and
@@ -13861,6 +13872,7 @@ mod tutorial_e2e_p1 {
     /// rootless overlay, and basic exec all work end-to-end.
     #[test]
     fn test_tut_p1_echo() {
+        ensure_alpine();
         let out = std::process::Command::new(bin())
             .args(["run", "alpine", "/bin/echo", "hello from a container"])
             .output()
@@ -13890,6 +13902,7 @@ mod tutorial_e2e_p1 {
     /// Failure indicates namespace setup, image layers, or Alpine config is broken.
     #[test]
     fn test_tut_p1_hostname_whoami() {
+        ensure_alpine();
         let out = std::process::Command::new(bin())
             .args([
                 "run",
@@ -13935,6 +13948,7 @@ mod tutorial_e2e_p1 {
             eprintln!("SKIP test_tut_p1_ps_logs_stop: requires root");
             return;
         }
+        ensure_alpine();
         let name = "tut-p1-ps";
         cleanup(name);
 
@@ -14002,6 +14016,7 @@ mod tutorial_e2e_p1 {
             eprintln!("SKIP test_tut_p1_exec_noninteractive: requires root");
             return;
         }
+        ensure_alpine();
         let name = "tut-p1-exec";
         cleanup(name);
 
@@ -14058,6 +14073,7 @@ mod tutorial_e2e_p1 {
         let state_dir = std::path::Path::new("/run/pelagos/containers").join(name);
 
         // Pre-clean any leftover state.
+        ensure_alpine();
         let _ = std::process::Command::new(bin())
             .args(["rm", "-f", name])
             .output();
@@ -14111,6 +14127,14 @@ mod tutorial_e2e_p2 {
         let _ = pelagos::image::remove_image(tag);
     }
 
+    fn ensure_alpine() {
+        let status = std::process::Command::new(bin())
+            .args(["image", "pull", "alpine"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "pre-test alpine pull failed");
+    }
+
     /// test_tut_p2_simple_build
     ///
     /// Rootless. Builds the image from `scripts/tutorial-e2e/p2-simple/` (a simple
@@ -14126,6 +14150,7 @@ mod tutorial_e2e_p2 {
             "/scripts/tutorial-e2e/p2-simple"
         );
         let tag = "tut-p2-simple:latest";
+        ensure_alpine();
         cleanup_image(tag);
 
         let build_out = std::process::Command::new(bin())
@@ -14179,6 +14204,7 @@ mod tutorial_e2e_p2 {
             "/scripts/tutorial-e2e/p2-simple"
         );
         let tag = "tut-p2-simple:latest";
+        ensure_alpine();
         cleanup_image(tag);
 
         // Build so we have a local image.
@@ -14332,6 +14358,14 @@ mod tutorial_e2e_p3 {
         false
     }
 
+    fn ensure_alpine() {
+        let status = std::process::Command::new(bin())
+            .args(["image", "pull", "alpine"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "pre-test alpine pull failed");
+    }
+
     /// test_tut_p3_read_only
     ///
     /// Requires root. Runs a container with `--read-only` and attempts to write to
@@ -14345,6 +14379,7 @@ mod tutorial_e2e_p3 {
             eprintln!("SKIP test_tut_p3_read_only: requires root");
             return;
         }
+        ensure_alpine();
         let out = std::process::Command::new(bin())
             .args([
                 "run",
@@ -14376,6 +14411,7 @@ mod tutorial_e2e_p3 {
             eprintln!("SKIP test_tut_p3_memory_oom: requires root");
             return;
         }
+        ensure_alpine();
         let out = std::process::Command::new(bin())
             .args([
                 "run",
@@ -14412,6 +14448,7 @@ mod tutorial_e2e_p3 {
             eprintln!("SKIP test_tut_p3_cap_drop: requires root");
             return;
         }
+        ensure_alpine();
         let out = std::process::Command::new(bin())
             .args([
                 "run",
@@ -14451,6 +14488,7 @@ mod tutorial_e2e_p3 {
             eprintln!("SKIP test_tut_p3_seccomp: requires root");
             return;
         }
+        ensure_alpine();
         let out = std::process::Command::new(bin())
             .args([
                 "run",
@@ -14483,6 +14521,7 @@ mod tutorial_e2e_p3 {
     /// connectivity, violating isolation guarantees.
     #[test]
     fn test_tut_p3_network_loopback() {
+        ensure_alpine();
         let out = std::process::Command::new(bin())
             .args([
                 "run",
@@ -14523,6 +14562,7 @@ mod tutorial_e2e_p3 {
             eprintln!("SKIP test_tut_p3_network_bridge_nat_port: requires root");
             return;
         }
+        ensure_alpine();
         let name = "tut-p3-net";
         cleanup(name);
 
@@ -14599,6 +14639,14 @@ mod tutorial_e2e_p4 {
         )
     }
 
+    fn ensure_alpine() {
+        let status = std::process::Command::new(bin())
+            .args(["image", "pull", "alpine"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "pre-test alpine pull failed");
+    }
+
     fn compose_down(project: &str) {
         let _ = std::process::Command::new(bin())
             .args(["compose", "down", "-f", stack_file(), "-p", project])
@@ -14636,6 +14684,7 @@ mod tutorial_e2e_p4 {
             eprintln!("SKIP test_tut_p4_compose_lifecycle: requires root");
             return;
         }
+        ensure_alpine();
         let project = "tut-p4-lifecycle";
         compose_down(project); // pre-clean
 
@@ -14717,6 +14766,7 @@ mod tutorial_e2e_p4 {
             eprintln!("SKIP test_tut_p4_compose_depends_on: requires root");
             return;
         }
+        ensure_alpine();
         let project = "tut-p4-deps";
         compose_down(project); // pre-clean
 
@@ -14760,6 +14810,7 @@ mod tutorial_e2e_p4 {
             eprintln!("SKIP test_tut_p4_compose_dns: requires root");
             return;
         }
+        ensure_alpine();
         let project = "tut-p4-dns";
         compose_down(project); // pre-clean
 
