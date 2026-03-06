@@ -7,7 +7,45 @@ permissions:
   contents: write
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables iproute2 passt
+      - name: Build
+        run: cargo build
+      - name: Build rootfs
+        run: sudo ./scripts/build-rootfs-tarball.sh
+      - name: Reset test environment
+        run: sudo ./scripts/reset-test-env.sh
+      - name: Run integration tests
+        run: sudo -E env "PATH=$PATH" cargo test --test integration_tests -- --test-threads=1
+
   build:
+    needs: [lint, unit-tests, integration-tests]
     strategy:
       matrix:
         include:
