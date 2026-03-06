@@ -14840,8 +14840,7 @@ mod tutorial_e2e_p4 {
 
         // Poll until DNS resolves 'db' (or 10s timeout). The DNS daemon registers
         // entries asynchronously after container start; in CI this can take a few seconds.
-        let dns_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let dns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut stdout;
         let mut stderr;
         loop {
