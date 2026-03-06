@@ -1,5 +1,4 @@
 FROM alpine
-RUN apk add --no-cache busybox-extras
 COPY server.sh /usr/local/bin/server.sh
 RUN chmod +x /usr/local/bin/server.sh
 CMD ["/usr/local/bin/server.sh"]

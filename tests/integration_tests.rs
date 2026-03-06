@@ -14710,6 +14710,11 @@ mod tutorial_e2e_p4 {
             app_name
         );
 
+        // Brief pause: individual container state files (read by `pelagos ps`) are written
+        // before the project state file (read by `compose ps`). Give the supervisor time to
+        // flush the project state so `compose ps` sees all services.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
         // compose ps should list both.
         let ps_out = std::process::Command::new(bin())
             .args(["compose", "ps", "-f", stack_file(), "-p", project])
@@ -14833,22 +14838,33 @@ mod tutorial_e2e_p4 {
             "app should be running before DNS test"
         );
 
-        // Give the DNS daemon a moment to register entries.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Try nslookup first, fall back to getent.
-        let exec_out = std::process::Command::new(bin())
-            .args([
-                "exec",
-                &app_name,
-                "/bin/sh",
-                "-c",
-                "nslookup db 2>&1 || getent hosts db 2>&1 || echo 'DNS_FAIL'",
-            ])
-            .output()
-            .expect("pelagos exec nslookup db");
-        let stdout = String::from_utf8_lossy(&exec_out.stdout);
-        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+        // Poll until DNS resolves 'db' (or 10s timeout). The DNS daemon registers
+        // entries asynchronously after container start; in CI this can take a few seconds.
+        let dns_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stdout;
+        let mut stderr;
+        loop {
+            let exec_out = std::process::Command::new(bin())
+                .args([
+                    "exec",
+                    &app_name,
+                    "/bin/sh",
+                    "-c",
+                    "nslookup db 2>&1 || getent hosts db 2>&1 || echo 'DNS_FAIL'",
+                ])
+                .output()
+                .expect("pelagos exec nslookup db");
+            stdout = String::from_utf8_lossy(&exec_out.stdout).into_owned();
+            stderr = String::from_utf8_lossy(&exec_out.stderr).into_owned();
+            if !stdout.contains("DNS_FAIL") && !stdout.contains("NXDOMAIN") {
+                break;
+            }
+            if std::time::Instant::now() >= dns_deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
 
         compose_down(project);
 
