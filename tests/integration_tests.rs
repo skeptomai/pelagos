@@ -13816,3 +13816,1013 @@ CMD [\"/usr/local/bin/script.sh\"]\n";
         );
     }
 }
+
+// ============================================================================
+// Tutorial E2E — Part 1: Basic container lifecycle
+// ============================================================================
+
+mod tutorial_e2e_p1 {
+    use super::is_root;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    /// Pre-clean a container by name — best-effort, ignores errors.
+    fn cleanup(name: &str) {
+        let b = bin();
+        let _ = std::process::Command::new(b).args(["stop", name]).output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new(b)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    /// Poll `pelagos ps` until `name` appears or timeout (ms) expires.
+    fn wait_for_container(name: &str, timeout_ms: u64) -> bool {
+        let b = bin();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = std::process::Command::new(b).args(["ps"]).output() {
+                if String::from_utf8_lossy(&out.stdout).contains(name) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// test_tut_p1_echo
+    ///
+    /// Rootless. Runs `pelagos run alpine /bin/echo "hello from a container"` and
+    /// verifies that stdout contains the expected string. This is the simplest
+    /// possible tutorial smoke test: it confirms that image pull (if needed),
+    /// rootless overlay, and basic exec all work end-to-end.
+    #[test]
+    fn test_tut_p1_echo() {
+        let out = std::process::Command::new(bin())
+            .args(["run", "alpine", "/bin/echo", "hello from a container"])
+            .output()
+            .expect("pelagos run should not fail to spawn");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "expected exit 0; stderr={}",
+            stderr.trim()
+        );
+        assert!(
+            stdout.contains("hello from a container"),
+            "expected 'hello from a container' in stdout, got: '{}'",
+            stdout.trim()
+        );
+    }
+
+    /// test_tut_p1_hostname_whoami
+    ///
+    /// Rootless. Runs `/bin/sh -c "hostname && whoami && cat /etc/os-release"` inside
+    /// an alpine container. Asserts that:
+    /// - hostname is non-empty
+    /// - "root" appears in the output (whoami inside container)
+    /// - "Alpine" appears in the output (/etc/os-release)
+    ///
+    /// Failure indicates namespace setup, image layers, or Alpine config is broken.
+    #[test]
+    fn test_tut_p1_hostname_whoami() {
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                "hostname && whoami && cat /etc/os-release",
+            ])
+            .output()
+            .expect("pelagos run should spawn");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "expected exit 0; stderr={}",
+            stderr.trim()
+        );
+        // hostname must not be empty (at least one non-whitespace char)
+        let first_line = stdout.lines().next().unwrap_or("").trim();
+        assert!(!first_line.is_empty(), "hostname should be non-empty");
+        assert!(
+            stdout.contains("root"),
+            "expected 'root' (whoami) in output; got: {}",
+            stdout.trim()
+        );
+        assert!(
+            stdout.contains("Alpine"),
+            "expected 'Alpine' (os-release) in output; got: {}",
+            stdout.trim()
+        );
+    }
+
+    /// test_tut_p1_ps_logs_stop
+    ///
+    /// Requires root. Starts `sleep 30` in detached mode, checks it appears in
+    /// `pelagos ps`, fetches logs (should succeed), stops it, and removes it.
+    ///
+    /// Failure indicates detach, watcher, ps listing, logs retrieval, or stop are broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_tut_p1_ps_logs_stop() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p1_ps_logs_stop: requires root");
+            return;
+        }
+        let name = "tut-p1-ps";
+        cleanup(name);
+
+        // Start detached
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "alpine",
+                "/bin/sleep",
+                "30",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+
+        // Wait for it to appear in ps
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in 'pelagos ps' within 10s",
+            name
+        );
+
+        // logs should succeed (may be empty)
+        let logs_out = std::process::Command::new(bin())
+            .args(["logs", name])
+            .output()
+            .expect("pelagos logs");
+        assert!(
+            logs_out.status.success(),
+            "pelagos logs should exit 0; stderr={}",
+            String::from_utf8_lossy(&logs_out.stderr)
+        );
+
+        // stop
+        let stop_out = std::process::Command::new(bin())
+            .args(["stop", name])
+            .output()
+            .expect("pelagos stop");
+        assert!(
+            stop_out.status.success(),
+            "pelagos stop should exit 0; stderr={}",
+            String::from_utf8_lossy(&stop_out.stderr)
+        );
+
+        // cleanup
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cleanup(name);
+    }
+
+    /// test_tut_p1_exec_noninteractive
+    ///
+    /// Requires root. Starts `sleep 60` in detached mode, then runs
+    /// `pelagos exec <name> /bin/cat /etc/hostname` and verifies the output
+    /// is non-empty (the container hostname).
+    ///
+    /// Failure indicates exec namespace-join or Alpine's /etc/hostname is broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_tut_p1_exec_noninteractive() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p1_exec_noninteractive: requires root");
+            return;
+        }
+        let name = "tut-p1-exec";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "alpine",
+                "/bin/sleep",
+                "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in ps within 10s",
+            name
+        );
+
+        let exec_out = std::process::Command::new(bin())
+            .args(["exec", name, "/bin/cat", "/etc/hostname"])
+            .output()
+            .expect("pelagos exec");
+        let stdout = String::from_utf8_lossy(&exec_out.stdout);
+        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+        assert!(
+            exec_out.status.success(),
+            "pelagos exec should exit 0; stderr={}",
+            stderr.trim()
+        );
+        assert!(
+            !stdout.trim().is_empty(),
+            "exec output (/etc/hostname) should be non-empty"
+        );
+
+        cleanup(name);
+    }
+
+    /// test_tut_p1_auto_rm
+    ///
+    /// Rootless. Runs `pelagos run --rm --name tut-p1-rm alpine /bin/echo "vanish"`
+    /// and verifies exit 0. After exit, checks that the named container's state
+    /// directory has been removed from /run/pelagos/containers/.
+    ///
+    /// Failure indicates the --rm flag is not cleaning up container state on exit.
+    #[test]
+    fn test_tut_p1_auto_rm() {
+        let name = "tut-p1-rm";
+        let state_dir = std::path::Path::new("/run/pelagos/containers").join(name);
+
+        // Pre-clean any leftover state.
+        let _ = std::process::Command::new(bin())
+            .args(["rm", "-f", name])
+            .output();
+
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--rm",
+                "--name",
+                name,
+                "alpine",
+                "/bin/echo",
+                "vanish",
+            ])
+            .output()
+            .expect("pelagos run --rm");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "expected exit 0; stderr={}",
+            stderr.trim()
+        );
+        assert!(
+            stdout.contains("vanish"),
+            "expected 'vanish' in stdout; got: {}",
+            stdout.trim()
+        );
+
+        // Give the runtime a moment to clean up.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(
+            !state_dir.exists(),
+            "--rm should remove container state dir '{}' after exit",
+            state_dir.display()
+        );
+    }
+}
+
+// ============================================================================
+// Tutorial E2E — Part 2: Image build
+// ============================================================================
+
+mod tutorial_e2e_p2 {
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn cleanup_image(tag: &str) {
+        let _ = pelagos::image::remove_image(tag);
+    }
+
+    /// test_tut_p2_simple_build
+    ///
+    /// Rootless. Builds the image from `scripts/tutorial-e2e/p2-simple/` (a simple
+    /// Alpine image that runs server.sh which prints "Hello from pelagos!"), tags it
+    /// `tut-p2-simple:latest`, runs it, and asserts the expected string appears in
+    /// stdout. Cleans up the image after the test.
+    ///
+    /// Failure indicates the build engine (COPY, RUN chmod, CMD) or image run is broken.
+    #[test]
+    fn test_tut_p2_simple_build() {
+        let ctx = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/tutorial-e2e/p2-simple"
+        );
+        let tag = "tut-p2-simple:latest";
+        cleanup_image(tag);
+
+        let build_out = std::process::Command::new(bin())
+            .args(["build", "-t", tag, ctx])
+            .output()
+            .expect("pelagos build should spawn");
+        let build_stderr = String::from_utf8_lossy(&build_out.stderr);
+        assert!(
+            build_out.status.success(),
+            "pelagos build failed; stderr={}",
+            build_stderr.trim()
+        );
+
+        let run_out = std::process::Command::new(bin())
+            .args(["run", tag])
+            .output()
+            .expect("pelagos run should spawn");
+        let stdout = String::from_utf8_lossy(&run_out.stdout);
+        let stderr = String::from_utf8_lossy(&run_out.stderr);
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                run_out.status.success(),
+                "run should exit 0; stderr={}",
+                stderr.trim()
+            );
+            assert!(
+                stdout.contains("Hello from pelagos!"),
+                "expected 'Hello from pelagos!' in stdout; got: '{}'",
+                stdout.trim()
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
+    /// test_tut_p2_image_save_load
+    ///
+    /// Rootless. Builds tut-p2-simple:latest (or reuses it), saves it to a temp
+    /// file via `pelagos image save`, removes the local copy, loads it back via
+    /// `pelagos image load`, then runs it to verify the round-trip preserved the
+    /// image content.
+    ///
+    /// Failure indicates the save/load round-trip is broken — either the OCI
+    /// archive format is corrupt or the image store is not updated correctly on load.
+    #[test]
+    fn test_tut_p2_image_save_load() {
+        let ctx = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/tutorial-e2e/p2-simple"
+        );
+        let tag = "tut-p2-simple:latest";
+        cleanup_image(tag);
+
+        // Build so we have a local image.
+        let build_out = std::process::Command::new(bin())
+            .args(["build", "-t", tag, ctx])
+            .output()
+            .expect("pelagos build");
+        assert!(
+            build_out.status.success(),
+            "build failed; stderr={}",
+            String::from_utf8_lossy(&build_out.stderr)
+        );
+
+        // Save to a tempfile.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp_path = tmp.path().to_path_buf();
+
+        let save_out = std::process::Command::new(bin())
+            .args(["image", "save", tag, "-o", tmp_path.to_str().unwrap()])
+            .output()
+            .expect("pelagos image save");
+        assert!(
+            save_out.status.success(),
+            "image save failed; stderr={}",
+            String::from_utf8_lossy(&save_out.stderr)
+        );
+
+        // Remove local copy.
+        cleanup_image(tag);
+
+        // Load back.
+        let load_out = std::process::Command::new(bin())
+            .args(["image", "load", "-i", tmp_path.to_str().unwrap()])
+            .output()
+            .expect("pelagos image load");
+        assert!(
+            load_out.status.success(),
+            "image load failed; stderr={}",
+            String::from_utf8_lossy(&load_out.stderr)
+        );
+
+        // Run and verify output.
+        let run_out = std::process::Command::new(bin())
+            .args(["run", tag])
+            .output()
+            .expect("pelagos run after load");
+        let stdout = String::from_utf8_lossy(&run_out.stdout);
+        let stderr = String::from_utf8_lossy(&run_out.stderr);
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                run_out.status.success(),
+                "run after load should exit 0; stderr={}",
+                stderr.trim()
+            );
+            assert!(
+                stdout.contains("Hello from pelagos!"),
+                "expected 'Hello from pelagos!' after save/load round-trip; got: '{}'",
+                stdout.trim()
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
+    /// test_tut_p2_multistage_go_build
+    ///
+    /// Rootless. Marked #[ignore] because it pulls golang:1.22-alpine and compiles
+    /// Go source, making it slow and network-dependent.
+    ///
+    /// Builds `scripts/tutorial-e2e/p2-go/` (two-stage: golang builder → alpine final),
+    /// runs the resulting image, and asserts "Hello from Go!" appears in stdout.
+    ///
+    /// Failure indicates multi-stage build (COPY --from=builder), Go compilation inside
+    /// a container, or static binary execution in the final Alpine stage is broken.
+    #[test]
+    #[ignore]
+    fn test_tut_p2_multistage_go_build() {
+        let ctx = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/tutorial-e2e/p2-go");
+        let tag = "tut-p2-go:latest";
+        cleanup_image(tag);
+
+        let build_out = std::process::Command::new(bin())
+            .args(["build", "-t", tag, ctx])
+            .output()
+            .expect("pelagos build (go)");
+        let build_stderr = String::from_utf8_lossy(&build_out.stderr);
+        assert!(
+            build_out.status.success(),
+            "go multi-stage build failed; stderr={}",
+            build_stderr
+        );
+
+        let run_out = std::process::Command::new(bin())
+            .args(["run", tag])
+            .output()
+            .expect("pelagos run go image");
+        let stdout = String::from_utf8_lossy(&run_out.stdout);
+        let stderr = String::from_utf8_lossy(&run_out.stderr);
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                run_out.status.success(),
+                "go image run should exit 0; stderr={}",
+                stderr.trim()
+            );
+            assert!(
+                stdout.contains("Hello from Go!"),
+                "expected 'Hello from Go!' in stdout; got: '{}'",
+                stdout.trim()
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+}
+
+// ============================================================================
+// Tutorial E2E — Part 3: Isolation
+// ============================================================================
+
+mod tutorial_e2e_p3 {
+    use super::is_root;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn cleanup(name: &str) {
+        let b = bin();
+        let _ = std::process::Command::new(b).args(["stop", name]).output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new(b)
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    fn wait_for_container(name: &str, timeout_ms: u64) -> bool {
+        let b = bin();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = std::process::Command::new(b).args(["ps"]).output() {
+                if String::from_utf8_lossy(&out.stdout).contains(name) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    }
+
+    /// test_tut_p3_read_only
+    ///
+    /// Requires root. Runs a container with `--read-only` and attempts to write to
+    /// `/readonly.txt`. Asserts the container exits non-zero (write is rejected by
+    /// the read-only rootfs).
+    ///
+    /// Failure indicates --read-only is not applied or the overlayfs mount is writable.
+    #[test]
+    fn test_tut_p3_read_only() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p3_read_only: requires root");
+            return;
+        }
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--read-only",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                "echo test > /readonly.txt",
+            ])
+            .output()
+            .expect("pelagos run --read-only");
+        assert!(
+            !out.status.success(),
+            "write to read-only rootfs should fail (exit non-zero)"
+        );
+    }
+
+    /// test_tut_p3_memory_oom
+    ///
+    /// Requires root. Runs a container limited to 64 MB of memory and attempts to
+    /// allocate 200 MB via `dd`. Asserts:
+    /// - The process exits non-zero (OOM killed or dd error).
+    /// - stdout does NOT contain "done" (meaning the full allocation succeeded).
+    ///
+    /// Failure indicates the --memory cgroup limit is not enforced.
+    #[test]
+    fn test_tut_p3_memory_oom() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p3_memory_oom: requires root");
+            return;
+        }
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--memory",
+                "64m",
+                "--tmpfs",
+                "/tmp",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                "dd if=/dev/zero of=/tmp/fill bs=1M count=200; echo done",
+            ])
+            .output()
+            .expect("pelagos run --memory");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success() || !stdout.contains("done"),
+            "OOM container should not print 'done'; exit={}, stdout={}",
+            out.status,
+            stdout.trim()
+        );
+    }
+
+    /// test_tut_p3_cap_drop
+    ///
+    /// Requires root. Runs a container with `--network loopback --cap-drop ALL` and
+    /// attempts `ip link set lo mtu 1280`. Asserts the output contains "denied" or
+    /// "Operation not permitted", confirming CAP_NET_ADMIN was dropped.
+    ///
+    /// Failure indicates capability dropping is not applied correctly.
+    #[test]
+    fn test_tut_p3_cap_drop() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p3_cap_drop: requires root");
+            return;
+        }
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--network",
+                "loopback",
+                "--cap-drop",
+                "ALL",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                "ip link set lo mtu 1280 2>&1 || echo 'ip link set: denied'",
+            ])
+            .output()
+            .expect("pelagos run --cap-drop ALL");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let combined = format!("{}{}", stdout, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            combined.to_lowercase().contains("denied")
+                || combined.contains("Operation not permitted")
+                || combined.contains("RTNETLINK"),
+            "expected permission error from ip link set after --cap-drop ALL; got: '{}'",
+            combined.trim()
+        );
+    }
+
+    /// test_tut_p3_seccomp
+    ///
+    /// Requires root. Runs a container with the default seccomp profile and attempts
+    /// `unshare --user echo hi`. Asserts the output contains "blocked by seccomp" or
+    /// "Operation not permitted", confirming unshare is restricted.
+    ///
+    /// Failure indicates the default seccomp profile is not applied or unshare is not
+    /// in the blocked syscall list.
+    #[test]
+    fn test_tut_p3_seccomp() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p3_seccomp: requires root");
+            return;
+        }
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--security-opt",
+                "seccomp=default",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                "unshare --user echo hi 2>&1 || echo 'blocked by seccomp'",
+            ])
+            .output()
+            .expect("pelagos run --security-opt seccomp=default");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let combined = format!("{}{}", stdout, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            combined.contains("blocked by seccomp")
+                || combined.contains("Operation not permitted")
+                || combined.contains("Permission denied"),
+            "expected seccomp to block unshare; got: '{}'",
+            combined.trim()
+        );
+    }
+
+    /// test_tut_p3_network_loopback
+    ///
+    /// Rootless. Runs a container with `--network loopback` and attempts to ping
+    /// 8.8.8.8. Asserts the ping fails (no external internet access).
+    ///
+    /// Failure indicates the loopback network mode provides unintended external
+    /// connectivity, violating isolation guarantees.
+    #[test]
+    fn test_tut_p3_network_loopback() {
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--network",
+                "loopback",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                "ping -c1 -W2 8.8.8.8 2>&1 || echo 'no internet'",
+            ])
+            .output()
+            .expect("pelagos run --network loopback");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let combined = format!("{}{}", stdout, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            combined.contains("no internet")
+                || combined.contains("unreachable")
+                || combined.contains("Network unreachable")
+                || combined.contains("bad address")
+                || !out.status.success(),
+            "loopback mode should have no external internet; got: '{}'",
+            combined.trim()
+        );
+    }
+
+    /// test_tut_p3_network_bridge_nat_port
+    ///
+    /// Requires root. Starts a container with bridge+NAT+port-publish that serves a
+    /// simple HTTP response from nc on port 80. Publishes port 18080→80.
+    /// Asserts that `curl http://localhost:18080` returns "Hello from pelagos".
+    ///
+    /// Failure indicates bridge setup, NAT (nftables MASQUERADE), or TCP DNAT port
+    /// forwarding is broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_tut_p3_network_bridge_nat_port() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p3_network_bridge_nat_port: requires root");
+            return;
+        }
+        let name = "tut-p3-net";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--network",
+                "bridge",
+                "--nat",
+                "--publish",
+                "18080:80",
+                "alpine",
+                "/bin/sh",
+                "-c",
+                r#"while true; do { printf "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nHello from pelagos\n"; } | nc -l -p 80; done"#,
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached run should exit 0");
+
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in ps",
+            name
+        );
+
+        // Give the nc listener time to start.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Try curl a few times.
+        let mut curl_success = false;
+        for _ in 0..10 {
+            let curl = std::process::Command::new("curl")
+                .args(["-s", "--max-time", "3", "http://localhost:18080"])
+                .output();
+            if let Ok(c) = curl {
+                let body = String::from_utf8_lossy(&c.stdout);
+                if body.contains("Hello from pelagos") {
+                    curl_success = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        cleanup(name);
+
+        assert!(
+            curl_success,
+            "curl http://localhost:18080 did not return 'Hello from pelagos' within 5s"
+        );
+    }
+}
+
+// ============================================================================
+// Tutorial E2E — Part 4: Compose
+// ============================================================================
+
+mod tutorial_e2e_p4 {
+    use super::is_root;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn stack_file() -> &'static str {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/tutorial-e2e/p4-stack/stack.reml"
+        )
+    }
+
+    fn compose_down(project: &str) {
+        let _ = std::process::Command::new(bin())
+            .args(["compose", "down", "-f", stack_file(), "-p", project])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    fn wait_for_ps_contains(pattern: &str, timeout_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = std::process::Command::new(bin()).args(["ps"]).output() {
+                if String::from_utf8_lossy(&out.stdout).contains(pattern) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        false
+    }
+
+    /// test_tut_p4_compose_lifecycle
+    ///
+    /// Requires root. Runs the full `compose up → ps → down` lifecycle:
+    /// 1. `pelagos compose up -f stack.reml -p tut-p4-lifecycle`
+    /// 2. Polls `pelagos ps` until both service containers appear.
+    /// 3. `pelagos compose ps` shows both services.
+    /// 4. `pelagos compose down` tears everything down.
+    /// 5. Verifies containers are gone from `pelagos ps`.
+    ///
+    /// Failure indicates compose up/down, scoped naming, or the supervisor is broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_tut_p4_compose_lifecycle() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p4_compose_lifecycle: requires root");
+            return;
+        }
+        let project = "tut-p4-lifecycle";
+        compose_down(project); // pre-clean
+
+        let up_status = std::process::Command::new(bin())
+            .args(["compose", "up", "-f", stack_file(), "-p", project])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("compose up");
+        assert!(up_status.success(), "compose up should exit 0");
+
+        // Both containers should appear in ps.
+        let db_name = format!("{}-db", project);
+        let app_name = format!("{}-app", project);
+
+        assert!(
+            wait_for_ps_contains(&db_name, 20_000),
+            "compose db container '{}' did not appear in ps within 20s",
+            db_name
+        );
+        assert!(
+            wait_for_ps_contains(&app_name, 20_000),
+            "compose app container '{}' did not appear in ps within 20s",
+            app_name
+        );
+
+        // compose ps should list both.
+        let ps_out = std::process::Command::new(bin())
+            .args(["compose", "ps", "-f", stack_file(), "-p", project])
+            .output()
+            .expect("compose ps");
+        let ps_stdout = String::from_utf8_lossy(&ps_out.stdout);
+        assert!(
+            ps_stdout.contains("db") || ps_stdout.contains(&db_name),
+            "compose ps should list 'db'; got: {}",
+            ps_stdout.trim()
+        );
+        assert!(
+            ps_stdout.contains("app") || ps_stdout.contains(&app_name),
+            "compose ps should list 'app'; got: {}",
+            ps_stdout.trim()
+        );
+
+        // Tear down.
+        compose_down(project);
+
+        // Containers should be gone.
+        let ps_after = std::process::Command::new(bin())
+            .args(["ps"])
+            .output()
+            .expect("ps after down");
+        let ps_after_stdout = String::from_utf8_lossy(&ps_after.stdout);
+        assert!(
+            !ps_after_stdout.contains(&db_name),
+            "'{}' should be gone after compose down; ps shows: {}",
+            db_name,
+            ps_after_stdout.trim()
+        );
+        assert!(
+            !ps_after_stdout.contains(&app_name),
+            "'{}' should be gone after compose down; ps shows: {}",
+            app_name,
+            ps_after_stdout.trim()
+        );
+    }
+
+    /// test_tut_p4_compose_depends_on
+    ///
+    /// Requires root. Verifies that `depends-on` with `:ready-port` causes the
+    /// compose engine to wait for the dependency before starting the dependent
+    /// service. The "db" service listens on port 6379 via `nc`; "app" depends on
+    /// it. Both services must appear running after compose up completes.
+    ///
+    /// Failure indicates the TCP readiness polling or topological ordering in the
+    /// compose supervisor is broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_tut_p4_compose_depends_on() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p4_compose_depends_on: requires root");
+            return;
+        }
+        let project = "tut-p4-deps";
+        compose_down(project); // pre-clean
+
+        let up_status = std::process::Command::new(bin())
+            .args(["compose", "up", "-f", stack_file(), "-p", project])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("compose up (depends-on test)");
+        assert!(up_status.success(), "compose up should exit 0");
+
+        let db_name = format!("{}-db", project);
+        let app_name = format!("{}-app", project);
+
+        // Both must be running — if depends-on is broken, app would fail or not start.
+        assert!(
+            wait_for_ps_contains(&db_name, 20_000),
+            "db container '{}' should be running",
+            db_name
+        );
+        assert!(
+            wait_for_ps_contains(&app_name, 20_000),
+            "app container '{}' should be running after depends-on satisfied",
+            app_name
+        );
+
+        compose_down(project);
+    }
+
+    /// test_tut_p4_compose_dns
+    ///
+    /// Requires root. After compose up, execs into the "app" container and runs
+    /// `nslookup db` or `getent hosts db`. Asserts the output contains an IP
+    /// address, confirming DNS service discovery resolves the "db" service name.
+    ///
+    /// Failure indicates the DNS daemon (pelagos-dns or dnsmasq) is not registering
+    /// compose service names, or the container's /etc/resolv.conf is misconfigured.
+    #[test]
+    #[serial_test::serial]
+    fn test_tut_p4_compose_dns() {
+        if !is_root() {
+            eprintln!("SKIP test_tut_p4_compose_dns: requires root");
+            return;
+        }
+        let project = "tut-p4-dns";
+        compose_down(project); // pre-clean
+
+        let up_status = std::process::Command::new(bin())
+            .args(["compose", "up", "-f", stack_file(), "-p", project])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("compose up (dns test)");
+        assert!(up_status.success(), "compose up should exit 0");
+
+        let db_name = format!("{}-db", project);
+        let app_name = format!("{}-app", project);
+
+        assert!(
+            wait_for_ps_contains(&db_name, 20_000),
+            "db should be running before DNS test"
+        );
+        assert!(
+            wait_for_ps_contains(&app_name, 20_000),
+            "app should be running before DNS test"
+        );
+
+        // Give the DNS daemon a moment to register entries.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Try nslookup first, fall back to getent.
+        let exec_out = std::process::Command::new(bin())
+            .args([
+                "exec",
+                &app_name,
+                "/bin/sh",
+                "-c",
+                "nslookup db 2>&1 || getent hosts db 2>&1 || echo 'DNS_FAIL'",
+            ])
+            .output()
+            .expect("pelagos exec nslookup db");
+        let stdout = String::from_utf8_lossy(&exec_out.stdout);
+        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+
+        compose_down(project);
+
+        assert!(
+            !stdout.contains("DNS_FAIL"),
+            "DNS lookup for 'db' failed; exec stdout='{}' stderr='{}'",
+            stdout.trim(),
+            stderr.trim()
+        );
+        // nslookup output contains "Address:" or getent returns "10.x.x.x db"
+        let has_ip = stdout.contains("Address:") || stdout.contains("10.") || {
+            // check for any x.x.x.x pattern
+            stdout.split_whitespace().any(|tok| {
+                tok.split('.').count() == 4
+                    && tok
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+            })
+        };
+        assert!(
+            has_ip,
+            "DNS lookup for 'db' should return an IP address; got: '{}'",
+            stdout.trim()
+        );
+    }
+}

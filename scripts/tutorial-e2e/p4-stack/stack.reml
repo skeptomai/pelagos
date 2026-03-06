@@ -1,0 +1,23 @@
+;;; Tutorial e2e Part 4 stack.
+;;;
+;;; Two services:
+;;;   db  — listens on port 6379 (nc echo loop)
+;;;   app — depends on db:6379, sleeps 300s
+;;;
+;;; Usage (tests supply a unique -p project name):
+;;;   sudo pelagos compose up -f stack.reml -p <project>
+
+(compose-up
+  (compose
+    (network "tut-p4-net" '(subnet "10.91.0.0/24"))
+
+    (service "db"
+      '(image "alpine")
+      '(network "tut-p4-net")
+      '(command "/bin/sh" "-c" "while true; do echo pong | nc -l -p 6379; done"))
+
+    (service "app"
+      '(image "alpine")
+      '(network "tut-p4-net")
+      (list 'depends-on "db" 6379)
+      '(command "/bin/sh" "-c" "sleep 300"))))

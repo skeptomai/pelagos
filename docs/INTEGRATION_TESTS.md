@@ -2794,3 +2794,178 @@ This validates the rootless-first guard in `src/cli/run.rs`: when a non-root use
 requests bridge networking, NAT, or port publishing, Pelagos should print a friendly
 error and exit immediately rather than failing deep in the network setup with a
 cryptic kernel error. Failure indicates the guard was removed or is not reached.
+
+---
+
+## tutorial_e2e_p1 — Basic container lifecycle
+
+### `test_tut_p1_echo`
+**Requires:** rootless (group access to image store)
+
+Runs `pelagos run alpine /bin/echo "hello from a container"` and asserts stdout
+contains the expected string. The simplest possible CLI smoke test: confirms image
+pull (if needed), rootless overlay setup, and basic exec all work end-to-end.
+
+Failure indicates something is fundamentally broken with image unpacking, rootless
+overlay, or process exec.
+
+### `test_tut_p1_hostname_whoami`
+**Requires:** rootless
+
+Runs `/bin/sh -c "hostname && whoami && cat /etc/os-release"` inside an Alpine
+container and asserts: hostname is non-empty, "root" appears in output (whoami),
+and "Alpine" appears in output (/etc/os-release).
+
+Failure indicates namespace setup, UTS isolation, or Alpine image layer extraction
+is broken.
+
+### `test_tut_p1_ps_logs_stop`
+**Requires:** root
+
+Starts `sleep 30` with `--detach --name tut-p1-ps`, polls `pelagos ps` until the
+container appears (up to 10s), calls `pelagos logs` (asserts exit 0), calls
+`pelagos stop`, then cleans up. Uses `#[serial]` to avoid concurrent name clashes.
+
+Failure indicates detach, watcher, ps listing, log retrieval, or stop/rm are broken.
+
+### `test_tut_p1_exec_noninteractive`
+**Requires:** root
+
+Starts `sleep 60` detached, polls until running, then calls `pelagos exec <name>
+/bin/cat /etc/hostname` and asserts the output is non-empty.
+
+Failure indicates exec namespace-join, the watcher state file, or Alpine's
+/etc/hostname is broken.
+
+### `test_tut_p1_auto_rm`
+**Requires:** rootless
+
+Runs `pelagos run --rm --name tut-p1-rm alpine /bin/echo "vanish"`, asserts exit 0
+and "vanish" in stdout, then asserts that `/run/pelagos/containers/tut-p1-rm/` does
+not exist after exit.
+
+Failure indicates the `--rm` auto-cleanup path in the watcher is not removing the
+container state directory on exit.
+
+---
+
+## tutorial_e2e_p2 — Image build
+
+### `test_tut_p2_simple_build`
+**Requires:** rootless (group access to layer store)
+
+Builds the image from `scripts/tutorial-e2e/p2-simple/` (FROM alpine, RUN apk add,
+COPY server.sh, RUN chmod, CMD). Runs the resulting image and asserts "Hello from
+pelagos!" appears in stdout. Cleans up the image tag after the test.
+
+Failure indicates the build engine (COPY, RUN chmod, CMD exec) or image run is broken.
+
+### `test_tut_p2_image_save_load`
+**Requires:** rootless
+
+Builds `tut-p2-simple:latest`, saves it with `pelagos image save -o <tmpfile>`,
+removes the local copy, then loads it back with `pelagos image load -i <tmpfile>`,
+runs it, and asserts "Hello from pelagos!" in stdout.
+
+Failure indicates the OCI archive save/load round-trip is broken — either the tar
+format is wrong or the image store is not updated correctly on load.
+
+### `test_tut_p2_multistage_go_build`
+**Requires:** rootless, network access (Go module proxy) — `#[ignore]` (slow)
+
+Builds `scripts/tutorial-e2e/p2-go/` (two-stage: `golang:1.22-alpine` builder
+→ Alpine final). Runs the image and asserts "Hello from Go!" in stdout.
+
+Failure indicates multi-stage build (`COPY --from=builder`), Go compilation inside
+a container, or static binary execution in the final Alpine stage is broken.
+
+---
+
+## tutorial_e2e_p3 — Isolation
+
+### `test_tut_p3_read_only`
+**Requires:** root
+
+Runs with `--read-only` and attempts `echo test > /readonly.txt`. Asserts non-zero
+exit (write rejected by read-only rootfs).
+
+Failure indicates `--read-only` is not applied or the overlayfs upper layer is still
+writable.
+
+### `test_tut_p3_memory_oom`
+**Requires:** root
+
+Runs with `--memory 64m --tmpfs /tmp` and attempts to allocate 200 MB via `dd`.
+Asserts the process exits non-zero OR stdout does not contain "done".
+
+Failure indicates the cgroup v2 memory limit is not enforced.
+
+### `test_tut_p3_cap_drop`
+**Requires:** root
+
+Runs with `--network loopback --cap-drop ALL` and attempts `ip link set lo mtu 1280`.
+Asserts the output contains "denied", "Operation not permitted", or "RTNETLINK".
+
+Failure indicates capability dropping (`--cap-drop ALL`) is not applied correctly.
+
+### `test_tut_p3_seccomp`
+**Requires:** root
+
+Runs with `--security-opt seccomp=default` and attempts `unshare --user echo hi`.
+Asserts the output contains a permission error or "blocked by seccomp".
+
+Failure indicates the default seccomp profile is not applied or `unshare` syscall
+is missing from the blocked list.
+
+### `test_tut_p3_network_loopback`
+**Requires:** rootless
+
+Runs with `--network loopback` and attempts `ping -c1 8.8.8.8`. Asserts the ping
+fails (no external internet access in loopback mode).
+
+Failure indicates the loopback network mode provides unintended external connectivity.
+
+### `test_tut_p3_network_bridge_nat_port`
+**Requires:** root
+
+Starts a detached container with `--network bridge --nat --publish 18080:80` running
+an nc loop that serves a static HTTP response. Polls `curl http://localhost:18080`
+until it returns "Hello from pelagos" (up to ~5s). Uses `#[serial]`.
+
+Failure indicates bridge creation, NAT (nftables MASQUERADE), or TCP DNAT port
+forwarding is broken.
+
+---
+
+## tutorial_e2e_p4 — Compose
+
+### `test_tut_p4_compose_lifecycle`
+**Requires:** root
+
+Runs `compose up -f stack.reml -p tut-p4-lifecycle`, polls `pelagos ps` until both
+`tut-p4-lifecycle-db` and `tut-p4-lifecycle-app` appear, asserts both appear in
+`compose ps`, then runs `compose down` and asserts both are gone from `ps`.
+Uses `#[serial]`.
+
+Failure indicates compose up/down, scoped container naming, or the supervisor
+lifecycle is broken.
+
+### `test_tut_p4_compose_depends_on`
+**Requires:** root
+
+Runs the same two-service stack with `depends-on (db :ready-port 6379)`. Asserts
+both services are running after `compose up` completes. Uses `#[serial]`.
+
+Failure indicates the TCP readiness polling or topological ordering (Kahn's
+algorithm) in the compose supervisor is broken.
+
+### `test_tut_p4_compose_dns`
+**Requires:** root
+
+Starts the two-service stack, then runs `pelagos exec <app-container> /bin/sh -c
+"nslookup db 2>&1 || getent hosts db 2>&1 || echo DNS_FAIL"`. Asserts the output
+does not contain "DNS_FAIL" and contains an IP address.
+
+Failure indicates the DNS daemon (pelagos-dns) is not registering compose service
+names, the container's /etc/resolv.conf is misconfigured, or the DNS TCP readiness
+wait in depends-on is exposing a race with DNS registration.

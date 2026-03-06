@@ -1,0 +1,8 @@
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY main.go .
+RUN go build -o hello main.go
+
+FROM alpine
+COPY --from=builder /app/hello /usr/local/bin/hello
+CMD ["/usr/local/bin/hello"]
