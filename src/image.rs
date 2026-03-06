@@ -72,9 +72,16 @@ fn ensure_image_dirs() -> io::Result<()> {
 /// group members can remove images/layers that root created.
 #[cfg(unix)]
 pub fn create_store_dir(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))?;
+    // Only set permissions when we own the directory.  Root-created dirs
+    // (encountered in mixed root/rootless builds) cannot be chmod'd by non-root;
+    // they already have the correct group-writable bits from their original creation.
+    let meta = std::fs::metadata(path)?;
+    if meta.uid() == unsafe { libc::getuid() } {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))?;
+    }
     Ok(())
 }
 
@@ -255,7 +262,16 @@ pub fn oci_config_path(reference: &str) -> std::path::PathBuf {
 
 /// Save raw OCI config JSON to the image directory.
 pub fn save_oci_config(reference: &str, config_json: &str) -> io::Result<()> {
-    std::fs::write(oci_config_path(reference), config_json)
+    let path = oci_config_path(reference);
+    if let Err(e) = std::fs::write(&path, config_json) {
+        if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, config_json)?;
+        } else {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Load raw OCI config JSON from the image directory.
@@ -465,7 +481,19 @@ pub fn save_image(manifest: &ImageManifest) -> io::Result<()> {
     create_store_dir(&dir)?;
     let json =
         serde_json::to_string_pretty(manifest).map_err(|e| io::Error::other(e.to_string()))?;
-    std::fs::write(dir.join("manifest.json"), json)
+    let manifest_path = dir.join("manifest.json");
+    // If an existing root-owned manifest.json can't be overwritten directly,
+    // remove it first (the dir has group-write so we can unlink even without
+    // owning the file) and then write the new one.
+    if let Err(e) = std::fs::write(&manifest_path, &json) {
+        if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+            let _ = std::fs::remove_file(&manifest_path);
+            std::fs::write(&manifest_path, &json)?;
+        } else {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Load an image manifest from disk.

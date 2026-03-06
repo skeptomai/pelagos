@@ -1529,6 +1529,7 @@ fn append_dir_all_no_follow<W: io::Write>(
         let name = prefix.join(entry.file_name());
         let path = entry.path();
 
+        log::debug!("tar: adding {:?} (name={:?})", path, name);
         if ft.is_dir() {
             builder.append_dir(&name, &path)?;
             append_dir_all_no_follow(builder, &name, &path)?;
@@ -1543,10 +1544,17 @@ fn append_dir_all_no_follow<W: io::Write>(
             header.set_uid(std::os::unix::fs::MetadataExt::uid(&meta) as u64);
             header.set_gid(std::os::unix::fs::MetadataExt::gid(&meta) as u64);
             header.set_mtime(std::os::unix::fs::MetadataExt::mtime(&meta) as u64);
+            // Use set_link_name + append_data instead of append_link.
+            // append_link calls path2bytes() on the target, which rejects absolute
+            // symlink targets with "paths in archives must be relative".  Absolute
+            // symlinks are valid (e.g. Go build temp dirs, Alpine SDK), so we set
+            // the link name directly in the header (set_link_name allows absolute
+            // targets) and then write the header via append_data with an empty body.
+            header.set_link_name(&target)?;
             header.set_cksum();
-            builder.append_link(&mut header, &name, &target)?;
-        } else {
-            // Regular file (or special file — best-effort).
+            builder.append_data(&mut header, &name, std::io::empty())?;
+        } else if ft.is_file() {
+            // Regular file.
             match builder.append_path_with_name(&path, &name) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1554,6 +1562,40 @@ fn append_dir_all_no_follow<W: io::Write>(
                     log::debug!("skipping vanished file: {}", path.display());
                 }
                 Err(e) => return Err(e),
+            }
+        } else {
+            // Special file (char device, block device, fifo, socket).
+            // The tar crate's append_path_with_name calls append_special() which
+            // incorrectly uses the HOST path as the archive entry name (an absolute
+            // path), causing "paths in archives must be relative".  Handle special
+            // files ourselves.
+            //
+            // Overlayfs/fuse-overlayfs represents deleted files as char device 0,0
+            // (whiteout markers).  Convert these to OCI-standard .wh.FILENAME entries.
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = path.symlink_metadata()?;
+            let rdev = meta.rdev();
+            if rdev == 0 {
+                // Char device 0,0 → overlayfs whiteout.  Emit .wh.<name> file.
+                let parent = name.parent().unwrap_or(Path::new("."));
+                let basename = name
+                    .file_name()
+                    .map(|n| format!(".wh.{}", n.to_string_lossy()))
+                    .unwrap_or_default();
+                if !basename.is_empty() {
+                    let wh_name = parent.join(&basename);
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(0);
+                    header.set_mode(0o444);
+                    header.set_cksum();
+                    builder.append_data(&mut header, &wh_name, std::io::empty())?;
+                    log::debug!("tar: whiteout {:?} → {:?}", name, wh_name);
+                }
+            } else {
+                // Other special files (non-whiteout device nodes, fifos, sockets)
+                // cannot be meaningfully archived in OCI layers — skip them.
+                log::debug!("tar: skipping special file: {}", path.display());
             }
         }
     }
@@ -1583,9 +1625,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), io::Error> {
             // Remove existing symlink/file if present.
             let _ = std::fs::remove_file(&dest_path);
             std::os::unix::fs::symlink(target, &dest_path)?;
-        } else {
+        } else if file_type.is_file() {
             std::fs::copy(entry.path(), &dest_path)?;
         }
+        // Special files (char/block device, fifo, socket) are skipped.
+        // Overlayfs whiteouts are char device 0,0; they represent deletions and
+        // do not correspond to real files in the layer store.
     }
     Ok(())
 }
