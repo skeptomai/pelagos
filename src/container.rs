@@ -134,7 +134,7 @@ pub use crate::seccomp::SeccompProfile;
 /// btrfs statically via statfs(2) rather than by probing mkdir success.
 fn layer_store_is_btrfs() -> bool {
     // BTRFS_SUPER_MAGIC from <linux/magic.h>
-    const BTRFS_SUPER_MAGIC: libc::__fsword_t = 0x9123683e;
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123683e;
     let layer_store = crate::paths::layers_dir();
     let Ok(path_c) = std::ffi::CString::new(layer_store.as_os_str().as_encoded_bytes()) else {
         return false;
@@ -143,7 +143,7 @@ fn layer_store_is_btrfs() -> bool {
     if unsafe { libc::statfs(path_c.as_ptr(), &mut sfs) } != 0 {
         return false;
     }
-    sfs.f_type == BTRFS_SUPER_MAGIC
+    sfs.f_type as u64 == BTRFS_SUPER_MAGIC
 }
 
 /// Probe whether native overlayfs with `userxattr` is supported (kernel 5.11+).
