@@ -247,7 +247,8 @@ sudo pelagos run --security-opt seccomp=default alpine \
 pelagos run --network loopback alpine /bin/sh -c "ping -c1 8.8.8.8 || echo 'no internet — good'"
 
 # Full internet via pasta — rootless-compatible, no kernel bridge required
-pelagos run --network pasta alpine /bin/sh -c "wget -qO- https://example.com | head -5"
+# icanhazip.com returns your public IP — confirms pasta is routing through the host
+pelagos run --network pasta alpine /bin/sh -c "wget -qO- https://icanhazip.com"
 
 # Bridge with NAT and a port mapping — requires root (host bridge + nftables)
 sudo pelagos run --network bridge --nat --publish 8080:80 alpine \
