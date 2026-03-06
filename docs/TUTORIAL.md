@@ -230,11 +230,14 @@ namespace (without it the container sees all host interfaces). `ip link` alone
 (read-only listing) never requires any capability — you must attempt a *mutating*
 operation like setting the MTU to prove `CAP_NET_ADMIN` is gone.
 
-**Seccomp — Docker's default profile out of the box:**
+**Seccomp — block dangerous syscalls:**
 
 ```bash
-sudo pelagos run alpine /usr/bin/strace /bin/true 2>&1 | head -5
-# strace fails — ptrace is blocked
+# Opt in to Docker's default seccomp profile; unshare (user namespace) is blocked
+sudo pelagos run --security-opt seccomp=default alpine \
+  /bin/sh -c "unshare --user echo hi 2>&1 || echo 'blocked by seccomp'"
+# unshare: unshare(0x10000000): Operation not permitted
+# blocked by seccomp
 ```
 
 **Networking modes:**

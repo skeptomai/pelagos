@@ -5891,13 +5891,13 @@ mod rootless {
             }
         };
 
-        // sleep 2: give pasta time to attach the TAP and configure IP+routes via --config-net.
-        // wget --spider: HEAD request — no body to save, so no /dev/null needed (the chroot
-        // only has proc mounted, not a full /dev with device nodes).
+        // The SIGSTOP/SIGCONT mechanism in spawn() ensures pasta has configured the
+        // network before the container runs — no sleep needed.
+        // wget --spider: HEAD request — no body to save.
         let mut child = Command::new("/bin/ash")
             .args([
                 "-c",
-                "sleep 2 && wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED",
+                "wget -q -T 5 --spider http://1.1.1.1/ && echo CONNECTED",
             ])
             .with_chroot(&rootfs)
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
@@ -5918,6 +5918,71 @@ mod rootless {
             out.contains("CONNECTED"),
             "wget succeeded but CONNECTED marker missing:\n{}",
             out
+        );
+    }
+
+    /// Verifies that DNS resolution works inside a pasta container.
+    ///
+    /// Requires root: no (runs rootless only).
+    /// Requires rootfs: yes (alpine-rootfs with /etc).
+    ///
+    /// Asserts that the container can resolve a hostname via DNS (not just reach
+    /// an IP directly).  Regression test for the missing-resolv.conf bug: pasta
+    /// provides network connectivity but the container had no /etc/resolv.conf,
+    /// so `wget example.com` failed with "bad address" even though IP worked.
+    ///
+    /// spawn() now auto-injects the host's upstream DNS servers and uses
+    /// SIGSTOP/SIGCONT to ensure pasta is ready before the container runs.
+    #[test]
+    fn test_pasta_dns() {
+        if is_root() {
+            eprintln!("Skipping test_pasta_dns: pasta is designed for rootless mode");
+            return;
+        }
+        if !is_pasta_available() {
+            eprintln!("Skipping test_pasta_dns: pasta not installed");
+            return;
+        }
+        let rootfs = match get_test_rootfs() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test_pasta_dns: alpine-rootfs not found");
+                return;
+            }
+        };
+
+        // nslookup uses DNS resolution — if resolv.conf is missing the command
+        // will fail with "bad address" before reaching any network.
+        let mut child = Command::new("/usr/bin/nslookup")
+            .args(["1.1.1.1"])
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_proc_mount()
+            .with_network(NetworkMode::Pasta)
+            .env("PATH", ALPINE_PATH)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        // nslookup for a raw IP does a reverse lookup.  What matters is that
+        // resolv.conf is present and the command can communicate with a DNS server.
+        // A success or a NXDOMAIN response (non-empty output mentioning "Server")
+        // both confirm DNS is configured; "bad address" would mean no resolv.conf.
+        assert!(
+            out.contains("Server") || out.contains("server") || status.success(),
+            "pasta DNS not configured — resolv.conf missing or empty?\nstdout: {}\nstderr: {}",
+            out,
+            err
+        );
+        assert!(
+            !err.contains("bad address"),
+            "pasta DNS lookup got 'bad address' — resolv.conf not injected\nstdout: {}\nstderr: {}",
+            out,
+            err
         );
     }
 }

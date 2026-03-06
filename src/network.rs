@@ -1706,7 +1706,47 @@ pub fn setup_pasta_network(
             io::Error::other(format!("failed to start pasta (is it installed?): {}", e))
         })?;
 
+    // Wait for pasta to configure the network interface inside the container's netns.
+    // pasta runs asynchronously; without waiting the container's first syscalls (e.g.
+    // connect, sendto) race against pasta still setting up the TAP.
+    //
+    // We poll /proc/{pid}/net/dev until a non-loopback interface appears, which
+    // indicates pasta has created and configured the TAP.  Timeout: 2 s.
+    wait_for_pasta_network(child_pid);
+
     Ok(PastaSetup { process })
+}
+
+/// Poll `/proc/{pid}/net/dev` until pasta has created a non-loopback interface.
+///
+/// This resolves the race between pasta's async network setup and the container
+/// process starting to use the network.  Returns as soon as the interface is
+/// visible, or after a 2-second timeout (which allows the container to proceed
+/// even if pasta is unusually slow).
+fn wait_for_pasta_network(child_pid: u32) {
+    let net_dev = format!("/proc/{}/net/dev", child_pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&net_dev) {
+            // /proc/{pid}/net/dev has one line per interface; lo is always present.
+            // A second interface means pasta has created the TAP.
+            let has_non_lo = contents
+                .lines()
+                .skip(2) // header lines
+                .any(|line| {
+                    let iface = line.trim().split(':').next().unwrap_or("").trim();
+                    !iface.is_empty() && iface != "lo"
+                });
+            if has_non_lo {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            log::warn!("pasta network setup timeout — proceeding anyway");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Kill the pasta relay process (best-effort; errors are non-fatal).

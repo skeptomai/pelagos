@@ -124,6 +124,28 @@ pub use crate::seccomp::SeccompProfile;
 
 // ── Rootless overlay helpers ────────────────────────────────────────────────
 
+/// Returns true if the pelagos layer store resides on a btrfs filesystem.
+///
+/// Native overlayfs with btrfs lower layers is broken for rootless containers:
+/// btrfs uses 64-bit inode numbers, and in a user namespace the kernel's
+/// overlayfs inode-translation overflows for inodes ≥ 2³², returning EOVERFLOW
+/// on getdents64 / mkdir / stat inside the overlay.  Fresh probe directories
+/// have low inode numbers and avoid the overflow (false positive), so we detect
+/// btrfs statically via statfs(2) rather than by probing mkdir success.
+fn layer_store_is_btrfs() -> bool {
+    // BTRFS_SUPER_MAGIC from <linux/magic.h>
+    const BTRFS_SUPER_MAGIC: libc::__fsword_t = 0x9123683e;
+    let layer_store = crate::paths::layers_dir();
+    let Ok(path_c) = std::ffi::CString::new(layer_store.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path_c.as_ptr(), &mut sfs) } != 0 {
+        return false;
+    }
+    sfs.f_type == BTRFS_SUPER_MAGIC
+}
+
 /// Probe whether native overlayfs with `userxattr` is supported (kernel 5.11+).
 ///
 /// A child enters a new user+mount namespace; the PARENT writes uid/gid maps
@@ -135,51 +157,38 @@ fn native_rootless_overlay_supported() -> bool {
     use std::sync::OnceLock;
     static RESULT: OnceLock<bool> = OnceLock::new();
     *RESULT.get_or_init(|| {
+        // If the layer store is on btrfs, native overlayfs is unusable for rootless.
+        //
+        // Btrfs uses 64-bit inode numbers.  In a user namespace, the kernel's
+        // overlayfs inode-number translation overflows when btrfs inode numbers
+        // exceed 2^32, returning EOVERFLOW on getdents64 / mkdir / stat inside the
+        // overlay.  Fresh probe directories get low inode numbers and avoid the
+        // overflow, giving a false positive — so we must detect btrfs statically
+        // rather than probing mkdir success.
+        //
+        // See kernel commit fa1c97a8c2e9 ("ovl: translate inode number for
+        // overlayfs on top of btrfs").  The only safe choice for rootless + btrfs
+        // is fuse-overlayfs, which runs in userspace and is not affected.
+        if layer_store_is_btrfs() {
+            log::debug!("rootless overlay: layer store is btrfs — skipping native overlay (use fuse-overlayfs)");
+            return false;
+        }
+
         // Upper/work/merged on /tmp (tmpfs) — supports user xattrs needed by userxattr overlayfs.
         let Ok(tmp) = tempfile::TempDir::new() else {
             return false;
         };
         let base = tmp.path();
+        let lower = base.join("lower");
         let upper = base.join("upper");
         let work = base.join("work");
         let merged = base.join("merged");
-
-        // Lower dir MUST be on the same filesystem as the actual layer store so
-        // the probe reflects real usage.  Native overlay on btrfs lower dirs can
-        // return EOVERFLOW on mkdir even when the mount itself succeeds (kernel
-        // inode-encoding incompatibility between btrfs and tmpfs).  Probing on
-        // tmpfs would give a false-positive; probing on the real layer fs catches it.
-        let layer_store = crate::paths::layers_dir();
-        let lower_tmp_result = tempfile::TempDir::new_in(&layer_store);
-        // If we can't create a temp dir in the layer store (e.g., permission denied
-        // before setup.sh has run), fall back to /tmp — this gives a best-effort
-        // result; the real overlay will fail later if the fs is incompatible.
-        // Keep TempDir alive until after probe completes — dropping it removes
-        // the directory, which would break the forked child.
-        let _lower_storage;
-        let lower: std::path::PathBuf = match lower_tmp_result {
-            Ok(d) => {
-                let p = d.path().join("lower");
-                _lower_storage = Some(d);
-                p
-            }
-            Err(_) => {
-                _lower_storage = None::<tempfile::TempDir>;
-                base.join("lower_fallback")
-            }
-        };
 
         // Create all directories.
         for d in [&lower, &upper, &work, &merged] {
             if std::fs::create_dir_all(d).is_err() {
                 return false;
             }
-        }
-        // Create a subdirectory inside lower so the probe can test copy-up (the
-        // scenario that triggers EOVERFLOW on btrfs lower dirs).
-        let lower_sub = lower.join("probedir");
-        if std::fs::create_dir(&lower_sub).is_err() {
-            return false;
         }
 
         let host_uid = unsafe { libc::getuid() };
@@ -254,19 +263,8 @@ fn native_rootless_overlay_supported() -> bool {
                     opts_c.as_ptr() as *const libc::c_void,
                 )
             };
-            if ret != 0 {
-                unsafe { libc::_exit(1) };
-            }
-            // Probe mkdir inside the overlay's lower-originated directory.
-            // This catches EOVERFLOW on btrfs lower dirs (copy-up failure).
-            let test_dir =
-                match std::ffi::CString::new(merged.join("probedir/sub").as_os_str().as_encoded_bytes())
-                {
-                    Ok(c) => c,
-                    Err(_) => unsafe { libc::_exit(1) },
-                };
-            let mkdir_ret = unsafe { libc::mkdir(test_dir.as_ptr(), 0o700) };
-            unsafe { libc::_exit(if mkdir_ret == 0 { 0 } else { 1 }) };
+            // Mount succeeded → native overlay+userxattr is supported.
+            unsafe { libc::_exit(if ret == 0 { 0 } else { 1 }) };
         }
 
         // Parent: close unused pipe ends.
@@ -374,6 +372,38 @@ fn spawn_fuse_overlayfs(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
+}
+
+/// Read the host's real (non-stub) upstream DNS servers for injection into pasta containers.
+///
+/// The host's `/etc/resolv.conf` often points to a loopback stub (e.g., systemd-resolved
+/// at 127.0.0.53) which is unreachable from a container with its own network namespace.
+/// We prefer `/run/systemd/resolve/resolv.conf`, which lists actual upstream servers.
+/// Loopback addresses (127.x, ::1) are always filtered out.
+fn host_upstream_dns() -> Vec<String> {
+    // Candidate resolv.conf files, in preference order.
+    let candidates = ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"];
+    for path in &candidates {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let servers: Vec<String> = text
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    let addr = line.strip_prefix("nameserver")?.trim();
+                    // Skip loopback addresses — not reachable from the container netns.
+                    if addr.starts_with("127.") || addr == "::1" {
+                        return None;
+                    }
+                    Some(addr.to_owned())
+                })
+                .collect();
+            if !servers.is_empty() {
+                return servers;
+            }
+        }
+    }
+    // Ultimate fallback: well-known public DNS.
+    vec!["1.1.1.1".to_owned(), "8.8.8.8".to_owned()]
 }
 
 /// Resolve a container's bridge IP by name.
@@ -2648,6 +2678,19 @@ impl Command {
                 }
             }
         }
+        // Pasta mode: inject the host's real upstream DNS servers.
+        // The container has its own netns; loopback addresses (127.x, ::1) like
+        // systemd-resolved's stub at 127.0.0.53 are unreachable from inside it.
+        // We read the actual upstream servers from /run/systemd/resolve/resolv.conf
+        // (which bypasses the stub) and fall back to /etc/resolv.conf, filtering
+        // out any loopback addresses.
+        if is_pasta && self.dns_servers.is_empty() {
+            for server in host_upstream_dns() {
+                if !auto_dns.contains(&server) {
+                    auto_dns.push(server);
+                }
+            }
+        }
         // Append user-specified DNS servers as fallback.
         auto_dns.extend(self.dns_servers.iter().cloned());
 
@@ -4267,11 +4310,31 @@ impl Command {
         let network = bridge_network;
 
         // Pasta: spawn the relay after the child has exec'd (/proc/{pid}/ns/net is live).
+        //
+        // pasta is started AFTER exec because we need the container's network namespace
+        // to exist. The container may reach network syscalls (DNS, connect) before pasta
+        // has configured the TAP. We eliminate this race by temporarily stopping the
+        // container process (SIGSTOP), setting up pasta, then resuming it (SIGCONT).
+        //
+        // SIGSTOP cannot be caught or ignored, so it reliably pauses the container.
+        // We stop/continue the actual container process (C, the grandchild in PID-ns
+        // containers) rather than the intermediate process P.
         let pasta: Option<crate::network::PastaSetup> = if is_pasta {
-            Some(
-                crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
-                    .map_err(Error::Io)?,
-            )
+            // find_container_pid returns C's host PID for PID-ns containers, or
+            // child_inner.id() itself for non-PID-ns containers.
+            let container_pid =
+                find_container_pid(child_inner.id()).unwrap_or_else(|| child_inner.id());
+            // Pause the container so it can't make network syscalls until pasta is ready.
+            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGSTOP) };
+            let setup = crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
+                .map_err(|e| {
+                    // Resume the container before propagating the error.
+                    unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
+                    Error::Io(e)
+                })?;
+            // Resume the container; pasta has configured the TAP and routes.
+            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
+            Some(setup)
         } else {
             None
         };
@@ -4778,6 +4841,13 @@ impl Command {
                 let gw = net_def.gateway.to_string();
                 if !auto_dns.contains(&gw) {
                     auto_dns.push(gw);
+                }
+            }
+        }
+        if is_pasta && self.dns_servers.is_empty() {
+            for server in host_upstream_dns() {
+                if !auto_dns.contains(&server) {
+                    auto_dns.push(server);
                 }
             }
         }
@@ -6166,12 +6236,19 @@ impl Command {
         // Bridge networking was fully set up before fork; nothing to do here.
         let network = bridge_network;
 
-        // Pasta: spawn the relay after the child has exec'd (/proc/{pid}/ns/net is live).
+        // Pasta: spawn the relay after the child has exec'd.  SIGSTOP/SIGCONT ensures
+        // the container doesn't make network syscalls before pasta has configured the TAP.
         let pasta: Option<crate::network::PastaSetup> = if is_pasta {
-            Some(
-                crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
-                    .map_err(Error::Io)?,
-            )
+            let container_pid =
+                find_container_pid(child_inner.id()).unwrap_or_else(|| child_inner.id());
+            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGSTOP) };
+            let setup = crate::network::setup_pasta_network(child_inner.id(), &self.port_forwards)
+                .map_err(|e| {
+                    unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
+                    Error::Io(e)
+                })?;
+            unsafe { libc::kill(container_pid as libc::pid_t, libc::SIGCONT) };
+            Some(setup)
         } else {
             None
         };

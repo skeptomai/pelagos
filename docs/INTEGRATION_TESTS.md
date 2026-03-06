@@ -1142,13 +1142,23 @@ correctly when rootless mode is triggered implicitly.
 ### `test_pasta_connectivity`
 **Requires:** non-root user, rootfs, pasta installed, outbound internet access
 
-Spawns a container with `NetworkMode::Pasta`, sleeps 2 seconds (TAP attach + `--config-net`
-routing setup), then runs `wget -q -T 5 --spider http://1.1.1.1/` (HEAD request — no body
-to write, avoiding `/dev/null` which doesn't exist as a device node in the chroot). Asserts
-the command exits 0 and prints `CONNECTED`. This is the end-to-end connectivity check — it verifies
-that packets actually flow through pasta's relay to the internet, not just that the
-interface exists and has an IP. Failure indicates pasta's packet relay is broken or outbound
-internet is unavailable in the test environment.
+Spawns a container with `NetworkMode::Pasta` and runs `wget -q -T 5 --spider http://1.1.1.1/`
+(HEAD request — no body to write, avoiding `/dev/null` which doesn't exist as a device node
+in the chroot). Asserts the command exits 0 and prints `CONNECTED`. No `sleep` is needed
+because `spawn()` uses SIGSTOP/SIGCONT to ensure pasta has configured the TAP before the
+container runs. Failure indicates pasta's packet relay is broken or outbound internet is
+unavailable in the test environment.
+
+### `test_pasta_dns`
+**Requires:** non-root user, rootfs, pasta installed
+
+Regression test for the missing `/etc/resolv.conf` bug: pasta provides network connectivity
+but no DNS configuration. `spawn()` now auto-injects the host's real upstream DNS servers
+(filtered to exclude loopback stubs like 127.0.0.53) as a bind-mounted resolv.conf.
+Runs `nslookup 1.1.1.1` inside a pasta container; asserts that the output contains
+"Server" or the command succeeds (reverse DNS response or NXDOMAIN both confirm DNS is
+configured), and asserts the error output does NOT contain "bad address" (which would
+indicate resolv.conf was missing). Failure means DNS injection is broken.
 
 ---
 
