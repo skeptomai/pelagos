@@ -251,8 +251,14 @@ pelagos run --network loopback alpine /bin/sh -c "ping -c1 8.8.8.8 || echo 'no i
 pelagos run --network pasta alpine /bin/sh -c "wget -qO- https://icanhazip.com"
 
 # Bridge with NAT and a port mapping — requires root (host bridge + nftables)
+# nc is in Alpine base; redirect stdout so the HTTP request doesn't echo back
 sudo pelagos run --network bridge --nat --publish 8080:80 alpine \
-  /bin/sh -c 'busybox httpd -p 80 -h /var/www & sleep 10'
+  /bin/sh -c 'while true; do
+    { printf "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nHello from pelagos\n"; } \
+      | nc -l -p 80 > /dev/null
+  done &
+  sleep 30'
+# In another terminal: curl http://localhost:8080  →  Hello from pelagos
 ```
 
 > **Rootless networking:** `none`, `loopback`, and `pasta` work without root.
