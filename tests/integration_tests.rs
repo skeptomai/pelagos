@@ -14060,6 +14060,62 @@ mod tutorial_e2e_p1 {
         cleanup(name);
     }
 
+    /// test_rootless_exec_noninteractive
+    ///
+    /// Rootless (no root required). Starts `sleep 60` in detached rootless mode
+    /// (no bridge/NAT), then runs `pelagos exec <name> /bin/cat /etc/alpine-release`
+    /// and verifies exit 0 and non-empty output.
+    ///
+    /// This exercises the rootless namespace-join ordering fix: USER ns must be
+    /// joined first (to acquire caps), then MOUNT, then remaining ns (UTS/IPC/NET).
+    /// Failure indicates a regression in exec.rs namespace-join ordering.
+    #[test]
+    #[serial_test::serial]
+    fn test_rootless_exec_noninteractive() {
+        ensure_alpine();
+        let name = "rootless-exec-test";
+        cleanup(name);
+
+        let status = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "alpine:3.21",
+                "/bin/sleep",
+                "60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("pelagos run --detach");
+        assert!(status.success(), "detached rootless run should exit 0");
+
+        assert!(
+            wait_for_container(name, 10_000),
+            "container '{}' did not appear in ps within 10s",
+            name
+        );
+
+        let exec_out = std::process::Command::new(bin())
+            .args(["exec", name, "/bin/cat", "/etc/alpine-release"])
+            .output()
+            .expect("pelagos exec");
+        let stdout = String::from_utf8_lossy(&exec_out.stdout);
+        let stderr = String::from_utf8_lossy(&exec_out.stderr);
+        assert!(
+            exec_out.status.success(),
+            "pelagos exec should exit 0; stderr={}",
+            stderr.trim()
+        );
+        assert!(
+            !stdout.trim().is_empty(),
+            "exec output (/etc/alpine-release) should be non-empty"
+        );
+
+        cleanup(name);
+    }
+
     /// test_tut_p1_auto_rm
     ///
     /// Rootless. Runs `pelagos run --rm --name tut-p1-rm alpine /bin/echo "vanish"`

@@ -36,9 +36,29 @@ pub struct ExecArgs {
 }
 
 pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Validate container is running
-    let state = read_state(&args.name)
-        .map_err(|e| format!("container '{}' not found: {}", args.name, e))?;
+    // 1. Validate container is running.
+    //
+    // In detached mode there is a brief window where pid==0: the watcher has
+    // forked and written state.json (so ps shows it "running" via watcher_pid)
+    // but hasn't yet spawned the container process and updated the PID.  Poll
+    // for up to 2 s so that `exec` called immediately after `run --detach`
+    // doesn't spuriously fail.
+    let state = {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut s = read_state(&args.name)
+            .map_err(|e| format!("container '{}' not found: {}", args.name, e))?;
+        while s.pid == 0
+            && s.status == ContainerStatus::Running
+            && check_liveness(s.watcher_pid)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            s = read_state(&args.name)
+                .map_err(|e| format!("container '{}' not found: {}", args.name, e))?;
+        }
+        s
+    };
 
     if state.status != ContainerStatus::Running || !check_liveness(state.pid) {
         return Err(format!("container '{}' is not running", args.name).into());

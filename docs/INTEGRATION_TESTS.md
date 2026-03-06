@@ -2837,6 +2837,18 @@ Starts `sleep 60` detached, polls until running, then calls `pelagos exec <name>
 Failure indicates exec namespace-join, the watcher state file, or Alpine's
 /etc/hostname is broken.
 
+### `test_rootless_exec_noninteractive`
+**Requires:** rootless (no root)
+
+Starts `sleep 60` detached (no bridge/NAT — pure rootless), polls until running,
+then calls `pelagos exec <name> /bin/cat /etc/alpine-release` and asserts exit 0
+and non-empty output.
+
+Exercises the rootless namespace-join ordering fix (USER first, then MOUNT, then
+UTS/IPC/NET) and the pid==0 race window fix in `cmd_exec` (polling until the watcher
+writes the real container PID before proceeding). Failure indicates a regression in
+either fix.
+
 ### `test_tut_p1_auto_rm`
 **Requires:** rootless
 
