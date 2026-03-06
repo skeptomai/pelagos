@@ -374,6 +374,9 @@ fn spawn_fuse_overlayfs(
         .spawn()
 }
 
+/// Path to the host CA certificate bundle, bind-mounted into pasta containers for TLS verification.
+const HOST_CA_CERT: &str = "/etc/ssl/certs/ca-certificates.crt";
+
 /// Read the host's real (non-stub) upstream DNS servers for injection into pasta containers.
 ///
 /// The host's `/etc/resolv.conf` often points to a loopback stub (e.g., systemd-resolved
@@ -2728,6 +2731,24 @@ impl Command {
             std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
         });
 
+        // Pasta containers need CA certs for HTTPS. Alpine base images don't include them.
+        // Bind-mount the host's trust store read-only into the container so wget/curl/etc
+        // can verify TLS certificates without any image changes.
+        let pasta_ca_cert_cstring: Option<std::ffi::CString> =
+            if is_pasta && self.namespaces.contains(Namespace::MOUNT) && self.chroot_dir.is_some()
+                && std::path::Path::new(HOST_CA_CERT).exists()
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                Some(
+                    std::ffi::CString::new(
+                        std::path::Path::new(HOST_CA_CERT).as_os_str().as_bytes(),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+
         // Links: resolve container names → IPs and write /etc/hosts temp file.
         if !self.links.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
@@ -3291,6 +3312,40 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "dns bind mount: {}",
+                                io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // CA certs: bind-mount host trust store read-only for pasta containers.
+                    // Alpine base images lack ca-certificates; this lets wget/curl verify TLS.
+                    if let Some(ref ca_src) = pasta_ca_cert_cstring {
+                        let ssl_dir = effective_root.join("etc/ssl/certs");
+                        std::fs::create_dir_all(&ssl_dir)
+                            .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
+                        let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
+                        let tgt_c = std::ffi::CString::new(
+                            ca_tgt.as_os_str().as_bytes(),
+                        )
+                        .unwrap();
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            ca_src.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND | libc::MS_RDONLY,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "ca cert bind mount: {}",
                                 io::Error::last_os_error()
                             )));
                         }
@@ -4885,6 +4940,21 @@ impl Command {
             std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
         });
 
+        let pasta_ca_cert_cstring: Option<std::ffi::CString> =
+            if is_pasta && self.namespaces.contains(Namespace::MOUNT) && self.chroot_dir.is_some()
+                && std::path::Path::new(HOST_CA_CERT).exists()
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                Some(
+                    std::ffi::CString::new(
+                        std::path::Path::new(HOST_CA_CERT).as_os_str().as_bytes(),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+
         // Links: resolve container names → IPs and write /etc/hosts temp file.
         if !self.links.is_empty() {
             if !self.namespaces.contains(Namespace::MOUNT) {
@@ -5357,6 +5427,37 @@ impl Command {
                         if r != 0 {
                             return Err(io::Error::other(format!(
                                 "dns bind mount: {}",
+                                io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // CA certs: bind-mount host trust store read-only for pasta containers.
+                    if let Some(ref ca_src) = pasta_ca_cert_cstring {
+                        let ssl_dir = effective_root.join("etc/ssl/certs");
+                        std::fs::create_dir_all(&ssl_dir)
+                            .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
+                        let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
+                        let tgt_c =
+                            std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
+                        let fd = libc::open(
+                            tgt_c.as_ptr(),
+                            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                            0o644u32,
+                        );
+                        if fd >= 0 {
+                            libc::close(fd);
+                        }
+                        let r = libc::mount(
+                            ca_src.as_ptr(),
+                            tgt_c.as_ptr(),
+                            ptr::null(),
+                            libc::MS_BIND | libc::MS_RDONLY,
+                            ptr::null(),
+                        );
+                        if r != 0 {
+                            return Err(io::Error::other(format!(
+                                "ca cert bind mount: {}",
                                 io::Error::last_os_error()
                             )));
                         }
