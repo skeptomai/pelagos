@@ -846,6 +846,17 @@ fn run_detached(
             // fire directly — one hop, no fragile two-hop chain.
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
 
+            // Record watcher_pid immediately so `pelagos ps` can verify we are alive
+            // via check_liveness(watcher_pid) while pid==0 (container not yet spawned).
+            // Without this, ps would see pid=0, call check_liveness(0) → false, and
+            // permanently mark the container as Exited before the container starts.
+            let watcher_pid = unsafe { libc::getpid() };
+            {
+                let mut early = state.clone();
+                early.watcher_pid = watcher_pid;
+                let _ = write_state(&early);
+            }
+
             // Set up piped stdio so we can relay to log files.
             cmd = cmd
                 .stdin(Stdio::Null)
@@ -860,7 +871,6 @@ fn run_detached(
                 }
             };
             let pid = child.pid();
-            let watcher_pid = unsafe { libc::getpid() };
 
             // Update state with real PIDs and network IPs.
             let mut updated = state;

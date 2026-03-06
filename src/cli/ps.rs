@@ -12,10 +12,15 @@ pub fn cmd_ps(all: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     states.sort_by(|a, b| a.started_at.cmp(&b.started_at));
 
     // Refresh liveness for running containers and update stale states on disk.
+    // When pid==0 the watcher child hasn't written the container PID yet (detached
+    // startup race); fall back to watcher_pid so we don't falsely mark as Exited.
     for s in &mut states {
-        if s.status == ContainerStatus::Running && !check_liveness(s.pid) {
-            s.status = ContainerStatus::Exited;
-            let _ = write_state(s);
+        if s.status == ContainerStatus::Running {
+            let pid_to_check = if s.pid > 0 { s.pid } else { s.watcher_pid };
+            if !check_liveness(pid_to_check) {
+                s.status = ContainerStatus::Exited;
+                let _ = write_state(s);
+            }
         }
     }
 

@@ -55,11 +55,11 @@ Pelagos compose files are Lisp programs, not config schemas. A minimal stack:
 ```lisp
 (define-service svc-db "db"
   :image "postgres:16"
-  :env   ("POSTGRES_PASSWORD" . "secret"))
+  :env   ("POSTGRES_PASSWORD" "secret"))
 
 (define-service svc-app "app"
   :image      "myapp:latest"
-  :depends-on ("db" :ready-port 5432))
+  :depends-on "db" 5432)
 
 (compose-up
   (compose svc-db svc-app))
@@ -234,10 +234,10 @@ sudo pelagos stop mybox && pelagos rm mybox
 ### Multi-service stack
 
 ```bash
-# Declarative
+# A minimal stack — all compose files are Lisp programs (.reml)
 sudo -E pelagos compose up -f examples/compose/web-stack/compose.reml -p demo
 
-# Imperative
+# With scripting: migrations, conditional startup, parallel execution
 sudo -E pelagos compose up -f examples/compose/imperative/compose.reml -p demo
 ```
 

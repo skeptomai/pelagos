@@ -578,7 +578,7 @@ pelagos rm --force <name>
 
 ## Compose
 
-`pelagos compose` orchestrates multi-service applications using an S-expression compose file
+`pelagos compose` orchestrates multi-service applications using a Lisp compose file
 (default: `compose.reml`).
 
 ### Basic Usage
@@ -609,91 +609,53 @@ sudo pelagos compose down -v
 
 ### Compose File Format
 
+Compose files are Lisp programs. Services, networks, and volumes are first-class
+values — name them with `define`, pass them as arguments, generate them with `map`.
+
 ```lisp
-(compose
-  (network backend (subnet "10.88.1.0/24"))
-  (volume pgdata)
+(compose-up
+  (compose
+    (network "backend" '(subnet "10.88.1.0/24"))
+    (volume "pgdata")
 
-  (service db
-    (image "postgres:16")
-    (network backend)
-    (volume pgdata "/var/lib/postgresql/data")
-    (env POSTGRES_PASSWORD "secret")
-    (port 5432 5432)
-    (memory "512m"))
+    (service "db"
+      '(image   "postgres:16")
+      '(network "backend")
+      '(volume  "pgdata" "/var/lib/postgresql/data")
+      '(env     "POSTGRES_PASSWORD" "secret")
+      '(port    5432 5432)
+      '(memory  "512m"))
 
-  (service api
-    (image "my-api:latest")
-    (network backend)
-    (depends-on (db :ready-port 5432))
-    (port 8080 8080)))
+    (service "api"
+      '(image      "my-api:latest")
+      '(network    "backend")
+      (list 'depends-on "db" 5432)
+      '(port       8080 8080))))
 ```
 
 ### `depends-on` and Health Checks
 
-`depends-on` controls startup order. Without a health check, Pelagos just verifies the
-dependency process is alive. With a health check, Pelagos polls until the check passes
+`depends-on` controls startup order. Pelagos polls until the check passes
 (60-second timeout, 250ms interval).
 
-#### Shorthand: `:ready-port N`
-
 ```lisp
-; TCP connect to port 5432
-(depends-on (db :ready-port 5432))
+; Process-alive only — start api after db is up, no port check
+(list 'depends-on "db")
+
+; TCP connect — start api only after db accepts connections on port 5432
+(list 'depends-on "db" 5432)
 ```
 
-#### Full `:ready` Syntax
-
-```lisp
-; TCP connect
-(depends-on (db :ready (port 5432)))
-
-; HTTP GET — host is replaced with the container IP; returns true for 2xx
-(depends-on (api :ready (http "http://localhost:8080/healthz")))
-
-; Command in container — true if exit code 0 (single-string form, split on whitespace)
-(depends-on (db :ready (cmd "pg_isready -U postgres")))
-
-; Multi-argument form
-(depends-on (db :ready (cmd "pg_isready" "-U" "postgres")))
-```
-
-#### Composable Operators: `and` / `or`
-
-```lisp
-; All checks must pass
-(depends-on (db :ready (and (port 5432) (cmd "pg_isready -U postgres"))))
-
-; Any check may pass
-(depends-on (api :ready (or (http "http://localhost:8080/health") (port 8080))))
-
-; Nested: port AND (http OR cmd)
-(depends-on (svc :ready (and (port 8080) (or (http "http://localhost:8080/ready") (cmd "test -f /var/ready")))))
-
-; Multiple dependencies with mixed checks
-(depends-on
-  (db    :ready (and (port 5432) (cmd "pg_isready")))
-  (cache :ready (or  (port 6379) (http "http://localhost:6380/ping"))))
-```
-
-#### Check Types Reference
-
-| Expression | What it does |
-|---|---|
-| `(port N)` | TCP connect to the container's IP on port N |
-| `(http "URL")` | HTTP GET (host replaced with container IP); passes on 2xx |
-| `(cmd "str")` | Run command in container's namespaces; passes if exit 0 |
-| `(cmd "exe" "a1" ...)` | Multi-arg form of cmd |
-| `(and e1 e2 ...)` | All sub-checks must pass |
-| `(or e1 e2 ...)` | Any sub-check must pass |
+The `list` form is required (rather than `'(...)` quote shorthand) because the port
+number must evaluate to an integer.
 
 ---
 
 ## Compose Files (`.reml`)
 
-All compose files use the `.reml` Lisp format. Simple stacks are just data declarations;
-complex stacks can use the full language — loops, conditionals, parameterised services,
-shared templates. The default file is `compose.reml`.
+All compose files are Lisp programs. Every `.reml` file has the full language available —
+loops, conditionals, `define`, `lambda`, environment variable reads, on-ready hooks.
+The default file is `compose.reml`.
 
 ```bash
 sudo pelagos compose up -f compose.reml

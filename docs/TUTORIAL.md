@@ -269,32 +269,32 @@ sudo pelagos run --network bridge --nat --publish 8080:80 alpine \
 
 ## Part 4 — Compose: Running a Stack
 
-Real applications are more than one process.  Pelagos compose uses an
-S-expression format that's more expressive than YAML.
+Real applications are more than one process.  Pelagos compose files are Lisp
+programs — every `.reml` file has the full language available.
 
 **`stack.reml`** — a web app + Redis:
 
 ```lisp
-(compose
-  (network frontend)
-
-  (service redis
-    (image "redis:alpine")
-    (network "frontend"))
-
-  (service web
-    (image "myserver:latest")
+(compose-up
+  (compose
     (network "frontend")
-    (depends-on (redis :ready-port 6379))
-    (port 8080 80)
-    (environment
-      (REDIS_HOST "redis")
-      (APP_ENV "production"))))
+
+    (service "redis"
+      '(image   "redis:alpine")
+      '(network "frontend"))
+
+    (service "web"
+      '(image      "myserver:latest")
+      '(network    "frontend")
+      (list 'depends-on "redis" 6379)
+      '(port       8080 80)
+      '(env        "REDIS_HOST" "redis")
+      '(env        "APP_ENV"    "production"))))
 ```
 
 ```bash
 sudo pelagos compose up -f stack.reml
-# Pelagos starts Redis first, waits for port 6379 to accept connections,
+# Pelagos starts redis first, waits for port 6379 to accept connections,
 # then starts web.  DNS: "redis" resolves inside "web" automatically.
 
 sudo pelagos compose ps -f stack.reml
@@ -305,7 +305,7 @@ sudo pelagos compose down -f stack.reml
 **Health-aware dependency:**
 
 ```lisp
-(depends-on (db :ready-port 5432))
+(list 'depends-on "db" 5432)
 ```
 
 Pelagos polls TCP every 250 ms for up to 60 s before declaring the
@@ -528,25 +528,24 @@ P3b — already done for the standalone path) and the CRI compliance doc.
 Pelagos can run Linux and Wasm services side-by-side in the same compose stack.
 
 ```lisp
-(compose
-  (network app-net)
-
-  ;; Linux service — standard OCI image
-  (service postgres
-    (image "postgres:alpine")
+(compose-up
+  (compose
     (network "app-net")
-    (environment
-      (POSTGRES_PASSWORD "secret")
-      (POSTGRES_DB "mydb")))
 
-  ;; Wasm service — pure WASI module, no Linux image needed
-  (service api-wasm
-    (image "myrepo/api:wasm")
-    (network "app-net")
-    (depends-on (postgres :ready-port 5432))
-    (environment
-      (DB_URL "postgres://postgres:secret@postgres/mydb"))
-    (port "3000:3000")))
+    ;; Linux service — standard OCI image
+    (service "postgres"
+      '(image   "postgres:alpine")
+      '(network "app-net")
+      '(env     "POSTGRES_PASSWORD" "secret")
+      '(env     "POSTGRES_DB"       "mydb"))
+
+    ;; Wasm service — pure WASI module, no Linux image needed
+    (service "api-wasm"
+      '(image   "myrepo/api:wasm")
+      '(network "app-net")
+      (list 'depends-on "postgres" 5432)
+      '(env  "DB_URL" "postgres://postgres:secret@postgres/mydb")
+      '(port 3000 3000))))
 ```
 
 ```bash

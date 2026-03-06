@@ -2734,20 +2734,19 @@ impl Command {
         // Pasta containers need CA certs for HTTPS. Alpine base images don't include them.
         // Bind-mount the host's trust store read-only into the container so wget/curl/etc
         // can verify TLS certificates without any image changes.
-        let pasta_ca_cert_cstring: Option<std::ffi::CString> =
-            if is_pasta && self.namespaces.contains(Namespace::MOUNT) && self.chroot_dir.is_some()
-                && std::path::Path::new(HOST_CA_CERT).exists()
-            {
-                use std::os::unix::ffi::OsStrExt as _;
-                Some(
-                    std::ffi::CString::new(
-                        std::path::Path::new(HOST_CA_CERT).as_os_str().as_bytes(),
-                    )
+        let pasta_ca_cert_cstring: Option<std::ffi::CString> = if is_pasta
+            && self.namespaces.contains(Namespace::MOUNT)
+            && self.chroot_dir.is_some()
+            && std::path::Path::new(HOST_CA_CERT).exists()
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            Some(
+                std::ffi::CString::new(std::path::Path::new(HOST_CA_CERT).as_os_str().as_bytes())
                     .unwrap(),
-                )
-            } else {
-                None
-            };
+            )
+        } else {
+            None
+        };
 
         // Links: resolve container names → IPs and write /etc/hosts temp file.
         if !self.links.is_empty() {
@@ -3324,10 +3323,7 @@ impl Command {
                         std::fs::create_dir_all(&ssl_dir)
                             .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
                         let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
-                        let tgt_c = std::ffi::CString::new(
-                            ca_tgt.as_os_str().as_bytes(),
-                        )
-                        .unwrap();
+                        let tgt_c = std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
                         let fd = libc::open(
                             tgt_c.as_ptr(),
                             libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
@@ -4940,20 +4936,19 @@ impl Command {
             std::ffi::CString::new(dir.join("resolv.conf").as_os_str().as_bytes()).unwrap()
         });
 
-        let pasta_ca_cert_cstring: Option<std::ffi::CString> =
-            if is_pasta && self.namespaces.contains(Namespace::MOUNT) && self.chroot_dir.is_some()
-                && std::path::Path::new(HOST_CA_CERT).exists()
-            {
-                use std::os::unix::ffi::OsStrExt as _;
-                Some(
-                    std::ffi::CString::new(
-                        std::path::Path::new(HOST_CA_CERT).as_os_str().as_bytes(),
-                    )
+        let pasta_ca_cert_cstring: Option<std::ffi::CString> = if is_pasta
+            && self.namespaces.contains(Namespace::MOUNT)
+            && self.chroot_dir.is_some()
+            && std::path::Path::new(HOST_CA_CERT).exists()
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            Some(
+                std::ffi::CString::new(std::path::Path::new(HOST_CA_CERT).as_os_str().as_bytes())
                     .unwrap(),
-                )
-            } else {
-                None
-            };
+            )
+        } else {
+            None
+        };
 
         // Links: resolve container names → IPs and write /etc/hosts temp file.
         if !self.links.is_empty() {
@@ -5438,8 +5433,7 @@ impl Command {
                         std::fs::create_dir_all(&ssl_dir)
                             .map_err(|e| io::Error::other(format!("ca mkdir: {}", e)))?;
                         let ca_tgt = effective_root.join("etc/ssl/certs/ca-certificates.crt");
-                        let tgt_c =
-                            std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
+                        let tgt_c = std::ffi::CString::new(ca_tgt.as_os_str().as_bytes()).unwrap();
                         let fd = libc::open(
                             tgt_c.as_ptr(),
                             libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
