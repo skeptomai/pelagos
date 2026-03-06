@@ -58,31 +58,103 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cmd = Command::new(exe).args(rest);
 
-    // The pre_exec order in container.rs is:
-    //   chroot (step 4) → user callback (step 5) → setns (step 6)
+    // Rootless exec namespace join ordering constraint
+    // ------------------------------------------------
+    // container.rs pre_exec processes namespaces in this order:
+    //   (a) join_ns_fds loop — step 4.855 in spawn(), step 6138 in
+    //       spawn_interactive() — runs BEFORE the user_pre_exec callback
+    //   (b) user_pre_exec callback — where we join USER + MOUNT + chroot
     //
-    // For exec we need setns(MOUNT) BEFORE chroot so the container's mount
-    // table is active.  We handle mount-ns join via a pre_exec callback that
-    // does: setns(mnt_fd) → fchdir(root_fd) → chroot(".") → chdir("/").
-    // Non-mount namespaces use the normal with_namespace_join() path.
+    // Joining any namespace (UTS, IPC, NET, PID) requires CAP_SYS_ADMIN in
+    // its *owning* user namespace.  For a rootless container every namespace
+    // is owned by the container's user namespace.  We don't have those
+    // capabilities until we join the user namespace in step (b) — but
+    // join_ns_fds runs in step (a), before we join USER.
+    //
+    // Fix: in rootless mode we bypass join_ns_fds entirely and instead
+    // handle all namespace joins (USER, MOUNT, UTS, IPC, NET, CGROUP) in
+    // the user_pre_exec callback, in the correct order:
+    //   1. setns(USER)  — gain caps in container's user namespace
+    //   2. setns(MOUNT) — join mount namespace
+    //   3. fchdir + chroot — enter container rootfs
+    //   4. setns(UTS/IPC/NET/CGROUP) — now have caps, these succeed
+    //
+    // PID is always skipped: joining a PID namespace via setns() only
+    // updates pid_for_children; a subsequent fork() is required to actually
+    // enter it.  container.rs handles this double-fork at step 1.65, which
+    // also runs BEFORE the user_pre_exec callback — the same ordering
+    // problem.  The exec'd process therefore runs in the host PID namespace
+    // (known limitation for rootless exec).
+    let is_rootless = unsafe { libc::getuid() } != 0;
+    // In rootless mode, any namespace owned by the container's user namespace
+    // must be joined AFTER the user namespace.  Collect them for the callback.
+    let has_user_ns = ns_entries.iter().any(|(_, ns)| *ns == Namespace::USER);
+
     let mut has_mount_ns = false;
+    let mut user_ns_path: Option<PathBuf> = None;
+    // Late namespaces: joined after USER inside the user_pre_exec callback.
+    let mut late_ns_paths: Vec<(PathBuf, Namespace)> = Vec::new();
     for (path, ns) in &ns_entries {
-        if *ns == Namespace::MOUNT {
-            has_mount_ns = true;
-        } else {
-            cmd = cmd.with_namespace_join(path, *ns);
+        match *ns {
+            Namespace::MOUNT => has_mount_ns = true,
+            Namespace::USER => {
+                // Handled in user_pre_exec callback, not via join_ns_fds.
+                user_ns_path = Some(path.clone());
+            }
+            Namespace::PID => {
+                // Skip PID: the double-fork mechanism in container.rs runs
+                // before user_pre_exec and would fail without caps.
+                log::debug!("exec: skipping PID namespace join (host PID namespace limitation)");
+            }
+            _ if is_rootless && has_user_ns => {
+                // UTS/IPC/NET/CGROUP: join after USER in the callback.
+                late_ns_paths.push((path.clone(), *ns));
+            }
+            _ => {
+                // Root exec (no user namespace): use the normal mechanism.
+                cmd = cmd.with_namespace_join(path, *ns);
+            }
         }
+    }
+
+    // Tell spawn() not to auto-create a new user namespace in rootless mode:
+    // we're joining the container's existing user namespace ourselves.
+    if user_ns_path.is_some() {
+        cmd = cmd.skip_rootless_user_ns();
     }
 
     // Capture workdir for use in the pre_exec callback.
     let exec_workdir = args.workdir.clone();
 
     if has_mount_ns {
-        // Open both fds in the parent (before fork) — inherited across fork.
+        // Open all namespace fds in the parent (before fork) so they are
+        // inherited across fork and remain valid in the child's pre_exec.
         let mnt_ns_path = format!("/proc/{}/ns/mnt", pid);
         let mnt_ns_file = std::fs::File::open(&mnt_ns_path)
             .map_err(|e| format!("open {}: {}", mnt_ns_path, e))?;
         let mnt_ns_fd = mnt_ns_file.as_raw_fd();
+
+        // Open user namespace fd if present — must be joined before MOUNT.
+        let user_ns_file = user_ns_path
+            .as_ref()
+            .map(|p| std::fs::File::open(p).map_err(|e| format!("open {:?}: {}", p, e)))
+            .transpose()?;
+        let user_ns_fd = user_ns_file.as_ref().map(|f| f.as_raw_fd());
+
+        // Open "late" namespaces (UTS, IPC, NET, CGROUP) that must be joined
+        // AFTER the user namespace to satisfy the CAP_SYS_ADMIN requirement.
+        let late_ns_files: Vec<(std::fs::File, Namespace)> = late_ns_paths
+            .iter()
+            .map(|(p, ns)| {
+                std::fs::File::open(p)
+                    .map(|f| (f, *ns))
+                    .map_err(|e| format!("open {:?}: {}", p, e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let late_ns_fds: Vec<(i32, Namespace)> = late_ns_files
+            .iter()
+            .map(|(f, ns)| (f.as_raw_fd(), *ns))
+            .collect();
 
         // Open the container's root directory as an fd.  After setns(MOUNT),
         // path-based resolution uses the host root (unchanged by setns).
@@ -100,13 +172,26 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         let root_fd = root_file.as_raw_fd();
 
         cmd = cmd.with_pre_exec(move || {
-            // Keep File objects alive so fds remain valid.
+            // Keep File objects alive so fds remain valid in the child.
             let _keep_mnt = &mnt_ns_file;
             let _keep_root = &root_file;
+            let _keep_user = &user_ns_file;
+            let _keep_late = &late_ns_files;
             unsafe {
+                // 1. Join user namespace first — the mount namespace and all
+                //    other container namespaces are owned by it, so we need
+                //    its credentials (cap_effective=all for uid 0) before
+                //    we can join MOUNT, UTS, IPC, etc.
+                if let Some(user_fd) = user_ns_fd {
+                    if libc::setns(user_fd, libc::CLONE_NEWUSER) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // 2. Join mount namespace.
                 if libc::setns(mnt_ns_fd, libc::CLONE_NEWNS) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // 3. Enter the container's rootfs.
                 if libc::fchdir(root_fd) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -114,11 +199,17 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if libc::chroot(dot.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                // chdir to the requested workdir (or "/" if none).
                 let target = exec_workdir.as_deref().unwrap_or("/");
                 let target_c = std::ffi::CString::new(target).unwrap();
                 if libc::chdir(target_c.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // 4. Join UTS/IPC/NET/CGROUP — now inside the container's
+                //    user namespace so CAP_SYS_ADMIN is satisfied.
+                for (fd, _ns) in &late_ns_fds {
+                    if libc::setns(*fd, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
             }
             Ok(())
@@ -400,12 +491,22 @@ pub fn discover_namespaces(
             }
             Err(_) => continue,
         };
+        // /proc/1/ns/user is unreadable by non-root; fall back to /proc/self/ns/<ns>
+        // which is always readable. For non-root callers both point to the same
+        // initial namespace, so the comparison is equivalent.
+        let self_ns = format!("/proc/self/ns/{}", ns_name);
         let init_ino = match std::fs::metadata(&init_ns) {
             Ok(m) => {
                 use std::os::unix::fs::MetadataExt;
                 m.ino()
             }
-            Err(_) => continue,
+            Err(_) => match std::fs::metadata(&self_ns) {
+                Ok(m) => {
+                    use std::os::unix::fs::MetadataExt;
+                    m.ino()
+                }
+                Err(_) => continue,
+            },
         };
 
         if container_ino != init_ino {

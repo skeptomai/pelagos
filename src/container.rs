@@ -839,6 +839,10 @@ pub struct Command {
     uid: Option<u32>,
     gid: Option<u32>,
     join_namespaces: Vec<(PathBuf, Namespace)>,
+    /// Suppress the automatic `Namespace::USER` unshare in rootless mode.
+    /// Used by `pelagos exec` which manages the user-namespace join itself
+    /// inside the pre_exec callback (must happen before the mount-ns join).
+    skip_rootless_user_ns: bool,
     // Mount configuration
     mount_proc: bool,
     mount_sys: bool,
@@ -939,6 +943,7 @@ impl Command {
             uid: None,
             gid: None,
             join_namespaces: Vec::new(),
+            skip_rootless_user_ns: false,
             mount_proc: false,
             mount_sys: false,
             mount_dev: false,
@@ -1165,6 +1170,16 @@ impl Command {
     /// ```
     pub fn with_namespace_join<P: Into<PathBuf>>(mut self, path: P, ns: Namespace) -> Self {
         self.join_namespaces.push((path.into(), ns));
+        self
+    }
+
+    /// Suppress the automatic `Namespace::USER` unshare in rootless mode.
+    ///
+    /// Use this when the caller manages the user-namespace join itself inside
+    /// a `with_pre_exec` callback — e.g. `pelagos exec`, which must join USER
+    /// before MOUNT so the mount-namespace join has the right credentials.
+    pub fn skip_rootless_user_ns(mut self) -> Self {
+        self.skip_rootless_user_ns = true;
         self
     }
 
@@ -2338,7 +2353,16 @@ impl Command {
 
         // Detect rootless mode (running as non-root) and auto-configure.
         let is_rootless = unsafe { libc::getuid() } != 0;
-        if is_rootless {
+        // Don't unshare a new USER namespace if we're joining an existing one
+        // (e.g. `pelagos exec` on a rootless container): setns to a sibling
+        // user namespace after unshare(CLONE_NEWUSER) returns EINVAL.
+        // Also skip if the caller opted out via skip_rootless_user_ns() (exec
+        // manages the user-ns join itself inside its pre_exec callback).
+        let joining_user_ns = self
+            .join_namespaces
+            .iter()
+            .any(|(_, ns)| *ns == Namespace::USER);
+        if is_rootless && !joining_user_ns && !self.skip_rootless_user_ns {
             // Unprivileged containers require a user namespace.
             self.namespaces |= Namespace::USER;
             let host_uid = unsafe { libc::getuid() };
@@ -4580,7 +4604,11 @@ impl Command {
 
         // Detect rootless mode and auto-configure (same logic as spawn()).
         let is_rootless = unsafe { libc::getuid() } != 0;
-        if is_rootless {
+        let joining_user_ns = self
+            .join_namespaces
+            .iter()
+            .any(|(_, ns)| *ns == Namespace::USER);
+        if is_rootless && !joining_user_ns && !self.skip_rootless_user_ns {
             self.namespaces |= Namespace::USER;
             let host_uid = unsafe { libc::getuid() };
             let host_gid = unsafe { libc::getgid() };
