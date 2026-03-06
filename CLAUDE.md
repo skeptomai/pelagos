@@ -249,10 +249,10 @@ Pelagos is a modern, lightweight Linux container runtime written in Rust. It pro
 - **`src/cli/exec.rs`**: `ExecArgs`, `cmd_exec()`, `discover_namespaces()`, `read_proc_environ()`
 
 **Compose (COMPLETE ✅):**
-- **`pelagos compose up [-f compose.rem] [-p project] [--foreground]`**: parse S-expression compose file, create scoped networks/volumes, start services in dependency order with TCP readiness polling, supervisor process with log relay
-- **`pelagos compose down [-f compose.rem] [-p project] [-v]`**: stop services in reverse topo order (SIGTERM → SIGKILL), remove networks/volumes/state
-- **`pelagos compose ps [-f compose.rem] [-p project]`**: list services with status
-- **`pelagos compose logs [-f compose.rem] [-p project] [--follow] [service]`**: view prefixed service logs
+- **`pelagos compose up [-f compose.reml] [-p project] [--foreground]`**: parse S-expression compose file, create scoped networks/volumes, start services in dependency order with TCP readiness polling, supervisor process with log relay
+- **`pelagos compose down [-f compose.reml] [-p project] [-v]`**: stop services in reverse topo order (SIGTERM → SIGKILL), remove networks/volumes/state
+- **`pelagos compose ps [-f compose.reml] [-p project]`**: list services with status
+- **`pelagos compose logs [-f compose.reml] [-p project] [--follow] [service]`**: view prefixed service logs
 - **S-expression format**: `(compose (network ...) (volume ...) (service ...))` — `;` comments, bare words, quoted strings, keyword args (`:ready-port`), nested lists
 - **Dependency management**: `(depends-on (db :ready-port 5432))` — topological sort (Kahn's), cycle detection, TCP readiness polling (250ms interval, 60s timeout)
 - **Scoped naming**: containers `{project}-{service}`, networks `{project}-{net}`, volumes `{project}-{vol}`; DNS uses bare service names for intra-project discovery

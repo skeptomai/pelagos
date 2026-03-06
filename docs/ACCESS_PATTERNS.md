@@ -22,7 +22,7 @@ somewhere in the cluster.
 
 **Pelagos today:** Not applicable as a use case. You control exactly when
 containers start and what ports they expose, so declaring `(port 3000 3000)` in
-`compose.rem` is already the right answer. The scenario that motivates
+`compose.reml` is already the right answer. The scenario that motivates
 `kubectl port-forward` — needing to reach a container whose ports weren't
 declared at launch — doesn't arise in Pelagos.
 
@@ -38,7 +38,7 @@ host.
 `30000–32767` range (or you declare one), and every node in the cluster binds
 it.
 
-**Pelagos today:** Fully supported. `(port 9090 9090)` in `compose.rem` or
+**Pelagos today:** Fully supported. `(port 9090 9090)` in `compose.reml` or
 `--publish 9090:9090` on `pelagos run` binds port 9090 on the host and forwards
 it to port 9090 in the container via nftables DNAT + a userspace TCP proxy for
 localhost access. Works on both `localhost` and the machine's LAN IP.
@@ -83,7 +83,7 @@ provides nginx-ingress as an addon.
 
 **Pelagos today:** No built-in ingress controller. However, all the infrastructure
 needed to run one is present: named networks, DNS service discovery, and port
-mapping. Add Traefik or Caddy as a service in `compose.rem` — it can reach all
+mapping. Add Traefik or Caddy as a service in `compose.reml` — it can reach all
 other services by name via Pelagos's DNS daemon.
 
 **Example** — adding Caddy as an ingress to the monitoring stack:

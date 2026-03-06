@@ -45,7 +45,7 @@ service name.
 
 ---
 
-## `compose.rem` — Prometheus startup flags
+## `compose.reml` — Prometheus startup flags
 
 **Added flag:**
 ```

@@ -272,7 +272,7 @@ sudo pelagos run --network bridge --nat --publish 8080:80 alpine \
 Real applications are more than one process.  Pelagos compose uses an
 S-expression format that's more expressive than YAML.
 
-**`stack.rem`** — a web app + Redis:
+**`stack.reml`** — a web app + Redis:
 
 ```lisp
 (compose
@@ -293,13 +293,13 @@ S-expression format that's more expressive than YAML.
 ```
 
 ```bash
-sudo pelagos compose up -f stack.rem
+sudo pelagos compose up -f stack.reml
 # Pelagos starts Redis first, waits for port 6379 to accept connections,
 # then starts web.  DNS: "redis" resolves inside "web" automatically.
 
-sudo pelagos compose ps -f stack.rem
-sudo pelagos compose logs -f stack.rem
-sudo pelagos compose down -f stack.rem
+sudo pelagos compose ps -f stack.reml
+sudo pelagos compose logs -f stack.reml
+sudo pelagos compose down -f stack.reml
 ```
 
 **Health-aware dependency:**
@@ -550,7 +550,7 @@ Pelagos can run Linux and Wasm services side-by-side in the same compose stack.
 ```
 
 ```bash
-sudo pelagos compose up -f mixed.rem
+sudo pelagos compose up -f mixed.reml
 ```
 
 The Wasm service gets DNS resolution for `postgres`, port 3000 mapped to the
@@ -614,11 +614,11 @@ pelagos build -t myapp:latest --no-cache .
 pelagos build -t myapp:latest --build-arg VERSION=1.2 .
 
 # Compose
-sudo pelagos compose up -f stack.rem
-sudo pelagos compose up -f stack.rem --foreground
-sudo pelagos compose ps -f stack.rem
-sudo pelagos compose logs -f stack.rem
-sudo pelagos compose down -f stack.rem
+sudo pelagos compose up -f stack.reml
+sudo pelagos compose up -f stack.reml --foreground
+sudo pelagos compose ps -f stack.reml
+sudo pelagos compose logs -f stack.reml
+sudo pelagos compose down -f stack.reml
 
 # Networks & Volumes
 sudo pelagos network create mynet

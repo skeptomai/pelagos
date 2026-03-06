@@ -579,7 +579,7 @@ pelagos rm --force <name>
 ## Compose
 
 `pelagos compose` orchestrates multi-service applications using an S-expression compose file
-(default: `compose.rem`).
+(default: `compose.reml`).
 
 ### Basic Usage
 
@@ -591,7 +591,7 @@ sudo pelagos compose up
 sudo pelagos compose up --foreground
 
 # Use a custom file and project name
-sudo pelagos compose up -f mystack.rem -p myproject
+sudo pelagos compose up -f mystack.reml -p myproject
 
 # List services
 pelagos compose ps
@@ -689,16 +689,15 @@ dependency process is alive. With a health check, Pelagos polls until the check 
 
 ---
 
-## Compose Lisp Files (`.reml`)
+## Compose Files (`.reml`)
 
-For complex stacks — parameterised services, loops, conditionals, shared templates — write
-a `.reml` (Pelagos Lisp) file instead of a static `.rem` file. `compose up` auto-detects the
-format by file extension and dispatches accordingly. Default discovery tries `compose.reml`
-first, then falls back to `compose.rem`.
+All compose files use the `.reml` Lisp format. Simple stacks are just data declarations;
+complex stacks can use the full language — loops, conditionals, parameterised services,
+shared templates. The default file is `compose.reml`.
 
 ```bash
 sudo pelagos compose up -f compose.reml
-sudo pelagos compose up                   # tries compose.reml, then compose.rem
+sudo pelagos compose up                   # defaults to compose.reml
 ```
 
 ### Language

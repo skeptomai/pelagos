@@ -1187,7 +1187,27 @@ mod tests {
 
     #[test]
     fn test_example_compose_file() {
-        let content = std::fs::read_to_string("examples/compose/web-stack/compose.rem").unwrap();
+        let content = r#"
+(compose
+  (network frontend (subnet "10.88.1.0/24"))
+  (network backend  (subnet "10.88.2.0/24"))
+  (volume notes-data)
+  (service redis
+    (image "web-stack-redis:latest")
+    (network backend)
+    (memory "64m"))
+  (service app
+    (image "web-stack-app:latest")
+    (network frontend backend)
+    (depends-on (redis :ready-port 6379))
+    (memory "128m"))
+  (service proxy
+    (image "web-stack-proxy:latest")
+    (network frontend)
+    (depends-on (app :ready-port 5000))
+    (port 8080 80)
+    (memory "32m")))
+"#;
         let compose = parse_compose(&content).unwrap();
         assert_eq!(compose.networks.len(), 2);
         assert_eq!(compose.volumes, vec!["notes-data"]);

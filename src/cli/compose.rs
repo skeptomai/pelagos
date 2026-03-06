@@ -1,5 +1,4 @@
-//! `pelagos compose` — multi-service orchestration with S-expression compose files.
-//! Supports both `.rem` (static S-expression) and `.reml` (Lisp program) formats.
+//! `pelagos compose` — multi-service orchestration with Lisp compose files (`.reml`).
 
 use super::{
     check_liveness, container_dir, containers_dir, now_iso8601, write_state, ContainerState,
@@ -26,8 +25,8 @@ use std::time::{Duration, Instant};
 pub enum ComposeCmd {
     /// Start all services defined in the compose file
     Up {
-        /// Path to compose file (default: compose.rem)
-        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        /// Path to compose file (default: compose.reml)
+        #[clap(long = "file", short = 'f', default_value = "compose.reml")]
         file: PathBuf,
         /// Project name (default: parent directory name)
         #[clap(long = "project", short = 'p')]
@@ -38,8 +37,8 @@ pub enum ComposeCmd {
     },
     /// Stop and remove all services
     Down {
-        /// Path to compose file (default: compose.rem)
-        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        /// Path to compose file (default: compose.reml)
+        #[clap(long = "file", short = 'f', default_value = "compose.reml")]
         file: PathBuf,
         /// Project name
         #[clap(long = "project", short = 'p')]
@@ -50,8 +49,8 @@ pub enum ComposeCmd {
     },
     /// List services in the compose project
     Ps {
-        /// Path to compose file (default: compose.rem)
-        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        /// Path to compose file (default: compose.reml)
+        #[clap(long = "file", short = 'f', default_value = "compose.reml")]
         file: PathBuf,
         /// Project name
         #[clap(long = "project", short = 'p')]
@@ -59,8 +58,8 @@ pub enum ComposeCmd {
     },
     /// View logs for compose services
     Logs {
-        /// Path to compose file (default: compose.rem)
-        #[clap(long = "file", short = 'f', default_value = "compose.rem")]
+        /// Path to compose file (default: compose.reml)
+        #[clap(long = "file", short = 'f', default_value = "compose.reml")]
         file: PathBuf,
         /// Project name
         #[clap(long = "project", short = 'p')]
@@ -130,133 +129,8 @@ fn cmd_compose_up(
     project_name: Option<&str>,
     foreground: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Default file discovery: when the canonical default "compose.rem" was
-    // specified (or doesn't exist), try "compose.reml" first.
-    let resolved: std::path::PathBuf;
-    let file = if file == std::path::Path::new("compose.rem") && !file.exists() {
-        let reml = std::path::Path::new("compose.reml");
-        if reml.exists() {
-            resolved = reml.to_path_buf();
-            &resolved
-        } else {
-            file
-        }
-    } else {
-        file
-    };
-
-    // Dispatch to the Lisp evaluator for .reml files.
-    if file.extension().and_then(|e| e.to_str()) == Some("reml") {
-        return cmd_compose_up_reml(file, project_name, foreground);
-    }
-
-    let content = std::fs::read_to_string(file)
-        .map_err(|e| format!("cannot read '{}': {}", file.display(), e))?;
-    let compose = parse_compose(&content)?;
-    let project = derive_project_name(file, project_name)?;
-    let order = topo_sort(&compose.services)?;
-
-    // Check for existing project.
-    let state_file = pelagos::paths::compose_state_file(&project);
-    if state_file.exists() {
-        if let Ok(existing) = load_project_state(&project) {
-            if existing.supervisor_pid > 0 && check_liveness(existing.supervisor_pid) {
-                return Err(format!(
-                    "project '{}' is already running (supervisor PID {})",
-                    project, existing.supervisor_pid
-                )
-                .into());
-            }
-        }
-    }
-
-    // Early rootless + bridge guard — compose bridge networks require root.
-    if pelagos::paths::is_rootless() && !compose.networks.is_empty() {
-        eprintln!(
-            "pelagos: compose bridge networks require root (CAP_NET_ADMIN / nftables).\n\
-             For rootless compose, remove (network ...) declarations and use --network pasta \
-             on individual services, or run with sudo."
-        );
-        std::process::exit(1);
-    }
-
-    // Create scoped networks.
-    let mut created_networks = Vec::new();
-    for net in &compose.networks {
-        let scoped = scoped_network_name(&project, &net.name);
-        let config = pelagos::paths::network_config_dir(&scoped).join("config.json");
-        if !config.exists() {
-            let subnet = net.subnet.as_deref().unwrap_or("10.99.0.0/24");
-            super::network::cmd_network_create(&scoped, subnet)
-                .map_err(|e| format!("compose: failed to create network '{}': {}", scoped, e))?;
-        }
-        created_networks.push(scoped);
-    }
-
-    // Create scoped volumes.
-    let mut created_volumes = Vec::new();
-    for vol in &compose.volumes {
-        let scoped = scoped_volume_name(&project, vol);
-        let _ = Volume::open(&scoped).or_else(|_| Volume::create(&scoped));
-        created_volumes.push(scoped);
-    }
-
-    // Clean any stale DNS config files for this project's networks
-    // (leftover from a previous run whose compose down didn't clean up properly).
-    for net in &created_networks {
-        let dns_file = pelagos::paths::dns_network_file(net);
-        if dns_file.exists() {
-            log::info!("compose: removing stale DNS config for network '{}'", net);
-            let _ = std::fs::remove_file(&dns_file);
-        }
-    }
-
-    if foreground {
-        run_supervisor(
-            &project,
-            file,
-            &compose,
-            &order,
-            &created_networks,
-            &created_volumes,
-        )
-    } else {
-        // Double-fork to daemonise.
-        let fork_result = unsafe { libc::fork() };
-        match fork_result {
-            -1 => Err(std::io::Error::last_os_error().into()),
-            0 => {
-                // Child: detach from parent's session.
-                unsafe { libc::setsid() };
-                // Become a subreaper so orphaned container descendants are
-                // re-parented to us, not host init.
-                unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-                if let Err(e) = run_supervisor(
-                    &project,
-                    file,
-                    &compose,
-                    &order,
-                    &created_networks,
-                    &created_volumes,
-                ) {
-                    log::error!("compose supervisor: {}", e);
-                    unsafe { libc::_exit(1) };
-                }
-                unsafe { libc::_exit(0) };
-            }
-            _child_pid => {
-                // Parent: brief sleep to let supervisor write state, then print status.
-                std::thread::sleep(Duration::from_millis(200));
-                println!("Project '{}' started", project);
-                Ok(())
-            }
-        }
-    }
+    cmd_compose_up_reml(file, project_name, foreground)
 }
-
-// ---------------------------------------------------------------------------
-// .reml (Lisp) path
-// ---------------------------------------------------------------------------
 
 fn cmd_compose_up_reml(
     file: &std::path::Path,
@@ -371,7 +245,7 @@ fn cmd_compose_up_reml(
                     &hooks,
                     &compose_dir,
                 ) {
-                    log::error!("compose supervisor (.reml): {}", e);
+                    log::error!("compose supervisor: {}", e);
                     unsafe { libc::_exit(1) };
                 }
                 unsafe { libc::_exit(0) };
@@ -387,7 +261,7 @@ fn cmd_compose_up_reml(
 
 /// Run compose supervision with optional `on-ready` hooks.
 ///
-/// Called by both the `.rem` path (empty hook map) and the `.reml` path.
+/// Called by the compose supervisor to run services with optional `on-ready` hooks.
 #[allow(clippy::too_many_arguments)]
 pub fn run_compose_with_hooks(
     project: &str,
@@ -468,109 +342,6 @@ pub fn run_compose_with_hooks(
 
     println!("All services started for project '{}'", project);
 
-    loop {
-        std::thread::sleep(Duration::from_secs(2));
-        let mut all_exited = true;
-        for (svc_name, svc_state) in &mut project_state.services {
-            if svc_state.status == "exited" {
-                continue;
-            }
-            if check_liveness(svc_state.pid) {
-                all_exited = false;
-            } else {
-                log::info!("compose: service '{}' exited", svc_name);
-                svc_state.status = "exited".into();
-            }
-        }
-        save_project_state(&project_state)?;
-        if all_exited {
-            log::info!("compose: all services exited for project '{}'", project);
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-fn run_supervisor(
-    project: &str,
-    file: &std::path::Path,
-    compose: &ComposeFile,
-    order: &[String],
-    created_networks: &[String],
-    created_volumes: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let supervisor_pid = unsafe { libc::getpid() };
-
-    // Write initial project state.
-    let mut project_state = ComposeProject {
-        name: project.to_string(),
-        file_path: file.to_string_lossy().into_owned(),
-        services: HashMap::new(),
-        networks: created_networks.to_vec(),
-        volumes: created_volumes.to_vec(),
-        supervisor_pid,
-        started_at: now_iso8601(),
-    };
-    save_project_state(&project_state)?;
-
-    // Build service lookup.
-    let svc_map: HashMap<&str, &ServiceSpec> = compose
-        .services
-        .iter()
-        .map(|s| (s.name.as_str(), s))
-        .collect();
-
-    // Track container PIDs for monitoring and IPs for readiness.
-    let mut container_pids: HashMap<String, i32> = HashMap::new();
-    let mut container_ips: HashMap<String, String> = HashMap::new();
-
-    // Start services in topo order.
-    for svc_name in order {
-        let svc = svc_map[svc_name.as_str()];
-        let container_name = scoped_container_name(project, svc_name);
-
-        // Wait for dependencies.
-        for dep in &svc.depends_on {
-            wait_for_dependency(project, dep, &container_pids, &container_ips)?;
-        }
-
-        // Spawn the service container.
-        log::info!(
-            "compose: starting service '{}' as '{}'",
-            svc_name,
-            container_name
-        );
-        let compose_dir = file.parent().unwrap_or(std::path::Path::new("."));
-        let pid = spawn_service(project, svc, &container_name, compose, compose_dir)?;
-
-        // Read back container state to get IP.
-        if let Ok(cstate) = super::read_state(&container_name) {
-            if let Some(ip) = cstate.bridge_ip.as_ref() {
-                container_ips.insert(svc_name.clone(), ip.clone());
-            }
-            for (net, ip) in &cstate.network_ips {
-                container_ips.insert(svc_name.clone(), ip.clone());
-                let _ = net; // We store the latest IP per service for readiness.
-            }
-        }
-
-        container_pids.insert(svc_name.clone(), pid);
-
-        project_state.services.insert(
-            svc_name.clone(),
-            ComposeServiceState {
-                container_name: container_name.clone(),
-                status: "running".into(),
-                pid,
-            },
-        );
-        save_project_state(&project_state)?;
-    }
-
-    println!("All services started for project '{}'", project);
-
-    // Monitor loop: check liveness every 2s.
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let mut all_exited = true;
