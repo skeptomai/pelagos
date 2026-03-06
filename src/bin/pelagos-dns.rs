@@ -255,7 +255,7 @@ fn parse_network_config(content: &str) -> Option<NetworkConfig> {
 
 struct ListenSocket {
     socket: UdpSocket,
-    network_name: String,
+    gateway_ip: Ipv4Addr,
 }
 
 struct ServerState {
@@ -318,36 +318,14 @@ impl ServerState {
             .collect();
 
         // Remove sockets for IPs no longer needed.
-        self.sockets.retain(|s| {
-            if let Ok(SocketAddr::V4(v4)) = s.socket.local_addr() {
-                return desired.contains_key(v4.ip());
-            }
-            false
-        });
+        self.sockets.retain(|s| desired.contains_key(&s.gateway_ip));
 
         // Determine which IPs already have sockets.
-        let bound: Vec<Ipv4Addr> = self
-            .sockets
-            .iter()
-            .filter_map(|s| {
-                s.socket.local_addr().ok().and_then(|a| match a {
-                    SocketAddr::V4(v4) => Some(*v4.ip()),
-                    _ => None,
-                })
-            })
-            .collect();
+        let bound: Vec<Ipv4Addr> = self.sockets.iter().map(|s| s.gateway_ip).collect();
 
         // Bind new sockets for IPs not yet bound.
-        for (&ip, &net_name) in &desired {
+        for &ip in desired.keys() {
             if bound.contains(&ip) {
-                // Update network_name for existing socket if needed.
-                for s in &mut self.sockets {
-                    if let Ok(SocketAddr::V4(v4)) = s.socket.local_addr() {
-                        if v4.ip() == &ip {
-                            s.network_name = net_name.to_string();
-                        }
-                    }
-                }
                 continue;
             }
 
@@ -357,7 +335,7 @@ impl ServerState {
                     let _ = sock.set_nonblocking(true);
                     self.sockets.push(ListenSocket {
                         socket: sock,
-                        network_name: net_name.to_string(),
+                        gateway_ip: ip,
                     });
                     eprintln!("pelagos-dns: listening on {}", bind_addr);
                 }
@@ -373,15 +351,25 @@ impl ServerState {
         self.configs.values().any(|c| !c.entries.is_empty())
     }
 
-    /// Look up a container name in a specific network's config.
-    fn lookup(&self, network_name: &str, name: &str) -> Option<Ipv4Addr> {
-        self.configs.get(network_name)?.entries.get(name).copied()
+    /// Look up a container name across all configs served by a given gateway IP.
+    ///
+    /// When multiple named networks share the same gateway (e.g. two compose projects
+    /// both using 10.91.0.0/24), a single UDP socket listens on that gateway IP.
+    /// Searching all matching configs ensures entries from any of those networks are
+    /// found rather than returning NXDOMAIN because the HashMap in rebind_sockets
+    /// collapsed them to one network name.
+    fn lookup(&self, gateway: Ipv4Addr, name: &str) -> Option<Ipv4Addr> {
+        self.configs
+            .values()
+            .filter(|cfg| cfg.listen_ip == gateway)
+            .find_map(|cfg| cfg.entries.get(name).copied())
     }
 
-    /// Get upstream servers for a network.
-    fn upstream(&self, network_name: &str) -> Vec<Ipv4Addr> {
+    /// Get upstream servers for a gateway IP (first matching network).
+    fn upstream(&self, gateway: Ipv4Addr) -> Vec<Ipv4Addr> {
         self.configs
-            .get(network_name)
+            .values()
+            .find(|cfg| cfg.listen_ip == gateway)
             .map(|c| c.upstream.clone())
             .unwrap_or_default()
     }
@@ -505,8 +493,8 @@ fn main() {
             match recv {
                 Ok((n, src)) => {
                     activity = true;
-                    let network_name = state.sockets[i].network_name.clone();
-                    if let Some(response) = handle_query(&buf[..n], &network_name, &state) {
+                    let gateway_ip = state.sockets[i].gateway_ip;
+                    if let Some(response) = handle_query(&buf[..n], gateway_ip, &state) {
                         let _ = state.sockets[i].socket.send_to(&response, src);
                     }
                 }
@@ -526,7 +514,7 @@ fn main() {
 }
 
 /// Handle a DNS query: resolve locally or forward upstream.
-fn handle_query(packet: &[u8], network_name: &str, state: &ServerState) -> Option<Vec<u8>> {
+fn handle_query(packet: &[u8], gateway: Ipv4Addr, state: &ServerState) -> Option<Vec<u8>> {
     let query = parse_dns_query(packet)?;
 
     // Strip `.pelagos` suffix if present.
@@ -539,7 +527,7 @@ fn handle_query(packet: &[u8], network_name: &str, state: &ServerState) -> Optio
     // This prevents blocking the main loop on AAAA queries for container names.
     if !name.contains('.') {
         if query.qtype == DNS_TYPE_A && query.qclass == DNS_CLASS_IN {
-            if let Some(ip) = state.lookup(network_name, name) {
+            if let Some(ip) = state.lookup(gateway, name) {
                 return Some(build_a_response(&query, ip));
             }
         }
@@ -549,7 +537,7 @@ fn handle_query(packet: &[u8], network_name: &str, state: &ServerState) -> Optio
         // If we return NXDOMAIN for the AAAA query while the A query succeeds,
         // parallel resolvers (like musl libc) may treat the NXDOMAIN as
         // authoritative proof that the name doesn't exist, discarding the A result.
-        if state.lookup(network_name, name).is_some() {
+        if state.lookup(gateway, name).is_some() {
             return Some(build_nodata(&query));
         }
         return Some(build_nxdomain(&query));
@@ -557,13 +545,13 @@ fn handle_query(packet: &[u8], network_name: &str, state: &ServerState) -> Optio
 
     // Dotted name — try local lookup for A queries first.
     if query.qtype == DNS_TYPE_A && query.qclass == DNS_CLASS_IN {
-        if let Some(ip) = state.lookup(network_name, name) {
+        if let Some(ip) = state.lookup(gateway, name) {
             return Some(build_a_response(&query, ip));
         }
     }
 
     // Forward to upstream DNS.
-    let upstream = state.upstream(network_name);
+    let upstream = state.upstream(gateway);
     if upstream.is_empty() {
         return Some(build_nxdomain(&query));
     }
