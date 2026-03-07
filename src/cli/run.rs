@@ -1,5 +1,28 @@
 //! `pelagos run` — create and start a container.
 
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// PID of the container process being watched.  Written once after spawn,
+/// read by the watcher's SIGTERM/SIGINT handler to forward the signal.
+static WATCHER_CONTAINER_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Signal handler installed in the watcher process.
+///
+/// Forwards the received signal to the container process so that the normal
+/// teardown path (`child.wait()` → `teardown_resources()`) runs.  This
+/// ensures that `kill <watcher_pid>` triggers clean resource removal rather
+/// than leaving dangling veths and nftables rules.
+///
+/// # Safety
+/// Only async-signal-safe operations: `AtomicI32::load` + `libc::kill`.
+#[allow(dead_code)] // used via FFI in watcher child's signal() call
+extern "C" fn watcher_forward_signal(signum: libc::c_int) {
+    let pid = WATCHER_CONTAINER_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        unsafe { libc::kill(pid, signum) };
+    }
+}
+
 use super::{
     check_liveness, container_dir, containers_dir, generate_name, parse_capability, parse_cpus,
     parse_memory, parse_ulimit, parse_user, parse_user_in_layers, rootfs_path, write_state,
@@ -107,11 +130,11 @@ pub struct RunArgs {
     #[clap(long = "ulimit")]
     pub ulimit: Vec<String>,
 
-    /// Capability to drop: ALL or CAP_NAME (repeatable)
+    /// Capability to drop from the default set: ALL or a capability name (repeatable)
     #[clap(long = "cap-drop")]
     pub cap_drop: Vec<String>,
 
-    /// Capability to add after --cap-drop ALL (repeatable)
+    /// Capability to add on top of the default set (repeatable)
     #[clap(long = "cap-add")]
     pub cap_add: Vec<String>,
 
@@ -585,20 +608,24 @@ fn apply_cli_options(
         cmd = cmd.with_rlimit(res, soft, hard);
     }
 
-    // Capabilities
-    let drop_all = args.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL"));
-    if drop_all {
-        cmd = cmd.drop_all_capabilities();
-        let mut add_caps = Capability::empty();
+    // Capabilities: start from DEFAULT_CAPS, apply --cap-drop then --cap-add.
+    // --cap-drop ALL zeros the baseline; individual --cap-drop NAME removes one cap.
+    if !args.cap_drop.is_empty() || !args.cap_add.is_empty() {
+        let drop_all = args.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL"));
+        let mut effective = if drop_all {
+            Capability::empty()
+        } else {
+            Capability::DEFAULT_CAPS
+        };
+        if !drop_all {
+            for cap_name in &args.cap_drop {
+                effective &= !parse_capability(cap_name)?;
+            }
+        }
         for cap_name in &args.cap_add {
-            let cap = parse_capability(cap_name)?;
-            add_caps |= cap;
+            effective |= parse_capability(cap_name)?;
         }
-        if !add_caps.is_empty() {
-            cmd = cmd.with_capabilities(add_caps);
-        }
-    } else if !args.cap_drop.is_empty() {
-        return Err("--cap-drop only supports 'ALL'; use --cap-drop ALL --cap-add CAP_NAME to keep specific capabilities".into());
+        cmd = cmd.with_capabilities(effective);
     }
 
     // Security options
@@ -871,6 +898,22 @@ fn run_detached(
                 }
             };
             let pid = child.pid();
+
+            // Store the container PID so the signal handler can forward signals to it,
+            // then install SIGTERM/SIGINT handlers.  Any signal sent to the watcher
+            // (e.g. `kill <watcher_pid>`) is forwarded to the container, which then
+            // exits normally, causing child.wait() to return and teardown to run.
+            WATCHER_CONTAINER_PID.store(pid as i32, Ordering::Relaxed);
+            unsafe {
+                libc::signal(
+                    libc::SIGTERM,
+                    watcher_forward_signal as *const () as libc::sighandler_t,
+                );
+                libc::signal(
+                    libc::SIGINT,
+                    watcher_forward_signal as *const () as libc::sighandler_t,
+                );
+            }
 
             // Update state with real PIDs and network IPs.
             let mut updated = state;
