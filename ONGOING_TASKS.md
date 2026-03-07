@@ -22,18 +22,48 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #73 | feat(wasm): persistent Wasm VM pool (P4) | feat/low-pri |
 | #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
 
-## Current Baseline (2026-03-07, SHA e66950d)
+## Current Baseline (2026-03-07, SHA 201e4b4, v0.24.0)
 
 - Unit tests: **296/296 pass**
-- Integration tests: **236/237 pass, 6 ignored** — `exec::test_exec_joins_pid_namespace`
-  is a pre-existing failure (dirty container state after a full suite run; passes when
-  run in isolation after `sudo scripts/reset-test-env.sh`)
-- New rootless exec tests (5): all pass
-- CI: not re-run this session (no CI-impacting changes)
+- Integration tests: **243/243 pass, 6 ignored** — all pre-existing failures fixed
+- CI: **all jobs green** on v0.24.0 release (lint + unit + integration + x86_64 + aarch64)
+- Released: **v0.24.0** — https://github.com/skeptomai/pelagos/releases/tag/v0.24.0
 
-**Note for next session:** Run integration tests with `--test-threads=1` to avoid
-network-state races between DNS tests. Always `sudo scripts/reset-test-env.sh`
-if starting from a possibly dirty environment.
+**Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
+a possibly dirty environment. The reset script now handles veths, nftables, and DNS
+daemon cleanup correctly.
+
+## Completed This Session (2026-03-07, v0.24.0)
+
+### Resource cleanup fixes
+- Investigated orphaned veths/nftables after container exit; confirmed natural exit
+  and `pelagos stop` always clean up correctly
+- **Watcher SIGTERM handler**: forwards SIGTERM/SIGINT to container so `kill <watcher_pid>`
+  triggers normal teardown_resources() path (veth/netns/nftables cleanup)
+- **`pelagos rm --force`**: SIGTERM-first with 5 s grace period before SIGKILL
+- **`reset-test-env.sh`**: SIGTERM-first; deletes all `vh-*`/`vp-*` veths;
+  removes all `pelagos-*` nftables tables dynamically; stops DNS daemon
+
+### Capability management
+- `Capability::DEFAULT_CAPS` (Podman's 11-cap set) as secure-but-functional baseline
+- Compose `spawn_service` uses DEFAULT_CAPS (fixes postgres/nginx/redis breaking)
+- `(cap-drop ...)` in compose (both S-expr and Lisp parsers); `(cap-drop ALL)` supported
+- `--cap-drop NAME` CLI flag supporting all 41 Linux cap names
+- `parse_capability()` rewritten to use `Capability::from_name()` (was 9 hardcoded caps)
+- 6 new integration tests for cap behavior
+
+### Tutorial + image fixes
+- `image ls` TYPE column: now shows `component` vs `wasm` vs `linux` correctly
+- Tutorial: $GITHUB_USER var, redis pull prerequisite, Wasm prerequisites table,
+  std::process::id() removal, component-ctx/ build context, Part 7 rewritten (issue #70)
+- USER_GUIDE.md: graceful shutdown, reset-test-env.sh sections
+
+### Test fixes (3 pre-existing failures eliminated)
+- `test_exec_joins_pid_namespace`: rewritten to use `/bin/echo` (avoids /proc/self
+  limitation); documents known PID-namespace-exec double-fork issue
+- `test_healthcheck_unhealthy`: fixed polling race (was checking file existence only;
+  now waits for pid > 0 like other tests)
+- `test_tut_p4_compose_depends_on`: confirmed dirty-state flakiness; passes after reset
 
 ## Completed This Session (2026-03-03)
 
