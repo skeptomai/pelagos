@@ -1510,30 +1510,41 @@ fn do_container_start_inner(
         .with_namespaces(ns | Namespace::PID | Namespace::UTS | Namespace::IPC)
         .with_hostname(&container_name);
 
-    // Security: seccomp + dropped capabilities + no-new-privileges + masked paths.
-    // Mirrors Docker's secure-by-default posture.
-    cmd = cmd
-        .with_seccomp_default()
-        .drop_all_capabilities()
-        .with_no_new_privileges(true)
-        .with_masked_paths_default();
-
-    // Restore any capabilities explicitly requested via :cap-add in the service spec.
-    if !svc.cap_add.is_empty() {
+    // Security: seccomp + capabilities + no-new-privileges + masked paths.
+    //
+    // Start from DEFAULT_CAPS, apply (cap-drop ...) then (cap-add ...).
+    // (cap-drop "ALL") zeros the baseline before any cap-add is applied.
+    {
         use crate::container::Capability;
-        let mut restore = Capability::empty();
-        for name in &svc.cap_add {
-            let normalised = name
-                .to_uppercase()
-                .replace('-', "_")
-                .trim_start_matches("CAP_")
-                .to_string();
-            match Capability::from_name(&normalised) {
-                Some(cap) => restore |= cap,
-                None => log::warn!("container-start: unknown cap-add '{}' — skipping", name),
+        let drop_all = svc.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL"));
+        let mut effective = if drop_all {
+            Capability::empty()
+        } else {
+            Capability::DEFAULT_CAPS
+        };
+        if !drop_all {
+            for name in &svc.cap_drop {
+                let n = name.to_uppercase().replace('-', "_");
+                let n = n.trim_start_matches("CAP_");
+                match Capability::from_name(n) {
+                    Some(cap) => effective &= !cap,
+                    None => log::warn!("cap-drop: unknown capability '{}' — skipping", name),
+                }
             }
         }
-        cmd = cmd.with_capabilities(restore);
+        for name in &svc.cap_add {
+            let n = name.to_uppercase().replace('-', "_");
+            let n = n.trim_start_matches("CAP_");
+            match Capability::from_name(n) {
+                Some(cap) => effective |= cap,
+                None => log::warn!("cap-add: unknown capability '{}' — skipping", name),
+            }
+        }
+        cmd = cmd
+            .with_seccomp_default()
+            .with_capabilities(effective)
+            .with_no_new_privileges(true)
+            .with_masked_paths_default();
     }
 
     // Spawn with log capture.

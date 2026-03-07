@@ -18,8 +18,7 @@ pub fn cmd_rm(name: &str, force: bool) -> Result<(), Box<dyn std::error::Error>>
                 }
             }
             // Give the container up to 5 s to exit cleanly before resorting to SIGKILL.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while check_liveness(state.pid) && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }

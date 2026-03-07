@@ -595,6 +595,31 @@ bitflags! {
     }
 }
 
+impl Capability {
+    /// Default capability set for container runtimes — matches Podman's defaults.
+    ///
+    /// This is a safe, functional baseline: enough for images that manage users
+    /// and file ownership at startup (postgres, nginx, etc.) while omitting
+    /// the highest-risk caps (NET_RAW, MKNOD, AUDIT_WRITE).
+    ///
+    /// Use `drop_all_capabilities()` when you know a service needs nothing,
+    /// or `with_capabilities(Capability::DEFAULT_CAPS - dropped + added)` for
+    /// fine-grained control.
+    pub const DEFAULT_CAPS: Capability = Capability::from_bits_retain(
+        Capability::CHOWN.bits()
+            | Capability::DAC_OVERRIDE.bits()
+            | Capability::FOWNER.bits()
+            | Capability::FSETID.bits()
+            | Capability::KILL.bits()
+            | Capability::NET_BIND_SERVICE.bits()
+            | Capability::SETFCAP.bits()
+            | Capability::SETGID.bits()
+            | Capability::SETPCAP.bits()
+            | Capability::SETUID.bits()
+            | Capability::SYS_CHROOT.bits(),
+    );
+}
+
 impl Namespace {
     /// Convert namespace flags to nix CloneFlags
     fn to_clone_flags(self) -> CloneFlags {

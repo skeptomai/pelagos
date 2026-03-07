@@ -3030,3 +3030,72 @@ does not contain "DNS_FAIL" and contains an IP address.
 Failure indicates the DNS daemon (pelagos-dns) is not registering compose service
 names, the container's /etc/resolv.conf is misconfigured, or the DNS TCP readiness
 wait in depends-on is exposing a race with DNS registration.
+
+---
+
+## Compose cap-add Tests
+
+### `test_compose_cap_add_chown`
+**Requires:** root, rootfs
+
+Mirrors the compose `spawn_service` hardening block (`drop_all_capabilities` +
+`with_seccomp_default` + `with_no_new_privileges` + `with_masked_paths_default`)
+and then restores `CAP_CHOWN` via `with_capabilities(Capability::CHOWN)`.  Runs
+`chown nobody /tmp` inside the container and asserts exit 0 and `OK` on stdout.
+
+Failure indicates that the compose `cap-add` wiring — calling `with_capabilities`
+after `drop_all_capabilities` in `spawn_service` — is broken or that `CAP_CHOWN`
+is not correctly parsed from the capability name string.
+
+### `test_compose_cap_add_chown_denied_without_cap`
+**Requires:** root, rootfs
+
+Same hardening block as `test_compose_cap_add_chown` but without any
+`with_capabilities` call — `CAP_CHOWN` remains dropped.  Runs
+`chown nobody /tmp && echo OK || echo EPERM` and asserts the output contains
+`EPERM` and does not contain `OK`.
+
+Failure indicates that `drop_all_capabilities` is not actually dropping
+`CAP_CHOWN`, meaning the security boundary that `cap-add` is supposed to opt
+into is not enforced.
+
+### `test_default_caps_hex_value`
+**Requires:** root, rootfs
+
+Runs a container with exactly `Capability::DEFAULT_CAPS` and reads `CapEff`
+from `/proc/self/status`.  Asserts the value is `00000000800405fb` — the 11-cap
+set (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID, SETPCAP,
+NET_BIND_SERVICE, SYS_CHROOT, SETFCAP).
+
+Failure means the `DEFAULT_CAPS` constant was modified without updating this
+test — any bit added or removed changes the hex value.
+
+### `test_default_caps_allows_chown_denies_mknod`
+**Requires:** root, rootfs
+
+Runs a container with `DEFAULT_CAPS` and executes both `chown nobody /tmp` and
+`mknod /tmp/testdev c 1 1`.  Asserts `CHOWN=OK` and `MKNOD=FAIL`.
+
+Failure indicates either: CHOWN was removed from `DEFAULT_CAPS` (postgres-style
+images would break), or MKNOD was accidentally added (device-node creation
+attack surface opened).
+
+### `test_cap_drop_all_zeros_caps`
+**Requires:** root, rootfs
+
+Runs a container with `drop_all_capabilities()` (the `(cap-drop "ALL")` path)
+and asserts `chown` fails — even CHOWN, which is in `DEFAULT_CAPS`, must be
+absent after explicit drop-all.
+
+Failure indicates `drop_all_capabilities()` is not zeroing the effective cap
+set, so `(cap-drop "ALL")` would silently leave capabilities in place.
+
+### `test_cap_drop_individual_removes_only_that_cap`
+**Requires:** root, rootfs
+
+Runs a container with `DEFAULT_CAPS & !Capability::CHOWN`.  Asserts `chown`
+fails (`CHOWN=FAIL`) but the process completes normally (`ALIVE`), proving that
+a single-cap drop removes only that capability without becoming drop-all.
+
+Failure in either direction: if `CHOWN=OK`, the cap-drop didn't apply; if
+`ALIVE` is missing, the implementation accidentally dropped all caps.

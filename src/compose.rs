@@ -44,9 +44,12 @@ pub struct ServiceSpec {
     pub command: Option<Vec<String>>,
     pub workdir: Option<String>,
     pub user: Option<String>,
-    /// Capabilities to restore after `drop_all_capabilities()`.
+    /// Capabilities to add on top of the default set.
     /// Accepts bare names ("net-raw", "NET_RAW") or prefixed ("CAP_NET_RAW").
     pub cap_add: Vec<String>,
+    /// Capabilities to remove from the default set, or "ALL" to start from empty.
+    /// Accepts bare names, prefixed names, or the special value "ALL".
+    pub cap_drop: Vec<String>,
 }
 
 /// A volume mount: `name:path` inside the container.
@@ -291,6 +294,7 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
         workdir: None,
         user: None,
         cap_add: Vec::new(),
+        cap_drop: Vec::new(),
     };
 
     for arg in &args[1..] {
@@ -410,6 +414,17 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
                         ))
                     })?;
                     spec.cap_add.push(cap.to_string());
+                }
+            }
+            "cap-drop" => {
+                for item in &list[1..] {
+                    let cap = item.as_atom().ok_or_else(|| {
+                        ComposeError::InvalidValue(format!(
+                            "service '{}': cap-drop values must be atoms",
+                            name
+                        ))
+                    })?;
+                    spec.cap_drop.push(cap.to_string());
                 }
             }
             other => {

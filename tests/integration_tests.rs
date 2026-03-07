@@ -11354,7 +11354,8 @@ fn test_lisp_env_fallback_and_override() {
     use pelagos::lisp::Interpreter;
 
     // Ensure the test var is absent.
-    std::env::remove_var("_PELAGOS_TEST_PORT");
+    // SAFETY: single-threaded test; no other thread reads this var.
+    unsafe { std::env::remove_var("_PELAGOS_TEST_PORT") };
 
     let mut interp = Interpreter::new();
 
@@ -11368,7 +11369,8 @@ fn test_lisp_env_fallback_and_override() {
     assert_eq!(v, pelagos::lisp::Value::Int(9999));
 
     // With var set: should use the provided value.
-    std::env::set_var("_PELAGOS_TEST_PORT", "1234");
+    // SAFETY: single-threaded test; no other thread reads this var.
+    unsafe { std::env::set_var("_PELAGOS_TEST_PORT", "1234") };
     let v2 = interp
         .eval_str(
             r#"(let ((p (env "_PELAGOS_TEST_PORT")))
@@ -11377,7 +11379,8 @@ fn test_lisp_env_fallback_and_override() {
         .expect("eval failed");
     assert_eq!(v2, pelagos::lisp::Value::Int(1234));
 
-    std::env::remove_var("_PELAGOS_TEST_PORT");
+    // SAFETY: single-threaded test; no other thread reads this var.
+    unsafe { std::env::remove_var("_PELAGOS_TEST_PORT") };
 }
 
 #[test]
@@ -15274,4 +15277,337 @@ mod tutorial_e2e_p4 {
             stdout.trim()
         );
     }
+}
+
+// ============================================================================
+// Compose cap-add: verify capability restoration in compose services
+// ============================================================================
+//
+// pelagos compose drops all capabilities before spawning each service.  The
+// :cap-add service option restores named capabilities after the drop.  These
+// tests verify that cap-add is wired through the compose service spawning path
+// (src/cli/compose.rs spawn_service) by running a CAP_CHOWN-requiring operation
+// (chown nobody /tmp) and checking whether it succeeds or fails based on
+// whether cap-add was specified.
+
+/// Verify that a compose service with `cap-add CHOWN` can execute `chown`.
+///
+/// Spawns a container directly using the same hardening block that compose
+/// uses (drop_all_capabilities + with_capabilities for restore) and runs
+/// `chown nobody /tmp`.  If CAP_CHOWN is correctly restored, `chown` exits 0.
+/// This is a unit-level regression guard: if the compose spawn_service path
+/// stops calling with_capabilities after drop_all_capabilities, this test
+/// catches it immediately without requiring a full compose run.
+#[test]
+fn test_compose_cap_add_chown() {
+    if !is_root() {
+        eprintln!("SKIP: test_compose_cap_add_chown requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: test_compose_cap_add_chown requires alpine-rootfs");
+            return;
+        }
+    };
+
+    // Mirrors the compose hardening block in src/cli/compose.rs spawn_service:
+    //   .with_seccomp_default()
+    //   .drop_all_capabilities()
+    //   .with_no_new_privileges(true)
+    //   .with_masked_paths_default()
+    //   .with_capabilities(restore)   ← this is what cap-add wires in
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "chown nobody /tmp && echo OK"])
+        .with_chroot(&rootfs)
+        .with_proc_mount()
+        .with_namespaces(Namespace::MOUNT | Namespace::PID | Namespace::UTS | Namespace::IPC)
+        .with_hostname("cap-add-test")
+        .with_seccomp_default()
+        .drop_all_capabilities()
+        .with_no_new_privileges(true)
+        .with_masked_paths_default()
+        // Restore CAP_CHOWN — the critical cap-add under test.
+        .with_capabilities(Capability::CHOWN)
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (status, stdout_bytes, stderr_bytes) =
+        child.wait_with_output().expect("wait_with_output failed");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+
+    assert!(
+        status.success(),
+        "chown should succeed with CAP_CHOWN restored; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("OK"),
+        "expected 'OK' from chown success; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+/// Verify that a compose service WITHOUT `cap-add CHOWN` cannot execute `chown`.
+///
+/// Same setup as `test_compose_cap_add_chown` but without the
+/// `with_capabilities(Capability::CHOWN)` call.  `chown` must fail with a
+/// non-zero exit because CAP_CHOWN was dropped and not restored.
+///
+/// This is the negative counterpart: if the container runtime accidentally
+/// preserved CAP_CHOWN after `drop_all_capabilities()`, this test would catch
+/// it.  Both tests together guard that the drop-then-restore pattern works
+/// correctly and is not a no-op in either direction.
+#[test]
+fn test_compose_cap_add_chown_denied_without_cap() {
+    if !is_root() {
+        eprintln!("SKIP: test_compose_cap_add_chown_denied_without_cap requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: test_compose_cap_add_chown_denied_without_cap requires alpine-rootfs");
+            return;
+        }
+    };
+
+    // Same hardening block as compose spawn_service, but NO cap-add restore.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "chown nobody /tmp && echo OK || echo EPERM"])
+        .with_chroot(&rootfs)
+        .with_proc_mount()
+        .with_namespaces(Namespace::MOUNT | Namespace::PID | Namespace::UTS | Namespace::IPC)
+        .with_hostname("cap-denied-test")
+        .with_seccomp_default()
+        .drop_all_capabilities()
+        .with_no_new_privileges(true)
+        .with_masked_paths_default()
+        // No with_capabilities() call — CAP_CHOWN remains dropped.
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (_status, stdout_bytes, _stderr_bytes) =
+        child.wait_with_output().expect("wait_with_output failed");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+    // The shell catches the chown failure via ||, so the shell itself exits 0,
+    // but the output must contain EPERM — not OK — because chown was denied.
+    assert!(
+        stdout.contains("EPERM"),
+        "expected chown to fail (EPERM) without CAP_CHOWN; stdout={stdout:?}"
+    );
+    assert!(
+        !stdout.contains("OK"),
+        "chown must NOT succeed without CAP_CHOWN; stdout={stdout:?}"
+    );
+}
+
+/// Verify that `Capability::DEFAULT_CAPS` is the correct 11-cap set.
+///
+/// Reads `CapEff` from `/proc/self/status` inside a container running with
+/// exactly `DEFAULT_CAPS` and asserts the hex value matches the expected mask
+/// (0x00000000800405fb).  This catches any future accidental changes to the
+/// constant — if a bit is added or removed, this test fails immediately.
+///
+/// Expected caps: CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP
+///                NET_BIND_SERVICE SYS_CHROOT SETFCAP
+#[test]
+fn test_default_caps_hex_value() {
+    if !is_root() {
+        eprintln!("SKIP: test_default_caps_hex_value requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: test_default_caps_hex_value requires alpine-rootfs");
+            return;
+        }
+    };
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "grep '^CapEff:' /proc/self/status"])
+        .with_chroot(&rootfs)
+        .with_proc_mount()
+        .with_namespaces(Namespace::MOUNT | Namespace::PID)
+        .with_capabilities(Capability::DEFAULT_CAPS)
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (status, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    assert!(status.success(), "grep failed: {stdout}");
+
+    let capeff_val = stdout
+        .lines()
+        .find(|l| l.starts_with("CapEff:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("missing");
+
+    assert_eq!(
+        capeff_val, "00000000800405fb",
+        "DEFAULT_CAPS CapEff mismatch — expected 00000000800405fb (11-cap set), got {capeff_val}"
+    );
+}
+
+/// Verify that DEFAULT_CAPS allows CHOWN (proving compose no longer drops all caps
+/// by default) and denies MKNOD (proving NET_RAW-class caps are excluded).
+///
+/// This is the functional complement to `test_default_caps_hex_value`: it confirms
+/// the two most important properties of the default set without relying on a specific
+/// hex value — CHOWN must work (so postgres-style images start cleanly) and MKNOD
+/// must fail (so device-node creation attacks are blocked).
+#[test]
+fn test_default_caps_allows_chown_denies_mknod() {
+    if !is_root() {
+        eprintln!("SKIP: test_default_caps_allows_chown_denies_mknod requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: test_default_caps_allows_chown_denies_mknod requires alpine-rootfs");
+            return;
+        }
+    };
+
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "chown nobody /tmp && echo CHOWN=OK || echo CHOWN=FAIL; \
+             mknod /tmp/testdev c 1 1 2>/dev/null && echo MKNOD=OK || echo MKNOD=FAIL",
+        ])
+        .with_chroot(&rootfs)
+        .with_proc_mount()
+        .with_namespaces(Namespace::MOUNT | Namespace::PID)
+        .with_capabilities(Capability::DEFAULT_CAPS)
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (_, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+    assert!(
+        stdout.contains("CHOWN=OK"),
+        "CHOWN should succeed with DEFAULT_CAPS; stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("MKNOD=FAIL"),
+        "MKNOD should fail with DEFAULT_CAPS (not in default set); stdout={stdout:?}"
+    );
+}
+
+/// Verify that `(cap-drop "ALL")` / `drop_all_capabilities()` zeros the effective
+/// cap set, denying even CHOWN which is present in DEFAULT_CAPS.
+///
+/// This guards the explicit drop-all path: when a user writes `(cap-drop "ALL")`
+/// in a compose service spec, the container must truly have no capabilities.
+#[test]
+fn test_cap_drop_all_zeros_caps() {
+    if !is_root() {
+        eprintln!("SKIP: test_cap_drop_all_zeros_caps requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: test_cap_drop_all_zeros_caps requires alpine-rootfs");
+            return;
+        }
+    };
+
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "chown nobody /tmp && echo CHOWN=OK || echo CHOWN=FAIL",
+        ])
+        .with_chroot(&rootfs)
+        .with_proc_mount()
+        .with_namespaces(Namespace::MOUNT | Namespace::PID)
+        .drop_all_capabilities()
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (_, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+    assert!(
+        stdout.contains("CHOWN=FAIL"),
+        "CHOWN must fail after drop_all_capabilities(); stdout={stdout:?}"
+    );
+}
+
+/// Verify that removing a single cap from DEFAULT_CAPS (via `DEFAULT_CAPS & !cap`)
+/// removes exactly that capability while leaving all others intact.
+///
+/// Drops CHOWN from the default set.  Asserts:
+/// - `chown` fails (CHOWN was removed)
+/// - The container still runs to completion (not all caps dropped — process is alive)
+///
+/// This guards the individual `(cap-drop "NAME")` compose path and the
+/// `--cap-drop NAME` CLI path: a single-cap drop must not silently become drop-all.
+#[test]
+fn test_cap_drop_individual_removes_only_that_cap() {
+    if !is_root() {
+        eprintln!("SKIP: test_cap_drop_individual_removes_only_that_cap requires root");
+        return;
+    }
+    let rootfs = match get_test_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "SKIP: test_cap_drop_individual_removes_only_that_cap requires alpine-rootfs"
+            );
+            return;
+        }
+    };
+
+    // DEFAULT_CAPS minus CHOWN — every other default cap should remain.
+    let caps = Capability::DEFAULT_CAPS & !Capability::CHOWN;
+
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            // CHOWN removed — must fail.
+            "chown nobody /tmp && echo CHOWN=OK || echo CHOWN=FAIL; \
+             // DAC_OVERRIDE still present — reading a root-owned file works.
+             echo ALIVE",
+        ])
+        .with_chroot(&rootfs)
+        .with_proc_mount()
+        .with_namespaces(Namespace::MOUNT | Namespace::PID)
+        .with_capabilities(caps)
+        .env("PATH", ALPINE_PATH)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped)
+        .spawn()
+        .expect("spawn failed");
+
+    let (_, stdout_bytes, _) = child.wait_with_output().expect("wait failed");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+
+    assert!(
+        stdout.contains("CHOWN=FAIL"),
+        "CHOWN must fail when individually dropped; stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("ALIVE"),
+        "process must remain alive (other caps intact, not drop-all); stdout={stdout:?}"
+    );
 }

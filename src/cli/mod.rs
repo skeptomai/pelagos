@@ -493,21 +493,13 @@ pub fn parse_ulimit(
 /// Parse a capability name like "CAP_NET_RAW" or "NET_RAW" to Capability bitflag.
 pub fn parse_capability(s: &str) -> Result<pelagos::container::Capability, String> {
     use pelagos::container::Capability;
-    let name = s.trim().to_ascii_uppercase();
+    let name = s.trim().to_ascii_uppercase().replace('-', "_");
     let name = name.strip_prefix("CAP_").unwrap_or(&name);
-    match name {
-        "CHOWN"           => Ok(Capability::CHOWN),
-        "DAC_OVERRIDE"    => Ok(Capability::DAC_OVERRIDE),
-        "FOWNER"          => Ok(Capability::FOWNER),
-        "SETGID"          => Ok(Capability::SETGID),
-        "SETUID"          => Ok(Capability::SETUID),
-        "NET_BIND_SERVICE"=> Ok(Capability::NET_BIND_SERVICE),
-        "NET_RAW"         => Ok(Capability::NET_RAW),
-        "SYS_CHROOT"      => Ok(Capability::SYS_CHROOT),
-        "SYS_ADMIN"       => Ok(Capability::SYS_ADMIN),
-        "SYS_PTRACE"      => Ok(Capability::SYS_PTRACE),
-        other => Err(format!("unknown capability '{}' (supported: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, SYS_ADMIN, SYS_PTRACE)", other)),
-    }
+    Capability::from_name(name).ok_or_else(|| {
+        format!(
+            "unknown capability '{s}' (use Linux capability names, e.g. NET_RAW, SYS_ADMIN, CHOWN)"
+        )
+    })
 }
 
 /// Format a duration in seconds as a human-readable "X minutes ago" string.

@@ -715,6 +715,64 @@ Alternatively, use `quote` shorthand:
   '(network "backend"))
 ```
 
+### Capabilities in Compose Services
+
+`pelagos compose` starts every service with a safe default capability set
+(`DEFAULT_CAPS`) that mirrors Podman's defaults — enough for images that manage
+users and file ownership at startup, without the highest-risk capabilities:
+
+| In `DEFAULT_CAPS` | Not in `DEFAULT_CAPS` (must use `cap-add`) |
+|---|---|
+| `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` | `NET_RAW` — raw socket abuse vector |
+| `KILL`, `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID` | `MKNOD` — device node creation |
+| `NET_BIND_SERVICE`, `SYS_CHROOT` | `AUDIT_WRITE`, `SYS_ADMIN`, `SYS_PTRACE`, … |
+
+Use `(cap-add ...)` to add capabilities beyond the default, `(cap-drop ...)` to
+remove individual capabilities from the default, or `(cap-drop "ALL")` to start
+from zero and add back only what you need:
+
+```lisp
+; Add a non-default capability
+(service "scanner"
+  '(image "myapp:latest")
+  '(cap-add "NET_RAW"))           ; raw socket access
+
+; Remove a default capability for extra hardening
+(service "worker"
+  '(image "myapp:latest")
+  '(cap-drop "NET_BIND_SERVICE")) ; this service never binds ports < 1024
+
+; Start from zero — most restrictive; add back only what's needed
+(service "sandbox"
+  '(image "myapp:latest")
+  '(cap-drop "ALL")
+  '(cap-add "NET_BIND_SERVICE"))
+```
+
+Capability names are case-insensitive and may omit the `CAP_` prefix.  All
+Linux capability names are accepted (CHOWN, DAC_OVERRIDE, FOWNER, SETGID,
+SETUID, NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, SYS_ADMIN, SYS_PTRACE, …).
+
+**Postgres / database services** work without any `cap-add` because `CHOWN`,
+`FOWNER`, `SETUID`, `SETGID`, and `DAC_OVERRIDE` are all in `DEFAULT_CAPS`.
+Only add `cap-add` if you need capabilities *outside* the default set, or use
+`cap-drop` to tighten a service that needs fewer than the defaults:
+
+```lisp
+(compose-up
+  (compose
+    (volume "pgdata")
+    (service "db"
+      '(image  "postgres:alpine")
+      '(volume "pgdata" "/var/lib/postgresql/data")
+      '(env    "POSTGRES_PASSWORD" "secret")
+      '(port   5432 5432)
+      ; No cap-add needed — DEFAULT_CAPS includes everything postgres requires.
+      ; Use cap-drop to harden further if desired:
+      ; '(cap-drop "NET_BIND_SERVICE")
+      )))
+```
+
 ### Example: Parameterised Services
 
 ```lisp
@@ -1171,16 +1229,24 @@ sudo pelagos run --read-only --tmpfs /tmp alpine /bin/sh
 
 ### Capabilities
 
-```bash
-# Drop all capabilities (most restrictive)
-sudo pelagos run --cap-drop ALL alpine /bin/sh
+`pelagos run` starts with `DEFAULT_CAPS` (the same 11-cap set as compose).
+Use `--cap-drop` and `--cap-add` to adjust:
 
-# Drop all, then add back specific ones
+```bash
+# Remove one cap from the default set
+sudo pelagos run --cap-drop NET_BIND_SERVICE alpine /bin/sh
+
+# Drop everything, add back only what's needed (most restrictive)
 sudo pelagos run --cap-drop ALL --cap-add NET_BIND_SERVICE alpine /bin/sh
+
+# Add a non-default capability
+sudo pelagos run --cap-add NET_RAW alpine /bin/sh
 ```
 
-Supported capabilities: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID,
-NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, SYS_ADMIN, SYS_PTRACE.
+All Linux capability names are accepted (case-insensitive, `CAP_` prefix
+optional): CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETFCAP, SETGID,
+SETPCAP, SETUID, NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, SYS_ADMIN,
+SYS_PTRACE, MKNOD, AUDIT_WRITE, and all others from `linux/capability.h`.
 
 ### Seccomp Profiles
 

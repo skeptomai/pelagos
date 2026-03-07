@@ -82,7 +82,17 @@ pub fn cmd_image_ls(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             &img.digest
         };
-        let type_tag = if img.is_wasm_image() { "wasm" } else { "linux" };
+        let type_tag = if img
+            .layer_types
+            .iter()
+            .any(|t| t == "application/vnd.bytecodealliance.wasm.component.layer.v0+wasm")
+        {
+            "component"
+        } else if img.is_wasm_image() {
+            "wasm"
+        } else {
+            "linux"
+        };
         println!(
             "{:<30} {:<10} {:<6} {}",
             img.reference,

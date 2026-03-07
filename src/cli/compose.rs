@@ -542,19 +542,28 @@ fn spawn_service(
         .with_namespaces(ns | Namespace::PID | Namespace::UTS | Namespace::IPC)
         .with_hostname(container_name);
 
-    // Security: seccomp + dropped capabilities + no-new-privileges + masked paths.
-    // Mirrors Docker's secure-by-default posture.
+    // Security: seccomp + capabilities + no-new-privileges + masked paths.
+    //
+    // Start from DEFAULT_CAPS (the Podman 11-cap set), then apply (cap-drop ...)
+    // and (cap-add ...) from the service spec.  (cap-drop "ALL") drops everything
+    // first, giving a zero-cap baseline before any cap-add is applied.
+    let drop_all = svc.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL"));
+    let mut effective_caps = if drop_all {
+        pelagos::container::Capability::empty()
+    } else {
+        pelagos::container::Capability::DEFAULT_CAPS
+    };
+    if !drop_all && !svc.cap_drop.is_empty() {
+        effective_caps &= !super::parse_capability_mask(&svc.cap_drop);
+    }
+    if !svc.cap_add.is_empty() {
+        effective_caps |= super::parse_capability_mask(&svc.cap_add);
+    }
     cmd = cmd
         .with_seccomp_default()
-        .drop_all_capabilities()
+        .with_capabilities(effective_caps)
         .with_no_new_privileges(true)
         .with_masked_paths_default();
-
-    // Restore any capabilities explicitly requested via :cap-add in the service spec.
-    if !svc.cap_add.is_empty() {
-        let restore = super::parse_capability_mask(&svc.cap_add);
-        cmd = cmd.with_capabilities(restore);
-    }
 
     // Spawn detached with log capture.
     std::fs::create_dir_all(containers_dir())?;

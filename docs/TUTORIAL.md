@@ -173,12 +173,15 @@ all intermediate files stay in the builder stage and never reach the output.
 **Sharing and distributing images:**
 
 ```bash
-# Push to a registry (tag first if the registry needs a full reference)
-pelagos image tag mygoapp:latest ghcr.io/myuser/mygoapp:latest
-pelagos image push ghcr.io/myuser/mygoapp:latest
+# Set your GitHub username once
+export GITHUB_USER=your-github-username
 
-# Log in to a private registry first
-echo "$TOKEN" | pelagos image login --username myuser --password-stdin ghcr.io
+# Log in to GHCR (do this before pushing)
+echo "$PELAGOS_E2E_GHCR_TOKEN" | pelagos image login ghcr.io -u "$GITHUB_USER" --password-stdin
+
+# Tag and push (the registry namespace must match your username)
+pelagos image tag mygoapp:latest ghcr.io/$GITHUB_USER/mygoapp:latest
+pelagos image push ghcr.io/$GITHUB_USER/mygoapp:latest
 
 # Save to a tar archive for offline transfer
 pelagos image save mygoapp:latest -o mygoapp.tar
@@ -205,8 +208,13 @@ sudo pelagos run --read-only alpine /bin/sh -c "echo test > /readonly.txt" || tr
 ```bash
 sudo pelagos run --memory 64m --tmpfs /tmp alpine /bin/sh -c \
   'dd if=/dev/zero of=/tmp/fill bs=1M count=200; echo done'
-# Killed by OOM — tmpfs writes count against memory.max; dd never reaches 200 MB
+echo "exit: $?"
 ```
+
+Expected output: **nothing from `dd`, no "done", exit code 137** (128 + SIGKILL).
+The silence is correct — the OOM killer sends SIGKILL to the container before `dd`
+finishes, so neither `dd`'s summary nor `echo done` ever runs.  Exit code 137
+confirms the kill.
 
 Writing to a `tmpfs` mount is the reliable trigger: tmpfs pages are anonymous
 memory and count directly against the cgroup limit.  Shell tricks like `$()` or
@@ -291,6 +299,12 @@ programs — every `.reml` file has the full language available.
 ```
 
 ```bash
+# Pull images before the first compose up.
+# redis:alpine comes from the registry; myserver:latest was built in Part 2
+# ("Building images with pelagos build"). If you jumped to this section, build it first:
+#   pelagos build -t myserver:latest mygoapp/
+pelagos image pull redis:alpine
+
 sudo pelagos compose up -f stack.reml
 # Pelagos starts redis first, waits for port 6379 to accept connections,
 # then starts web.  DNS: "redis" resolves inside "web" automatically.
@@ -315,6 +329,30 @@ dependency ready.  No `sleep 5` hacks.
 
 This is where Pelagos diverges from every other Linux runtime.
 
+**Prerequisites — pick one:**
+
+| Option | When to use | Setup |
+|--------|-------------|-------|
+| System runtime (wasmtime) | Default build of pelagos | See below |
+| System runtime (wasmedge) | Alternative | `curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh \| bash`, then symlink as above |
+| Embedded wasmtime | No system runtime wanted | `cargo build --features embedded-wasm` and use `./target/debug/pelagos` |
+
+The default `pelagos` binary uses whichever of `wasmtime` or `wasmedge` it finds in
+`PATH`.  The `--features embedded-wasm` build runs Wasm in-process with no external
+dependency — section 5.4 covers this in detail.
+
+**Installing wasmtime so `sudo pelagos` can find it:**
+
+`pelagos run` requires `sudo`, which strips `~/.wasmtime/bin` from PATH due to
+`secure_path` in sudoers.  Install wasmtime and symlink it into the system PATH:
+
+```bash
+curl https://wasmtime.dev/install.sh -sSf | bash
+sudo ln -sf ~/.wasmtime/bin/wasmtime /usr/local/bin/wasmtime
+wasmtime --version        # verify user PATH
+sudo wasmtime --version   # verify sudo PATH
+```
+
 ### 5.1 Run a Wasm module directly
 
 Pelagos packages Wasm binaries as OCI images (FROM scratch) and runs them
@@ -324,7 +362,7 @@ without a Linux rootfs — no Alpine layers, no kernel image loading.
 # Compile a Rust program to WASI P1 (plain module)
 cat > hello.rs << 'EOF'
 fn main() {
-    println!("Hello from Wasm! pid={}", std::process::id());
+    println!("Hello from Wasm!");
 }
 EOF
 
@@ -378,14 +416,20 @@ the embedded wasmtime path.
 rustup target add wasm32-wasip2
 rustc --target wasm32-wasip2 --edition 2021 -o hello-component.wasm hello.rs
 
-# Build and run as a component image
-pelagos build -t my-component:latest - << 'EOF'
+# Package it — put the binary in a build context directory with a Remfile
+mkdir -p component-ctx
+cp hello-component.wasm component-ctx/
+cat > component-ctx/Remfile << 'EOF'
 FROM scratch
 COPY hello-component.wasm /hello.wasm
 EOF
 
-sudo pelagos image ls
-# TYPE column shows: component  (media type: application/vnd.bytecodealliance.wasm.component.layer.v0+wasm)
+pelagos build -t my-component:latest component-ctx/
+
+pelagos image ls
+# REFERENCE           LAYERS  TYPE       DIGEST
+# my-wasm-app:latest  1       wasm       ...
+# my-component:latest 1       component  ...
 
 sudo pelagos run my-component:latest
 ```
@@ -521,38 +565,49 @@ P3b — already done for the standalone path) and the CRI compliance doc.
 
 ---
 
-## Part 7 — Putting it Together: Mixed Linux + Wasm Compose
+## Part 7 — Putting it Together: Multi-Service Compose
 
-Pelagos can run Linux and Wasm services side-by-side in the same compose stack.
+This example runs a Go web service backed by Redis, showing dependency ordering,
+DNS service discovery, and port mapping in a compose stack.
+
+> **Mixed Linux + Wasm compose** (Wasm services alongside Linux services in the
+> same stack) is tracked in issue #70 and is not yet implemented.  Wasm images
+> must be run directly with `pelagos run` for now.
+
+**`multi.reml`:**
 
 ```lisp
 (compose-up
   (compose
-    (network "app-net")
+    (network "backend")
 
-    ;; Linux service — standard OCI image
-    (service "postgres"
-      '(image   "postgres:alpine")
-      '(network "app-net")
-      '(env     "POSTGRES_PASSWORD" "secret")
-      '(env     "POSTGRES_DB"       "mydb"))
+    (service "redis"
+      '(image   "redis:alpine")
+      '(network "backend"))
 
-    ;; Wasm service — pure WASI module, no Linux image needed
-    (service "api-wasm"
-      '(image   "myrepo/api:wasm")
-      '(network "app-net")
-      (list 'depends-on "postgres" 5432)
-      '(env  "DB_URL" "postgres://postgres:secret@postgres/mydb")
-      '(port 3000 3000))))
+    (service "web"
+      '(image      "myserver:latest")
+      '(network    "backend")
+      (list 'depends-on "redis" 6379)
+      '(port       8080 80)
+      '(env        "REDIS_HOST" "redis"))))
 ```
 
 ```bash
-sudo pelagos compose up -f mixed.reml
+# myserver:latest was built in Part 2; redis:alpine was pulled in Part 6
+sudo pelagos compose up -f multi.reml
+sudo pelagos compose ps -f multi.reml
+sudo pelagos compose logs -f multi.reml
+sudo pelagos compose down -f multi.reml
 ```
 
-The Wasm service gets DNS resolution for `postgres`, port 3000 mapped to the
-host, and env vars passed through WASI — all from the same orchestration layer
-as the Linux service.
+Pelagos starts `redis` first, waits for port 6379 to accept connections, then
+starts `web`.  DNS: `redis` resolves inside `web` automatically.
+
+> **Note on images that need `chown`/`chmod` at startup** (e.g. `postgres:alpine`):
+> Compose drops all Linux capabilities by default (matching Docker's secure posture).
+> Images whose entrypoints call `chown`/`chmod` as root need those capabilities
+> restored via `:cap-add` — see issue #86.
 
 ---
 
@@ -565,7 +620,7 @@ as the Linux service.
 | Wasm subprocess (wasmtime/wasmedge) | ✅ |
 | Embedded Wasm P1 (plain module) | ✅ `--features embedded-wasm` |
 | Embedded Wasm P2 (Component Model) | ✅ `--features embedded-wasm` |
-| Mixed Linux+Wasm compose | 🔄 Basic (issue #70) |
+| Mixed Linux+Wasm compose | ❌ Not yet implemented (issue #70) |
 | WASI P2 socket passthrough | 🔄 Issue #71 |
 | containerd shim (local) | 🔧 Experimental — needs field testing |
 | containerd shim under Kubernetes | 🔧 Needs ctr validation first |
