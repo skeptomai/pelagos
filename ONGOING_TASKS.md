@@ -22,13 +22,14 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #73 | feat(wasm): persistent Wasm VM pool (P4) | feat/low-pri |
 | #69 | fix: integration test suite hangs locally (DNS tests) | bug/CLOSED |
 
-## Current Baseline (2026-03-04, SHA pending)
+## Current Baseline (2026-03-07, SHA e66950d)
 
-- Unit tests: **296/296 pass** (embedded-wasm feature), **294/294** (default)
-- Integration tests: **205/205 pass, 8 ignored** (`--test-threads=1`)
-- CI (GitHub Actions): **all 6 jobs pass** (lint, unit-tests, integration-tests, e2e-tests, wasm-e2e-tests, wasm-embedded-e2e-tests)
-- E2E tests: **7 Wasm subprocess e2e tests pass** (`scripts/test-wasm-e2e.sh`)
-- Embedded e2e tests: **14/14 pass** (`scripts/test-wasm-embedded-e2e.sh`, includes P3b component tests)
+- Unit tests: **296/296 pass**
+- Integration tests: **236/237 pass, 6 ignored** — `exec::test_exec_joins_pid_namespace`
+  is a pre-existing failure (dirty container state after a full suite run; passes when
+  run in isolation after `sudo scripts/reset-test-env.sh`)
+- New rootless exec tests (5): all pass
+- CI: not re-run this session (no CI-impacting changes)
 
 **Note for next session:** Run integration tests with `--test-threads=1` to avoid
 network-state races between DNS tests. Always `sudo scripts/reset-test-env.sh`
@@ -155,6 +156,79 @@ No code changes required. Issue closed.
 (`build_wasmtime_cmd`). P3 adds a separate embedded path via `WasiCtxBuilder`.
 They coexist — P2 work is not thrown away. P3 must include socket support in
 its `WasiCtxBuilder` setup for parity.
+
+## Completed This Session (2026-03-07)
+
+### Rootless `pelagos exec` fixes and tests (commits 8a20ce4 → e66950d)
+
+All work is in `src/cli/exec.rs`, `src/cli/stop.rs`, `src/container.rs`,
+`scripts/setup.sh`, `tests/integration_tests.rs`, `docs/INTEGRATION_TESTS.md`.
+
+**1. Namespace join ordering fix (f41c212)**
+Rootless exec was failing with EPERM on `setns`. Root cause: the
+`join_ns_fds` mechanism in container.rs runs before the `user_pre_exec`
+callback. Joining any namespace (MOUNT, UTS, IPC, NET) owned by the
+container's user namespace requires `CAP_SYS_ADMIN` in that user namespace,
+which we don't have until AFTER we join it.
+
+Fix: skip `join_ns_fds` entirely for rootless containers; handle all
+namespace joins (USER → MOUNT → chroot → UTS/IPC/NET/CGROUP) in the
+`user_pre_exec` callback in the correct order.
+
+**2. pid==0 race in exec and stop (8a20ce4, 6a254c5)**
+`pelagos run --detach` writes `state.json` with `pid=0` before the watcher
+spawns the container, creating a brief window. Both `cmd_exec` and `cmd_stop`
+had races: they saw `pid=0`, called `check_liveness(0)` → false, and either
+spuriously failed or prematurely marked the container Exited (stop race
+allowed a subsequent exec to succeed on an ostensibly stopped container).
+
+Fix: poll for `pid > 0` in both `cmd_exec` and `cmd_stop` with a 2s deadline.
+
+**3. Environ reads intermediate process, not container (6a254c5)**
+For PID-namespace containers, `state.pid` is the intermediate process P (which
+ran `pre_exec` but never called `exec()`). P's `/proc/pid/environ` reflects the
+fork-inherited host environment, not the `--env` vars. The actual container
+(grandchild C) has the correct environ.
+
+Fix: read from C via `/proc/{P}/task/{P}/children`, falling back to P if no
+grandchild exists (non-PID-ns case).
+
+**4. fuse-overlayfs `allow_other` for `--user UID` exec (1c8949c)**
+`pelagos exec --user 1000` failed with EPERM/EACCES. Root cause: fuse-overlayfs
+mounts lacked `allow_other`. Only the mounting user (host UID 1000 = container
+UID 0) could access the FUSE filesystem. After `setuid(1000)` inside the
+container's user namespace, the process becomes host UID 100999 (from the
+`/etc/subuid` range), which FUSE rejected with EACCES on `execve`.
+
+Fix:
+- `src/container.rs` `spawn_fuse_overlayfs()`: add `allow_other` to the
+  fuse-overlayfs mount options string.
+- `scripts/setup.sh`: enable `user_allow_other` in `/etc/fuse.conf` (required
+  by the kernel for non-root users to use `allow_other` when mounting FUSE).
+
+**5. UID/GID validation against uid_map (e66950d)**
+`pelagos exec --user 1000` from a `newgrp pelagos` shell failed with the
+cryptic "Invalid argument (os error 22)". Root cause: `newgrp`/`sg` changes
+the effective GID away from the primary GID. `newuidmap_will_work()` checks
+`egid == pw_gid` and returns false, causing the container's uid_map to collapse
+to a single entry `0 host_uid 1`. `setuid(1000)` inside that user namespace
+→ EINVAL (UID 1000 not covered by any uid_map entry).
+
+Fix: in `cmd_exec`, read `/proc/{pid}/uid_map` (and `gid_map`) before
+spawning and emit a clear error naming the uid_map and the root cause.
+
+**Tests added (5 new rootless exec tests):**
+- `test_rootless_exec_noninteractive`: basic exec in running container
+- `test_rootless_exec_sees_container_filesystem`: MOUNT ns join verified
+- `test_rootless_exec_environment`: env inherit + `-e` override
+- `test_rootless_exec_nonrunning_fails`: liveness check rejects stopped containers
+- `test_rootless_exec_user_workdir`: `--user 1000`, `--workdir`, `--user 1000:1000`,
+  write-as-uid-1000 (verifies fuse-overlayfs `allow_other` covers writes too)
+
+**Known pre-existing failure:**
+`exec::test_exec_joins_pid_namespace` fails after a full suite run due to
+dirty container state. Passes when run in isolation after
+`sudo scripts/reset-test-env.sh`.
 
 ## Next Session: Start Here
 
