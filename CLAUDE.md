@@ -139,6 +139,15 @@ This is a hard requirement, not optional cleanup.
    and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), push the
    fix, re-tag, and re-push — do not leave a broken tag pointing at bad code
 
+**"Crate me!"** — Publish to crates.io:
+1. Ensure the working tree is clean (`git status`)
+2. Confirm the version in `Cargo.toml` matches the intended publish version
+3. Do a dry run first: `cargo publish --dry-run` — fix any errors before proceeding
+4. Publish: `cargo publish`
+5. Verify the crate appeared on crates.io: `cargo search pelagos` or check
+   `https://crates.io/crates/pelagos` — confirm the version matches
+6. Report the crates.io URL and published version
+
 ### Execution Style
 Execute quietly — no step-by-step narration of what you're about to do. Just do
 it, then give a short summary of what was done and any notable outcomes. Reserve
