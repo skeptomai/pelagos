@@ -27,16 +27,33 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-07, SHA 201e4b4, v0.24.0)
+## Current Baseline (2026-03-08, SHA d127a42, post-v0.24.0)
 
 - Unit tests: **296/296 pass**
-- Integration tests: **243/243 pass, 6 ignored** — all pre-existing failures fixed
-- CI: **all jobs green** on v0.24.0 release (lint + unit + integration + x86_64 + aarch64)
-- Released: **v0.24.0** — https://github.com/skeptomai/pelagos/releases/tag/v0.24.0
+- Integration tests: **246/246 pass, 6 ignored**
+- Tree: clean, up to date with origin/main
 
 **Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
-a possibly dirty environment. The reset script now handles veths, nftables, and DNS
-daemon cleanup correctly.
+a possibly dirty environment.
+
+## Completed This Session (2026-03-08)
+
+### Issue triage + GH reconciliation
+- Discovered #80 (DNS upstream forward) and #86 (compose caps) already fixed in v0.24.0 but not closed — closed both
+- Discovered #74 epic + sub-issues #76–#79 (cgroup enforcement tests) already implemented and passing — closed all
+- Updated ONGOING_TASKS.md issue index to match GH reality (21 open → all correctly tracked)
+
+### AppArmor / SELinux support (#52, #63, #64) — commit 34527bc
+- `src/mac.rs`: `is_apparmor_enabled()`, `is_selinux_enabled()`, async-signal-safe fd helpers
+- **Two-step fd technique** (matches runc): open attr fd before chroot (step 3.9), write after NNP/Landlock but before seccomp (step 6.56); both spawn paths (root + rootless) updated
+- LSM availability checked in parent process so allocation-safe; graceful skip when LSM absent
+- `Command::with_apparmor_profile()`, `Command::with_selinux_label()` builder methods
+- `--apparmor-profile`, `--selinux-label` CLI flags on `pelagos run`
+- `(apparmor-profile ...)`, `(selinux-label ...)` in compose specs
+- `scripts/apparmor-profiles/pelagos-container` — production profile template
+- `scripts/apparmor-profiles/pelagos-test` — permissive profile for tests
+- 3 new integration tests; 246/246 pass
+- Issues #52, #63, #64 closed
 
 ## Completed This Session (2026-03-07, v0.24.0)
 
@@ -267,9 +284,9 @@ dirty container state. Passes when run in isolation after
 
 ## Next Session: Start Here
 
-1. **#52 — AppArmor/SELinux profile support** — see plan below
-2. #60 (io_uring seccomp profile) — useful complement to existing seccomp work
-3. #61 (CRIU checkpoint/restore) — complex but differentiating feature
+1. #60 (io_uring seccomp profile) — useful complement to existing seccomp work
+2. #61 (CRIU checkpoint/restore) — complex but differentiating feature
+3. Wasm: #70 (mixed compose validation), #71 (WASI P2 sockets)
 
 ---
 
