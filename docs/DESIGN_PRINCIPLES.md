@@ -111,6 +111,34 @@ Add a dependency only when the alternative is reimplementing something
 complex and error-prone (e.g. `oci-client` for registry protocol,
 `seccompiler` for BPF compilation, `nix` for safe syscall wrappers).
 
+## 7a. Library Dependencies vs. Subsystem Dependencies
+
+These are not the same kind of dependency and must not be treated alike.
+
+**Library dependencies** are subordinate. They do what you tell them at
+the call sites you choose, under the contract you define. If they
+misbehave, you replace them. You are in control.
+
+**Subsystem dependencies** invert that relationship. A subsystem has its
+own opinions about lifecycle, socket paths, configuration format, and
+update cadence. You build *around* its model, not on top of it. When it
+changes, your product breaks on someone else's schedule. This is closer
+to "we are a plugin for X" than "we use X."
+
+The practical consequence: pelagos should have **no subsystem-sized
+external dependencies**. This is what separates a product from an
+integration. AWS Finch is an integration — Lima + containerd + nerdctl
+assembled by Amazon. That is fine for Finch's goals. Pelagos has a
+coherent design philosophy and a specific UX; delegating a major
+subsystem permanently cedes that UX to a project with different goals
+and different maintainers.
+
+This principle is what drives the macOS design toward owning the VM
+orchestration layer (AVF bindings + virtiofsd) rather than building on
+Lima. Lima is an excellent project; that is not the point. The point is
+that pelagos's failure modes and release cadence should belong to
+pelagos.
+
 ## 8. Test Everything
 
 A feature is not done until it has integration tests in the same commit.

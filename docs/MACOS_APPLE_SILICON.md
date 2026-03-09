@@ -1,6 +1,6 @@
 # pelagos on Apple Silicon — Design Options
 
-*Researched 2026-03-09. Decision pending.*
+*Researched 2026-03-09. Updated 2026-03-09 with objc2-virtualization findings.*
 
 ---
 
@@ -390,20 +390,122 @@ security track record.
 
 ---
 
+## Revised Architecture: Pure-Rust AVF Bindings
+
+*Added 2026-03-09 after deeper research into the AVF ecosystem.*
+
+### The subsystem dependency problem
+
+There is a principled distinction between **library dependencies** (subordinate — they
+do what you tell them under the contract you define) and **subsystem dependencies**
+(Lima, Docker daemon — they have their own lifecycle, conventions, and release cadence;
+you build *around* them). Pelagos should have no subsystem-sized external dependencies.
+This is what separates a product from an integration.
+
+This principle eliminates Lima as a long-term substrate — not because Lima is bad, but
+because it would make pelagos a Lima plugin rather than a product.
+
+### objc2-virtualization changes the calculus
+
+Research reveals that `objc2-virtualization` — a maintained, auto-generated Rust crate
+binding the entire `Virtualization.framework` — already exists. It is part of the
+`objc2` ecosystem (4,400+ commits, 59k dependents, updated weekly from Xcode SDK
+headers). This is not a weekend project; it is production infrastructure.
+
+This means a pure-Rust analog to vfkit is buildable today, without Go, without Lima,
+and without writing raw Objective-C FFI by hand:
+
+```
+pelagos-mac (Rust)
+  └── objc2-virtualization    ← replaces vfkit; library dep, not subsystem
+  └── virtiofsd               ← already Rust (Red Hat)
+  └── vsock via UnixStream    ← standard library
+```
+
+No Go binary at any layer. No subsystem you don't control.
+
+### AVF documentation quality
+
+Apple's `Virtualization.framework` documentation is solid for a proprietary framework:
+- Comprehensive Apple developer docs with a dedicated updates page
+- Two substantial WWDC sessions: [2022](https://developer.apple.com/videos/play/wwdc2022/10002/)
+  and [2023](https://developer.apple.com/videos/play/wwdc2023/10007/)
+- The Go `Code-Hex/vz` bindings serve as an annotated reference — they split
+  implementation across `virtualization_11.m`, `virtualization_13.m`,
+  `virtualization_15.m`, making per-macOS-version API changes explicit and readable
+
+Known gaps: no public C API (Objective-C/Swift only), some GPU and USB functionality
+undocumented, private entitlement required for extended features. None of these affect
+the Linux VM use case.
+
+**Feature availability by macOS version:**
+
+| macOS | Key additions relevant to pelagos |
+|---|---|
+| 11 (Big Sur) | Framework introduced; Linux VM support |
+| 12 (Monterey) | VirtIO networking, storage, vsock, entropy |
+| 13 (Ventura) | EFI boot, virtiofs (folder sharing), Rosetta for x86_64 Linux, VirtioGPU |
+| 14 (Sonoma) | NVMe controller, remote storage |
+| 15 (Sequoia) | USB device support (limited) |
+
+macOS 13.5+ covers everything pelagos needs. macOS 11/12 would require dropping virtiofs
+(fall back to SFTP or NFS) and Rosetta — a reasonable trade-off to defer.
+
+### The pilot project
+
+The pilot validates the architecture concretely before committing to a full
+implementation. It is not a throwaway — the pilot *is* the production component.
+
+**`pelagos-vz`** — a thin ergonomic Rust crate over `objc2-virtualization`:
+- Boot a Linux VM from a kernel + initrd + disk image
+- Configure vsock (exposed as Unix socket on host), virtiofs, NAT networking, Rosetta
+- Manage VM lifecycle: start, stop, clean shutdown
+- ~500–800 lines; use `Code-Hex/vz` Go bindings as design reference for the API shape
+
+**`pelagos-guest`** — a minimal Rust daemon that runs inside the VM as a startup service:
+- Listens on `AF_VSOCK` port N
+- Receives JSON command envelopes: `{"cmd": "run", "image": "alpine", "args": [...]}`
+- Forks `pelagos` with the given arguments
+- Streams stdout/stderr back over vsock, returns exit code
+- ~200 lines
+
+**What the pilot proves:**
+1. `objc2-virtualization` is usable for booting real Linux VMs
+2. vsock IPC works end-to-end from a Rust host to a Rust guest
+3. virtiofs file sharing (host directory → container bind mount) is functional
+4. The entire stack compiles and runs without any Go binary
+
+**What it does not need:** port forwarding, Rosetta, installer packaging, multi-VM
+management. Those come after the architecture is validated.
+
+### Caveats
+
+- `objc2-virtualization` is auto-generated: complete but not ergonomic. `pelagos-vz`
+  wraps it with a curated API rather than exposing raw ObjC bindings.
+- Code signing is required: the `com.apple.security.virtualization` entitlement must
+  be present. This is true of all AVF consumers including vfkit.
+- macOS 13.5+ minimum for full feature set. A macOS 12 fallback (drop virtiofs +
+  Rosetta) is possible but not a priority.
+
+---
+
 ## Recommendation
 
 Security analysis reverses any suggestion to evolve toward Option C.
 
-**Option A** is the correct v1 and likely permanent architecture. SSH passthrough is
-not just "simpler" — it is architecturally correct: authentication is handled by a
-protocol with 25 years of security hardening, the attack surface is a single
-well-understood component, and the 150ms per-command overhead is the correct price for
-not building a Docker daemon.
+**The target architecture is now: pure-Rust AVF bindings (`pelagos-vz`) + virtiofsd +
+vsock IPC.** The discovery of `objc2-virtualization` eliminates the Go binary dependency
+and the Lima subsystem dependency simultaneously. Options A–D were evaluated under the
+assumption that a pure-Rust AVF path required writing raw ObjC FFI from scratch. That
+assumption is false.
 
-**Option B** is worth pursuing if latency becomes a *measured* user pain point.
-The vsock + Unix-socket model is sound if socket permissions are strict and every
-handler validates its inputs. Consider it v2 only after Option A is shipping and users
-are actually reporting command latency as a problem.
+**Option A (Lima/SSH)** remains a valid fast-path if the pilot reveals `objc2-virtualization`
+to be immature in practice. SSH authentication is architecturally correct; the Lima
+subsystem dependency is the only reason not to use it permanently.
+
+**Option B (vfkit + Rust orchestrator)** is superseded by the pure-Rust path.
+vfkit's only advantage over Lima was thinner subsystem coupling; `pelagos-vz` eliminates
+the dependency entirely rather than reducing it.
 
 **Option C** should not be the target architecture. The gRPC daemon is the Docker
 daemon problem rebuilt from scratch. If a persistent socket is ever needed (Docker
@@ -411,8 +513,12 @@ socket compatibility, VS Code Dev Containers), the correct scope is a minimal
 read-mostly status socket — not a full execution API — with mTLS mandatory from day
 one.
 
-**Option D** is appropriate for community/early-access distribution while the signed
-installer is being built. Insufficient for enterprise.
+**Option D** is appropriate for community/early-access distribution during development.
+Insufficient for enterprise.
 
 **Option E** is a 2027 watch item. Track the macOS 26 release and accumulation of
 security track record for the `Containerization` framework.
+
+**Immediate next step:** build the `pelagos-vz` pilot as described above. If it boots a
+Linux VM and round-trips a vsock command in under 500 lines of Rust, the architecture
+is validated and Options A–B become fallbacks rather than the plan.
