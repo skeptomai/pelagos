@@ -1,5 +1,10 @@
 # Pelagos - Linux Container Runtime
 
+## Repository
+
+- **Default / integration branch: `main`** — there is no `master` branch.
+  All work lands on `main` directly or via PRs targeting `main`.
+
 ## ⚠️ CRITICAL RULES FOR CLAUDE ⚠️
 
 ### File Placement Rules
