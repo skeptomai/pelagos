@@ -16032,6 +16032,10 @@ mod auto_resolv_conf {
             .expect("spawn failed")
             .wait()
             .expect("wait failed");
-        assert!(status.success(), "container must exit 0 without MOUNT ns: {:?}", status);
+        assert!(
+            status.success(),
+            "container must exit 0 without MOUNT ns: {:?}",
+            status
+        );
     }
 }
