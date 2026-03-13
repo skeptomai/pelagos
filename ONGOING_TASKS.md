@@ -27,14 +27,49 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-12, SHA 5f33721)
+## Current Baseline (2026-03-12, SHA 0a8b57f / pelagos-mac fac01b5)
 
-- Unit tests: **299/299 pass**
-- Integration tests: **252/252 pass, 6 ignored**
-- Tree: clean, up to date with origin/main
+- pelagos unit tests: **299/299 + 43/43 bin pass** (new label tests in binary)
+- pelagos integration tests: **256/257 pass, 6 ignored** (1 pre-existing ordering flake)
+- pelagos-mac: compiles on macOS only (objc2-virtualization); no new test regressions
+- Trees: clean, up to date with origin/main (both repos)
 
 **Note for next session:** Always `sudo scripts/reset-test-env.sh` if starting from
 a possibly dirty environment.
+
+## Completed This Session (2026-03-12)
+
+### Epic #91: VS Code devcontainer support — COMPLETE ✅
+
+**Stream A — `pelagos start <name>` (closes #90) — PR #92**
+- `SpawnConfig` struct captures all RunArgs fields needed for restart
+- `src/cli/start.rs`: reads saved SpawnConfig, converts to RunArgs, calls cmd_run detached
+- `CliCommand::Start` dispatches to `cmd_start` when container state exists
+- Integration tests: restart after exit, same command re-runs, running container rejected
+
+**Stream B — `docker start` in pelagos-docker (pelagos-mac PR #75)**
+- `DockerCmd::Start` maps to `pelagos start <name>` via SSH into VM
+
+**Native container labels (closes #93) — PR #94**
+- `pelagos run --label KEY=VALUE` (repeatable); stored in `ContainerState.labels` (HashMap)
+- `SpawnConfig.labels: Vec<String>` survives `pelagos start` restarts
+- `pelagos ps --filter label=KEY[=VALUE]`, `--filter name=`, `--filter status=`
+- `pelagos container inspect` already includes labels in JSON
+- 4 unit tests (serde roundtrip, filter logic) + 2 integration tests
+
+**Labels sidecar removal (pelagos-mac closes #76) — PR #79**
+- `pelagos-docker`: pass `--label` natively to `pelagos run`; forward `--filter label=` to pelagos
+- Read labels from `pelagos container inspect` JSON instead of `shim-labels.json`
+- `labels.rs` deleted
+
+**Always-on virtiofs volumes share (closes #77) — PR #79**
+- `pelagos-mac/src/main.rs`: always prepend `pelagos-volumes` share pointing to
+  `~/.local/share/pelagos/volumes/`
+- `scripts/build-vm-image.sh`: mount `pelagos-volumes` tag at `/var/lib/pelagos/volumes/`
+  after ext2 disk mount; user shares unaffected
+
+**devcontainer guide (closes #78) — PR #79**
+- `docs/DEVCONTAINER_GUIDE.md`: setup, volume persistence, labels, restart semantics
 
 ## Completed This Session (2026-03-09)
 
