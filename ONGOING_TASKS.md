@@ -315,10 +315,192 @@ See `docs/MACOS_APPLE_SILICON.md` for full analysis. Decision pending.
 
 ---
 
+## Completed This Session (2026-03-12)
+
+### Stream A — `pelagos start` + SpawnConfig (PR #92, issues #90, #91 Gap 2) — DONE
+
+- `SpawnConfig` struct added to `src/cli/mod.rs`; includes `nat: bool` field
+- Populated from `RunArgs` in `cmd_run()` via `build_spawn_config()` helper
+- Persisted in `ContainerState.spawn_config` in both `run_foreground()` and `run_detached()`
+- `src/cli/start.rs`: `cmd_start(name)` reads SpawnConfig, calls `cmd_run` detached; rejects running containers
+- `src/main.rs`: `CliCommand::Start` dispatches to `cmd_start` if `container_state_exists()`, else OCI
+- 2 unit tests: serde roundtrip + backward-compat with old state files
+- 3 integration tests: restart_after_exit, restart_runs_same_command, start_running_fails
+- All pass; PR merged to main
+
+### Next: Stream B — pelagos-mac docker start + sidecar removal
+
+Work in `/home/cb/Projects/pelagos-mac` on branch `feat/docker-start`.
+See plan below in Plan section.
+
 ## Next Session: Start Here
 
-1. #61 (CRIU checkpoint/restore) — complex but differentiating feature
-2. Wasm: #70 (mixed compose validation), #71 (WASI P2 sockets)
+1. Stream B — pelagos-mac `docker start` + remove sidecar (see plan below)
+2. Epic #91 Gap 3 lazy-start: ensure all docker commands call ensure_vm_running()
+3. #61 (CRIU checkpoint/restore) — complex but differentiating feature
+4. Wasm: #70 (mixed compose validation), #71 (WASI P2 sockets)
+
+---
+
+## Plan: Epic #91 — Container Restart + VS Code Devcontainer Support
+
+### Overview
+
+Three work streams, in order:
+
+| Stream | Repo | Branch | Issues |
+|--------|------|--------|--------|
+| A — `pelagos start` + SpawnConfig | pelagos | `feat/container-restart-90` | #90, #91 Gap 2 |
+| B — `docker start` + remove sidecar | pelagos-mac | `feat/docker-start` | pelagos-mac #67 |
+| C — Gap 3 lazy-start extension | pelagos-mac | `feat/docker-start` (same) | #91 Gap 3 |
+
+### Stream A — pelagos runtime: `pelagos start <name>`
+
+#### A1. Add `SpawnConfig` to `src/cli/mod.rs`
+
+New struct persisted as `spawn_config` field in `ContainerState`:
+
+```rust
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SpawnConfig {
+    pub image:          Option<String>,   // image ref for layer_dirs re-lookup
+    pub exe:            String,           // executable
+    pub args:           Vec<String>,      // args after exe
+    pub env:            Vec<String>,      // KEY=VALUE pairs
+    pub bind:           Vec<String>,      // host:container[:ro]
+    pub volume:         Vec<String>,      // named volumes
+    pub network:        Vec<String>,      // ["pasta"] / ["bridge:mynet"] / etc.
+    pub publish:        Vec<String>,      // HOST:CONTAINER port mappings
+    pub dns:            Vec<String>,      // explicit DNS servers
+    pub working_dir:    Option<String>,
+    pub user:           Option<String>,
+    pub hostname:       Option<String>,
+    pub cap_drop:       Vec<String>,
+    pub cap_add:        Vec<String>,
+    pub security_opt:   Vec<String>,
+    pub read_only:      bool,
+    pub rm:             bool,             // propagate --rm semantics on restart
+}
+```
+
+Add to `ContainerState`:
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub spawn_config: Option<SpawnConfig>,
+```
+
+#### A2. Populate `spawn_config` in `cmd_run()` (src/cli/run.rs)
+
+Before the first `write_state()` call, construct `SpawnConfig` from `RunArgs`:
+- `image`: first element of `run_args.args` if it is an image reference
+- `exe` / `args`: from `run_args.args` split
+- All other fields: direct copy from `RunArgs`
+
+Store in the `ContainerState` written at line 782 (foreground) and line 874 (detached).
+
+**Overlay semantics on restart:** The overlay's upper/work dirs are ephemeral (in
+`/run/pelagos/overlay-{pid}-{n}/`). On `pelagos start`, fresh upper/work dirs are
+created, giving the restarted container a clean writable layer on top of the original
+image. Filesystem changes from the previous run are NOT preserved (same as the current
+pelagos run behaviour; overlay preservation is a future enhancement).
+
+#### A3. New `src/cli/start.rs`
+
+`pub fn cmd_start(name: &str) -> i32`
+
+1. `read_state(name)` — error with "container not found" if missing
+2. Match `status`: error "already running" if Running; proceed if Exited
+3. Error "cannot restart: no saved config (container predates this version)" if
+   `spawn_config.is_none()`
+4. Convert `SpawnConfig` → `RunArgs`:
+   - `name = Some(name.to_string())` — keep same container name
+   - `detach = true` — restart always runs detached
+   - all other fields: direct copy from SpawnConfig
+5. Call `cmd_run(run_args)` — rewrites state.json from scratch, spawns container
+
+#### A4. Update `CliCommand::Start` handler in `src/main.rs`
+
+The existing `Start { id }` dispatches to `pelagos::oci::cmd_start(&id)` (OCI lifecycle).
+Update to detect which path to take:
+
+```rust
+CliCommand::Start { id } => {
+    // OCI containers live at /run/pelagos/{id}/state.json
+    // Regular containers live at /run/pelagos/containers/{id}/state.json
+    if pelagos::cli::mod::container_state_exists(&id) {
+        pelagos::cli::start::cmd_start(&id)
+    } else {
+        pelagos::oci::cmd_start(&id)
+    }
+}
+```
+
+#### A5. Integration tests (3)
+
+| Test | Root | Assertion |
+|------|------|-----------|
+| `test_container_restart_after_exit` | yes | Run container that exits; verify Exited state; call `pelagos start`; verify Running |
+| `test_container_restart_runs_same_command` | yes | Restart captures stdout from the restarted container running the original command |
+| `test_container_start_running_fails` | yes | `pelagos start` on a Running container returns non-zero with error message |
+
+---
+
+### Stream B — pelagos-docker: `docker start` + remove sidecar
+
+#### B1. Add `Start { name }` to `DockerCmd` (pelagos-docker/src/main.rs)
+
+```rust
+Start {
+    #[clap(value_name = "NAME")]
+    names: Vec<String>,   // docker start supports multiple names
+},
+```
+
+Handler:
+```rust
+DockerCmd::Start { names } => {
+    for name in &names {
+        let code = run_pelagos_in_vm(&cfg, &["start", name]);
+        if code != 0 { return code; }
+    }
+    0
+}
+```
+
+#### B2. Remove sidecar label cache
+
+Once native exited-state persistence is confirmed working end-to-end:
+- Delete or gut `pelagos-docker/src/containers.rs` label-sidecar code
+- Remove `labels::set()` call from `cmd_run` (line 441)
+- Remove sidecar label lookups from `cmd_ps` (line 621) and `cmd_inspect` (line 815-826)
+- Verify `docker ps -a` and `docker inspect` use the native pelagos state
+
+#### B3. Gap 3 lazy-start
+
+In pelagos-mac daemon: ensure `start` (and any other path that needs VM) calls the
+`ensure_vm_running()` helper. A grep for where `run` calls this vs where `start`/`exec`
+don't will show the gaps. Likely 2-4 lines per call site.
+
+---
+
+### Key constraints
+
+- `pelagos start` always runs detached (VS Code needs a background container)
+- Overlay state is NOT preserved on restart (fresh writable layer)
+- `--rm` is propagated: a container started with `--rm` will auto-delete on exit again
+- Old containers without `spawn_config` get a clear error on `pelagos start`
+- OCI lifecycle `pelagos start <id>` is unchanged
+
+---
+
+### Acceptance test (end-to-end)
+
+1. `pelagos run --name test --detach ubuntu:22.04 /bin/sh -c "echo hi"`
+2. `pelagos ps --all` shows `test` as Exited
+3. `pelagos start test` → exits 0
+4. `pelagos ps` shows `test` as Running
+5. `pelagos exec test id` → returns uid=0(root) inside ubuntu:22.04
+6. `pelagos stop test && pelagos rm test`
 
 ---
 
