@@ -16289,6 +16289,34 @@ mod auto_resolv_conf {
     }
 
     // ---------------------------------------------------------------------------
+    // Overlay error-reporting / kernel compatibility tests
+    // ---------------------------------------------------------------------------
+
+    /// test_overlay_error_reporting_kernel_check
+    ///
+    /// Requires: root.
+    ///
+    /// Verifies that `kernel_supports_overlayfs()` returns true on this machine
+    /// (i.e., "overlay" appears in `/proc/filesystems`).  If this test fails it
+    /// means the development kernel is missing CONFIG_OVERLAY_FS, which would
+    /// cause `pelagos run image:tag` to fail with a clear error message (not EINVAL).
+    ///
+    /// This is a canary: if the kernel support check is broken or the function is
+    /// removed, image-based container runs will fail with a cryptic pre_exec EINVAL
+    /// instead of a readable error message.
+    #[test]
+    fn test_overlay_kernel_support_detected() {
+        let fs = std::fs::read_to_string("/proc/filesystems")
+            .expect("/proc/filesystems should be readable");
+        assert!(
+            fs.lines()
+                .any(|l| l.split_whitespace().any(|w| w == "overlay")),
+            "overlay not found in /proc/filesystems — pelagos image runs would fail with \
+             a clear error message on this kernel; install CONFIG_OVERLAY_FS"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // Container restart (`pelagos start`) tests
     // ---------------------------------------------------------------------------
 

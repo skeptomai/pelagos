@@ -333,6 +333,27 @@ fn is_fuse_overlayfs_available() -> bool {
         .is_ok()
 }
 
+/// Check whether the running kernel has `overlay` filesystem support.
+///
+/// Reads `/proc/filesystems` for a line containing "overlay".  This is the
+/// same check used by runc and containerd before attempting an overlay mount.
+/// Returns `false` if the file cannot be read (treated conservatively as
+/// "not supported").
+///
+/// Cached via `OnceLock` so the file is read at most once per process.
+fn kernel_supports_overlayfs() -> bool {
+    use std::sync::OnceLock;
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        std::fs::read_to_string("/proc/filesystems")
+            .map(|s| {
+                s.lines()
+                    .any(|l| l.split_whitespace().any(|w| w == "overlay"))
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Spawn a `fuse-overlayfs` subprocess to mount an overlay filesystem.
 ///
 /// Returns the child process handle. The caller must unmount (via `fusermount3 -u`)
@@ -2858,6 +2879,22 @@ impl Command {
                 )));
             }
         } else {
+            // Root (privileged) mode with overlay: the overlay mount runs inside
+            // pre_exec using the kernel's native overlayfs.  Probe before forking
+            // so we can surface a clear error when CONFIG_OVERLAY_FS is missing
+            // rather than a cryptic EINVAL from inside the child.
+            //
+            // Background: Rust's pre_exec error pipe sends only the raw OS errno
+            // back to the parent.  io::Error::other("message") has no raw_os_error,
+            // so the kernel falls back to EINVAL (22) for every custom error string
+            // — the actual error text is silently discarded.
+            if self.overlay.is_some() && !kernel_supports_overlayfs() {
+                return Err(Error::Io(io::Error::other(
+                    "kernel does not support overlayfs (CONFIG_OVERLAY_FS not compiled in); \
+                     container images require overlayfs — use a kernel with overlay support \
+                     or run as a rootless user with fuse-overlayfs installed",
+                )));
+            }
             use_fuse_overlay = false;
         }
 
@@ -3457,11 +3494,13 @@ impl Command {
                                 opts.as_ptr() as *const libc::c_void,
                             );
                             if ret != 0 {
-                                return Err(io::Error::other(format!(
-                                    "overlay mount (lowerdir={}): {}",
-                                    lower.to_string_lossy(),
-                                    io::Error::last_os_error()
-                                )));
+                                // Return the raw OS errno so it survives Rust's
+                                // pre_exec error pipe (io::Error::other loses the errno,
+                                // causing the parent to always report EINVAL regardless
+                                // of the actual failure).  The pre-spawn overlayfs probe
+                                // catches the common case (CONFIG_OVERLAY_FS missing)
+                                // before we reach this point.
+                                return Err(io::Error::last_os_error());
                             }
                             Some(merged)
                         }
@@ -5122,6 +5161,15 @@ impl Command {
                 libc::fcntl(slave_raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
             }
         } else {
+            // Root mode with overlay: probe for kernel overlay support before forking
+            // (see spawn() for the explanation of why EINVAL is always the symptom).
+            if self.overlay.is_some() && !kernel_supports_overlayfs() {
+                return Err(Error::Io(io::Error::other(
+                    "kernel does not support overlayfs (CONFIG_OVERLAY_FS not compiled in); \
+                     container images require overlayfs — use a kernel with overlay support \
+                     or run as a rootless user with fuse-overlayfs installed",
+                )));
+            }
             use_fuse_overlay = false;
         }
 

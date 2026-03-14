@@ -3279,6 +3279,19 @@ Failure indicates the auto-add of `Namespace::MOUNT` in `spawn()` / `spawn_inter
 is broken — containers with rootfs configured would fail to get a private mount namespace,
 causing pivot_root(2) to run in the host mount namespace.
 
+### `test_overlay_kernel_support_detected`
+**Requires:** none (no root, no rootfs)
+
+Reads `/proc/filesystems` and asserts the string "overlay" appears in it.  This is the
+same check `kernel_supports_overlayfs()` performs before forking a container with image
+layers, so that a missing `CONFIG_OVERLAY_FS` produces a clear error message rather than
+a cryptic "Invalid argument (os error 22)".
+
+Failure means the running kernel lacks overlayfs support.  On a development machine this
+would also mean `pelagos run image:tag` fails immediately with the message "kernel does not
+support overlayfs (CONFIG_OVERLAY_FS not compiled in)".  On Alpine's `virt` kernel (common
+in VM guests) this is the expected root cause of issue #100.
+
 ### `test_pivot_root_old_root_inaccessible`
 **Requires:** root, alpine-rootfs
 
