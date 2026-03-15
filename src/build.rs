@@ -1235,6 +1235,20 @@ fn execute_run(
         .stderr(Stdio::Piped);
 
     // Apply accumulated environment.
+    //
+    // env_clear() first: the container must receive ONLY the vars declared in the
+    // image config (and any ENV instructions processed so far), not any of the
+    // parent pelagos process's environment.  Without this, the parent's PATH (and
+    // other vars) leak into the container, which is incorrect and can produce
+    // "command not found" failures when the parent was launched from an unusual
+    // environment (e.g. a vsock daemon with a minimal or absent PATH).
+    // This matches Docker/runc behaviour: container env = image config env only.
+    cmd = cmd.env_clear();
+    log::debug!(
+        "build: execute_run applying {} env vars: {:?}",
+        config.env.len(),
+        config.env
+    );
     for env_str in &config.env {
         if let Some((k, v)) = env_str.split_once('=') {
             cmd = cmd.env(k, v);

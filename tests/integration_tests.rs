@@ -17947,4 +17947,89 @@ mod issue_110_pasta_stdin_isolation {
 
         let _ = image::remove_image(&manifest.reference);
     }
+
+    /// test_build_run_path_isolated_from_host
+    ///
+    /// Requires: root, alpine:latest pre-pulled
+    ///
+    /// Regression test for issue #110 (v0.42.0 fix): without env_clear() in
+    /// execute_run, the container process inherited the parent pelagos process's
+    /// environment.  In unusual invocation environments (vsock daemon, minimal init)
+    /// the parent's PATH could be absent or wrong, causing "command not found" (exit
+    /// 127) in the first non-cached RUN step of a subsequent build invocation.
+    ///
+    /// The fix is env_clear() before applying config.env, so the container gets ONLY
+    /// the image's declared environment vars, regardless of how pelagos was invoked.
+    ///
+    /// This test poisons the parent process PATH to a garbage value and verifies that
+    /// a RUN step (`ls /usr/bin/env`) still succeeds — proving the container's PATH
+    /// comes from the image config, not the host process's environment.
+    #[test]
+    fn test_build_run_path_isolated_from_host() {
+        if !is_root() {
+            eprintln!("SKIP test_build_run_path_isolated_from_host: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_build_run_path_isolated_from_host: \
+                 alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let tag = "pelagos-issue-110-path-test";
+        let _ = image::remove_image(tag);
+        let _ = image::remove_image(&format!("{}:latest", tag));
+
+        // Poison the parent process PATH so that if env_clear() is absent, the
+        // container would inherit a broken PATH and fail to find `ls`.
+        let old_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", "/nonexistent-poison-path");
+
+        let remfile =
+            "FROM alpine\nRUN ls /usr/bin/env > /found.txt 2>&1 && echo ok >> /found.txt\n";
+        let instructions = build::parse_remfile(remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+
+        let result = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        );
+
+        // Restore PATH regardless of outcome.
+        match old_path {
+            Some(val) => std::env::set_var("PATH", val),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let manifest = result.expect(
+            "execute_build failed — env_clear() may be missing (container inherited poisoned PATH)",
+        );
+
+        // Verify /found.txt contains "ok" (ls succeeded and shell ran ok).
+        let layer_dirs = image::layer_dirs(&manifest);
+        let cmd = pelagos::container::Command::new("/bin/cat")
+            .args(["/found.txt"])
+            .with_image_layers(layer_dirs)
+            .stdin(pelagos::container::Stdio::Null)
+            .stdout(pelagos::container::Stdio::Piped)
+            .stderr(pelagos::container::Stdio::Null);
+        let mut child = cmd.spawn().expect("spawn cat");
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        assert!(status.success(), "cat /found.txt failed");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("ok"),
+            "PATH isolation failed: /found.txt does not contain 'ok'. \
+             Container may have inherited poisoned host PATH. Output: {:?}",
+            out
+        );
+
+        let _ = image::remove_image(&manifest.reference);
+    }
 }

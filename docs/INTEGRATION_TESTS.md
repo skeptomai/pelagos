@@ -3563,3 +3563,26 @@ mode), runs `cat /dev/stdin | wc -c` in a RUN step, and asserts the byte count i
 count indicates pelagos's log output or pasta's pipes leaked into the container's stdin.
 
 Failure indicates the stdin isolation fix (pre_exec null redirect or stderr Piped) was reverted.
+
+### `test_build_run_path_isolated_from_host`
+**Requires:** root, `docker.io/library/alpine:latest` pre-pulled
+
+Regression test for issue #110 (v0.42.0 fix). Without `env_clear()` in `execute_run`, the container
+process inherited the parent pelagos process's full environment. In unusual invocation environments
+(vsock daemon, minimal init, macOS VM), the parent's `PATH` could be absent, incorrect, or differ
+from what the image config specifies, causing "command not found" (exit 127) in RUN steps — most
+visibly in the **first non-cached RUN step** of a subsequent build invocation where the cached-step
+overlay stack is used.
+
+The fix is calling `env_clear()` before applying `config.env` in `execute_run`, so the container
+receives **only** the environment variables declared in the image config, matching Docker/runc
+behaviour.
+
+The test poisons the parent process `PATH` to a garbage value (`/nonexistent-poison-path`) and then
+builds a one-step image that runs `ls /usr/bin/env`. If `env_clear()` is absent, the container
+inherits the poisoned `PATH`, `ls` is not found (no PATH lookup), and the build fails. With the fix,
+the container's `PATH` comes from the Alpine image config (`/usr/local/sbin:/usr/local/bin:...`),
+`ls` is found, and `/found.txt` contains "ok".
+
+Failure indicates `env_clear()` was removed from `execute_run` in `build.rs`.
+
