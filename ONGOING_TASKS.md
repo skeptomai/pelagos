@@ -47,9 +47,9 @@ All work is tracked in GitHub Issues. This file is a brief index.
 - #105 fix (2617115): `FROM ${VAR}` substitution + `FROM <stage-alias>` resolved via `completed_stages`
   (type changed from `HashMap<String,Vec<String>>` to `HashMap<String,(Vec<String>,ImageConfig)>`)
 - #106 fix (453f469): COPY `--chown=` and `--chmod=` flags parsed in a loop instead of treated as source
-- #107 fix (61e4258 + 0e43705): pasta stderr captured + `--foreground` flag added to prevent
-  pasta from daemonising (orphaning the relay child) which caused false-positive `try_wait()` exit
-  detection and silent TAP setup failures
+- #107 fix (61e4258 + 0e43705 + 316df12): pasta stdout+stderr captured (both Stdio::piped());
+  `--foreground` prevents pasta from daemonising (orphan/false-positive exit); `--quiet` removed;
+  merged into output_thread — pasta writes errors to stdout in some error paths/versions
 - Confirmed no bind-mount leak: DNS bind-mounts always happen after `unshare(CLONE_NEWNS)`;
   guard at spawn() prevents DNS setup without MOUNT namespace.
 - Bumped to v0.27.1, tagged, released. CI: all 5 jobs pass.
