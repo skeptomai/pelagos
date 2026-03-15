@@ -3538,3 +3538,24 @@ This test calls `execute_build` with a bare tag, then asserts:
 3. `load_image("myapp:latest")` succeeds — canonical form still works
 
 Failure indicates: `load_image` no longer falls back to `<ref>:latest` for bare refs.
+
+### `test_pasta_stdin_not_contaminated`
+**Requires:** root, pasta installed, `docker.io/library/alpine:latest` pre-pulled
+
+Regression test for issue #110. During build RUN steps using `NetworkMode::Pasta`, pasta's
+stdout pipe was leaking into the container's stdin fd in some environments (e.g. devcontainer
+builds via vsock), causing `curl | bash`-style scripts to execute pasta log messages as
+shell commands (exit code 127).
+
+The fix replaces the two separate `Stdio::piped()` calls for pasta's stdout and stderr with a
+single pipe created via `pipe2()` + `dup()`. Both pasta's stdout and stderr are directed to the
+same pipe write-end, and the output_thread reads from the single read-end. This eliminates the
+separate stdout pipe that was being confused with the container's stdin fd, and removes the
+nested stderr-draining thread.
+
+This test builds with `NetworkMode::Pasta`, running `cat /dev/stdin | wc -c` in a RUN step and
+asserting the byte count is 0. A non-zero count indicates bytes leaked from pasta's output into
+the container's stdin.
+
+Failure indicates: the combined-pipe fix (pipe2+dup) has been reverted or pasta's stdout is
+once again routed through a separate pipe that can alias the container's stdin.

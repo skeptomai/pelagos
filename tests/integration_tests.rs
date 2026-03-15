@@ -17845,3 +17845,93 @@ mod issue_109_run_finds_built_image {
         let _ = image::remove_image(&manifest.reference);
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #110 — pasta stdout must not contaminate container stdin
+// ---------------------------------------------------------------------------
+
+mod issue_110_pasta_stdin_isolation {
+    use crate::is_root;
+    use pelagos::{build, image};
+    use std::collections::HashMap;
+
+    /// test_pasta_stdin_not_contaminated
+    ///
+    /// Requires: root, pasta installed, docker.io/library/alpine:latest pre-pulled
+    ///
+    /// Regression test for issue #110: pasta's stdout pipe was leaking into the
+    /// container's stdin during build RUN steps, causing `curl | bash`-style
+    /// scripts to execute pasta's log output as shell commands (exit code 127).
+    ///
+    /// The fix combines pasta's stdout and stderr into a single pipe using
+    /// `pipe2()` + `dup()`, eliminating separate stdout/stderr pipes that
+    /// could be confused with the container's stdin fd.
+    ///
+    /// This test builds an image with a RUN step that explicitly reads from stdin
+    /// (`/bin/sh -c "read line; [ -z \"$line\" ]"`), asserts it exits 0 (stdin was
+    /// /dev/null → EOF → `read` returns non-zero... actually read returns 1 on EOF).
+    /// Instead we use `cat /dev/stdin | wc -c` and assert the byte count is 0,
+    /// which proves the container's stdin contained no bytes from pasta.
+    ///
+    /// Failure indicates: pasta's combined output pipe is leaking into the container's
+    /// stdin fd (i.e. the pipe2+dup fix was reverted or is broken).
+    #[test]
+    fn test_pasta_stdin_not_contaminated() {
+        if !is_root() {
+            eprintln!("SKIP test_pasta_stdin_not_contaminated: requires root");
+            return;
+        }
+        if !pelagos::network::is_pasta_available() {
+            eprintln!("SKIP test_pasta_stdin_not_contaminated: pasta not installed");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_pasta_stdin_not_contaminated: \
+                 alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let tag = "pelagos-issue-110-test";
+        let _ = image::remove_image(tag);
+        let _ = image::remove_image(&format!("{}:latest", tag));
+
+        // The RUN step reads all bytes from stdin and writes the count to a file.
+        // If pasta's pipe contaminated stdin, the byte count will be > 0.
+        let remfile = "FROM alpine\nRUN cat /dev/stdin | wc -c > /stdin-bytes.txt\n";
+        let instructions = build::parse_remfile(remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+
+        let manifest = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            tag,
+            pelagos::network::NetworkMode::Pasta,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build should succeed (pasta stdin isolation)");
+
+        // Verify the built image runs correctly and /stdin-bytes.txt contains "0".
+        let layer_dirs = image::layer_dirs(&manifest);
+        let cmd = pelagos::container::Command::new("/bin/cat")
+            .args(["/stdin-bytes.txt"])
+            .with_image_layers(layer_dirs)
+            .stdin(pelagos::container::Stdio::Null)
+            .stdout(pelagos::container::Stdio::Piped)
+            .stderr(pelagos::container::Stdio::Null);
+        let mut child = cmd.spawn().expect("spawn cat");
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        assert!(status.success(), "cat /stdin-bytes.txt failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let bytes: u64 = out.trim().parse().unwrap_or(u64::MAX);
+        assert_eq!(
+            bytes, 0,
+            "stdin was not empty during the RUN step: {} bytes leaked (pasta stdout contamination)",
+            bytes
+        );
+
+        let _ = image::remove_image(&manifest.reference);
+    }
+}

@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::Command as SysCmd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1790,14 +1790,77 @@ pub fn setup_pasta_network(
         None
     };
 
+    // Create a single pipe for pasta's combined stdout+stderr.
+    //
+    // Using two separate Stdio::piped() pipes caused pasta's stdout write-end to
+    // appear at an fd number that, in some environments (e.g. devcontainer builds
+    // invoked via vsock), ended up contaminating the container's stdin pipe.
+    // Merging both streams into one pipe:
+    //   - eliminates the two-pipe fd surface
+    //   - removes the need for a nested stderr thread (simpler code)
+    //   - captures all pasta output regardless of which stream pasta uses
+    //   - allows the output_thread to drain with a single read_to_string
+    //
+    // pasta may write diagnostic and error messages to either stdout or stderr
+    // depending on its version and error path; combining them ensures we see all
+    // output without --quiet suppressing anything.
+    let mut pipe_fds = [-1i32; 2];
+    // SAFETY: pipe_fds is a valid 2-element array.
+    let pipe_rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if pipe_rc != 0 {
+        if let Some(ref p) = ns_bind_mount {
+            unsafe {
+                libc::umount2(
+                    p.as_os_str().as_encoded_bytes().as_ptr() as *const libc::c_char,
+                    libc::MNT_DETACH,
+                )
+            };
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(io::Error::last_os_error());
+    }
+    let (pipe_read_fd, pipe_write_fd) = (pipe_fds[0], pipe_fds[1]);
+    // Duplicate the write end for pasta's stderr (both stdout+stderr go to the same pipe).
+    // SAFETY: pipe_write_fd is a valid open fd.
+    let pipe_write_fd_err = unsafe { libc::dup(pipe_write_fd) };
+    if pipe_write_fd_err < 0 {
+        unsafe {
+            libc::close(pipe_read_fd);
+            libc::close(pipe_write_fd);
+        }
+        if let Some(ref p) = ns_bind_mount {
+            unsafe {
+                libc::umount2(
+                    p.as_os_str().as_encoded_bytes().as_ptr() as *const libc::c_char,
+                    libc::MNT_DETACH,
+                )
+            };
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(io::Error::last_os_error());
+    }
+    // Mark the duplicated stderr write-end O_CLOEXEC so it is not accidentally
+    // inherited by any process spawned after pasta.
+    unsafe {
+        libc::fcntl(pipe_write_fd_err, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+
+    // SAFETY: Stdio::from_raw_fd takes ownership; the fds are closed by Rust after
+    // they are dup2'd into the child (or when spawn fails and the Command is dropped).
+    let stdout_stdio = unsafe { std::process::Stdio::from_raw_fd(pipe_write_fd) };
+    let stderr_stdio = unsafe { std::process::Stdio::from_raw_fd(pipe_write_fd_err) };
+
     let mut process = SysCmd::new("pasta")
         .args(&args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped()) // captured for diagnostics
-        .stderr(std::process::Stdio::piped()) // captured for diagnostics
+        .stdout(stdout_stdio) // combined pipe write-end
+        .stderr(stderr_stdio) // same pipe (dup of write-end)
         .spawn()
         .map_err(|e| {
-            // Clean up bind mount if spawn fails.
+            // stdout_stdio and stderr_stdio were consumed by Command; their fds are
+            // already closed (Command dropped on error).  Close the read end and
+            // clean up the bind mount.
+            unsafe { libc::close(pipe_read_fd) };
             if let Some(ref p) = ns_bind_mount {
                 unsafe {
                     libc::umount2(
@@ -1810,34 +1873,18 @@ pub fn setup_pasta_network(
             io::Error::other(format!("failed to start pasta (is it installed?): {}", e))
         })?;
 
-    // Drain pasta's stdout and stderr asynchronously on a single thread to prevent
-    // either pipe buffer from filling and stalling pasta.  pasta may write its error
-    // messages to stdout, stderr, or both depending on the error path and version,
-    // so we must capture both.  The thread exits when pasta closes both pipes
-    // (i.e. when pasta exits).  We join it in teardown to collect the output.
+    // Drain pasta's combined output asynchronously.  The thread holds the read end of
+    // the pipe and blocks until pasta exits (both write ends are now only in the pasta
+    // child — Rust closed the parent's copies during spawn).  We join in teardown.
     let output_thread = {
         use std::io::Read;
-        let mut stdout_pipe = process.stdout.take().expect("stdout pipe");
-        let mut stderr_pipe = process.stderr.take().expect("stderr pipe");
+        use std::os::unix::io::FromRawFd;
+        // SAFETY: pipe_read_fd is valid and not referenced anywhere else after this point.
+        let pipe_read_file = unsafe { std::fs::File::from_raw_fd(pipe_read_fd) };
         Some(std::thread::spawn(move || {
-            // Spawn a sub-thread for stderr so both pipes drain concurrently.
-            let stderr_thread = std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = stderr_pipe.read_to_string(&mut s);
-                s
-            });
-            let mut stdout_out = String::new();
-            let _ = stdout_pipe.read_to_string(&mut stdout_out);
-            let stderr_out = stderr_thread.join().unwrap_or_default();
-            // Merge stdout+stderr into a single string for unified logging.
-            let mut combined = stdout_out;
-            if !stderr_out.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str(&stderr_out);
-            }
-            combined
+            let mut out = String::new();
+            let _ = std::io::BufReader::new(pipe_read_file).read_to_string(&mut out);
+            out
         }))
     };
 
@@ -1948,7 +1995,7 @@ pub fn teardown_pasta_network(setup: &mut PastaSetup) {
             )
         };
         if rc == -1 {
-            log::warn!(
+            log::debug!(
                 "pasta netns bind-mount umount2 failed for {}: {}",
                 p.display(),
                 io::Error::last_os_error()
