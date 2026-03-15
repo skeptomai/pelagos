@@ -77,6 +77,9 @@ pub(crate) enum CliCommand {
         /// Output format: table or json
         #[clap(long, default_value = "table")]
         format: OutputFormat,
+        /// Shorthand for --format json; takes precedence if both are given
+        #[clap(long)]
+        json: bool,
         /// Filter containers (e.g. label=env=staging, label=managed, status=running)
         #[clap(long = "filter")]
         filter: Vec<String>,
@@ -203,6 +206,9 @@ pub(crate) enum ContainerCmd {
         /// Output format: table or json
         #[clap(long, default_value = "table")]
         format: OutputFormat,
+        /// Shorthand for --format json; takes precedence if both are given
+        #[clap(long)]
+        json: bool,
         /// Filter containers (e.g. label=env=staging, label=managed, status=running)
         #[clap(long = "filter")]
         filter: Vec<String>,
@@ -269,6 +275,9 @@ pub(crate) enum VolumeCmd {
         /// Output format: table or json
         #[clap(long, default_value = "table")]
         format: OutputFormat,
+        /// Shorthand for --format json; takes precedence if both are given
+        #[clap(long)]
+        json: bool,
     },
     /// Remove a named volume and its contents
     Rm {
@@ -301,6 +310,9 @@ pub(crate) enum ImageCmd {
         /// Output format: table or json
         #[clap(long, default_value = "table")]
         format: OutputFormat,
+        /// Shorthand for --format json; takes precedence if both are given
+        #[clap(long)]
+        json: bool,
     },
     /// Remove a locally stored image
     Rm {
@@ -384,6 +396,9 @@ pub(crate) enum NetworkCmd {
         /// Output format: table or json
         #[clap(long, default_value = "table")]
         format: OutputFormat,
+        /// Shorthand for --format json; takes precedence if both are given
+        #[clap(long)]
+        json: bool,
     },
     /// Remove a network
     Rm {
@@ -414,8 +429,9 @@ fn main() {
         CliCommand::Ps {
             all,
             format,
+            json,
             filter,
-        } => cli::ps::cmd_ps(all, format == OutputFormat::Json, &filter),
+        } => cli::ps::cmd_ps(all, json || format == OutputFormat::Json, &filter),
         CliCommand::Stop { name } => cli::stop::cmd_stop(&name),
         CliCommand::Rm { name, force } => cli::rm::cmd_rm(&name, force),
         CliCommand::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
@@ -425,8 +441,9 @@ fn main() {
             ContainerCmd::Ls {
                 all,
                 format,
+                json,
                 filter,
-            } => cli::ps::cmd_ps(all, format == OutputFormat::Json, &filter),
+            } => cli::ps::cmd_ps(all, json || format == OutputFormat::Json, &filter),
             ContainerCmd::Inspect { name } => cli::ps::cmd_inspect(&name),
             ContainerCmd::Stop { name } => cli::stop::cmd_stop(&name),
             ContainerCmd::Rm { name, force } => cli::rm::cmd_rm(&name, force),
@@ -443,7 +460,9 @@ fn main() {
         // Volume
         CliCommand::Volume { cmd } => match cmd {
             VolumeCmd::Create { name } => cli::volume::cmd_volume_create(&name),
-            VolumeCmd::Ls { format } => cli::volume::cmd_volume_ls(format == OutputFormat::Json),
+            VolumeCmd::Ls { format, json } => {
+                cli::volume::cmd_volume_ls(json || format == OutputFormat::Json)
+            }
             VolumeCmd::Rm { name } => cli::volume::cmd_volume_rm(&name),
         },
 
@@ -462,7 +481,9 @@ fn main() {
                 password_stdin,
                 insecure,
             ),
-            ImageCmd::Ls { format } => cli::image::cmd_image_ls(format == OutputFormat::Json),
+            ImageCmd::Ls { format, json } => {
+                cli::image::cmd_image_ls(json || format == OutputFormat::Json)
+            }
             ImageCmd::Rm { reference } => cli::image::cmd_image_rm(&reference),
             ImageCmd::Push {
                 reference,
@@ -497,7 +518,9 @@ fn main() {
         // Network
         CliCommand::Network { cmd } => match cmd {
             NetworkCmd::Create { name, subnet } => cli::network::cmd_network_create(&name, &subnet),
-            NetworkCmd::Ls { format } => cli::network::cmd_network_ls(format == OutputFormat::Json),
+            NetworkCmd::Ls { format, json } => {
+                cli::network::cmd_network_ls(json || format == OutputFormat::Json)
+            }
             NetworkCmd::Rm { name } => cli::network::cmd_network_rm(&name),
             NetworkCmd::Inspect { name } => cli::network::cmd_network_inspect(&name),
         },

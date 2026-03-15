@@ -17581,3 +17581,153 @@ mod pasta_diagnostic_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #108 — --json shorthand on listing commands
+// ---------------------------------------------------------------------------
+
+mod json_flag_tests {
+    use std::process::Command;
+
+    fn pelagos_bin() -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("target/debug/pelagos");
+        p
+    }
+
+    /// test_ps_json_flag_produces_valid_json
+    ///
+    /// Requires: root (pelagos ps reads /run/pelagos state)
+    ///
+    /// Verifies that `pelagos ps --json` produces a valid JSON array and that
+    /// `pelagos ps --json --all` also does.  Does not require any containers to
+    /// be running — an empty array `[]` is valid output.
+    ///
+    /// Failure indicates: --json flag is not wired up, or cmd_ps does not
+    /// emit JSON when the flag is set.
+    #[test]
+    fn test_ps_json_flag_produces_valid_json() {
+        let bin = pelagos_bin();
+        for args in &[vec!["ps", "--json"], vec!["ps", "--json", "--all"]] {
+            let out = Command::new(&bin)
+                .args(args)
+                .output()
+                .expect("pelagos ps --json");
+            assert!(
+                out.status.success(),
+                "pelagos {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+                panic!(
+                    "pelagos {:?} output is not valid JSON: {}\noutput: {}",
+                    args, e, stdout
+                )
+            });
+        }
+    }
+
+    /// test_ps_json_and_format_json_identical
+    ///
+    /// Requires: root
+    ///
+    /// `pelagos ps --json` and `pelagos ps --format json` must produce
+    /// identical output.
+    ///
+    /// Failure indicates: the two flags take different code paths or one of
+    /// them is broken.
+    #[test]
+    fn test_ps_json_and_format_json_identical() {
+        let bin = pelagos_bin();
+        let out_json = Command::new(&bin)
+            .args(["ps", "--json", "--all"])
+            .output()
+            .expect("pelagos ps --json");
+        let out_fmt = Command::new(&bin)
+            .args(["ps", "--format", "json", "--all"])
+            .output()
+            .expect("pelagos ps --format json");
+        assert!(out_json.status.success());
+        assert!(out_fmt.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out_json.stdout),
+            String::from_utf8_lossy(&out_fmt.stdout),
+            "--json and --format json produced different output"
+        );
+    }
+
+    /// test_image_ls_json_flag_produces_valid_json
+    ///
+    /// Requires: root (image store at /var/lib/pelagos)
+    ///
+    /// Verifies that `pelagos image ls --json` produces a valid JSON array.
+    /// An empty array is acceptable — no images need to be present.
+    ///
+    /// Failure indicates: --json flag not wired up on ImageCmd::Ls.
+    #[test]
+    fn test_image_ls_json_flag_produces_valid_json() {
+        let bin = pelagos_bin();
+        let out = Command::new(&bin)
+            .args(["image", "ls", "--json"])
+            .output()
+            .expect("pelagos image ls --json");
+        assert!(
+            out.status.success(),
+            "pelagos image ls --json failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        serde_json::from_str::<serde_json::Value>(&stdout)
+            .unwrap_or_else(|e| panic!("not valid JSON: {}\noutput: {}", e, stdout));
+    }
+
+    /// test_network_ls_json_flag_produces_valid_json
+    ///
+    /// Requires: root (network state at /run/pelagos/networks)
+    ///
+    /// Verifies that `pelagos network ls --json` produces a valid JSON array.
+    ///
+    /// Failure indicates: --json flag not wired up on NetworkCmd::Ls.
+    #[test]
+    fn test_network_ls_json_flag_produces_valid_json() {
+        let bin = pelagos_bin();
+        let out = Command::new(&bin)
+            .args(["network", "ls", "--json"])
+            .output()
+            .expect("pelagos network ls --json");
+        assert!(
+            out.status.success(),
+            "pelagos network ls --json failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        serde_json::from_str::<serde_json::Value>(&stdout)
+            .unwrap_or_else(|e| panic!("not valid JSON: {}\noutput: {}", e, stdout));
+    }
+
+    /// test_volume_ls_json_flag_produces_valid_json
+    ///
+    /// Requires: root (volume store at /var/lib/pelagos/volumes)
+    ///
+    /// Verifies that `pelagos volume ls --json` produces a valid JSON array.
+    ///
+    /// Failure indicates: --json flag not wired up on VolumeCmd::Ls.
+    #[test]
+    fn test_volume_ls_json_flag_produces_valid_json() {
+        let bin = pelagos_bin();
+        let out = Command::new(&bin)
+            .args(["volume", "ls", "--json"])
+            .output()
+            .expect("pelagos volume ls --json");
+        assert!(
+            out.status.success(),
+            "pelagos volume ls --json failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        serde_json::from_str::<serde_json::Value>(&stdout)
+            .unwrap_or_else(|e| panic!("not valid JSON: {}\noutput: {}", e, stdout));
+    }
+}

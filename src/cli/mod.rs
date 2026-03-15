@@ -201,6 +201,17 @@ pub struct SpawnConfig {
     pub labels: Vec<String>,
 }
 
+/// Persisted state for a running or exited container.
+///
+/// **Stable public interface.** The JSON serialisation of this struct is consumed by
+/// `pelagos-ui`, `pelagos-mac` (vsock protocol), and external tooling. Do not rename
+/// or remove fields without a deprecation cycle and major version bump. New optional
+/// fields (`#[serde(default, skip_serializing_if = ...)]`) may be added freely.
+///
+/// Key serde invariants:
+/// - [`ContainerStatus`] serialises as lowercase: `"running"` | `"exited"`
+/// - [`HealthStatus`] serialises as lowercase: `"starting"` | `"healthy"` | `"unhealthy"` | `"none"`
+/// - Optional/empty fields use `skip_serializing_if` — absent in JSON when empty, not `null`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
     pub name: String,

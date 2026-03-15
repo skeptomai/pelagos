@@ -3476,3 +3476,42 @@ interface appeared in the namespace.
 
 Failure indicates: the root-mode pasta invocation still uses the PID form (triggering the
 user-namespace open) or `--runas 0` is absent.
+
+### `test_ps_json_flag_produces_valid_json`
+**Requires:** root
+
+Verifies that `pelagos ps --json` and `pelagos ps --json --all` each produce a valid JSON
+array.  Does not require any containers to be running — an empty array `[]` is acceptable.
+
+Failure indicates: the `--json` flag is not wired up to `cmd_ps`, or `cmd_ps` does not emit
+JSON when the flag is set.
+
+### `test_ps_json_and_format_json_identical`
+**Requires:** root
+
+`pelagos ps --json --all` and `pelagos ps --format json --all` must produce byte-for-byte
+identical stdout.
+
+Failure indicates: the two flags take different code paths or one of them is broken.
+
+### `test_image_ls_json_flag_produces_valid_json`
+**Requires:** root
+
+Verifies that `pelagos image ls --json` produces a valid JSON array.  An empty array is
+acceptable if no images are stored.
+
+Failure indicates: `--json` is not wired up on `ImageCmd::Ls`.
+
+### `test_network_ls_json_flag_produces_valid_json`
+**Requires:** root
+
+Verifies that `pelagos network ls --json` produces a valid JSON array.
+
+Failure indicates: `--json` is not wired up on `NetworkCmd::Ls`.
+
+### `test_volume_ls_json_flag_produces_valid_json`
+**Requires:** root
+
+Verifies that `pelagos volume ls --json` produces a valid JSON array.
+
+Failure indicates: `--json` is not wired up on `VolumeCmd::Ls`.
