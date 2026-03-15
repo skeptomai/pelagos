@@ -435,8 +435,14 @@ impl std::fmt::Debug for NetworkSetup {
 }
 
 /// Runtime state for a pasta-backed container; holds the pasta process for teardown.
+///
+/// `stderr_thread` drains pasta's stderr asynchronously so the pipe buffer never
+/// fills and blocks pasta.  The collected output is logged at teardown (or sooner
+/// when pasta exits unexpectedly before the TAP appears).
 pub struct PastaSetup {
     process: std::process::Child,
+    /// Background thread draining pasta's stderr pipe.  Joined in teardown.
+    stderr_thread: Option<std::thread::JoinHandle<String>>,
 }
 
 // ── Name generation ───────────────────────────────────────────────────────────
@@ -1696,37 +1702,71 @@ pub fn setup_pasta_network(
     // PID must come last (positional argument).
     args.push(child_pid.to_string());
 
-    let process = SysCmd::new("pasta")
+    let mut process = SysCmd::new("pasta")
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped()) // captured for diagnostics
         .spawn()
         .map_err(|e| {
             io::Error::other(format!("failed to start pasta (is it installed?): {}", e))
         })?;
 
+    // Drain pasta's stderr asynchronously to prevent the pipe buffer from filling
+    // and stalling pasta.  The thread exits when pasta closes its end of the pipe
+    // (i.e. when pasta exits).  We join it in teardown to collect the output.
+    let stderr_thread = {
+        let mut stderr = process.stderr.take().expect("stderr pipe");
+        Some(std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            s
+        }))
+    };
+
     // Wait for pasta to configure the network interface inside the container's netns.
     // pasta runs asynchronously; without waiting the container's first syscalls (e.g.
     // connect, sendto) race against pasta still setting up the TAP.
     //
-    // We poll /proc/{pid}/net/dev until a non-loopback interface appears, which
-    // indicates pasta has created and configured the TAP.  Timeout: 2 s.
-    wait_for_pasta_network(child_pid);
+    // We poll /proc/{pid}/net/dev until a non-loopback interface appears (success),
+    // pasta exits before that happens (failure), or a 5-second timeout fires.
+    wait_for_pasta_network(child_pid, &mut process);
 
-    Ok(PastaSetup { process })
+    Ok(PastaSetup {
+        process,
+        stderr_thread,
+    })
 }
 
 /// Poll `/proc/{pid}/net/dev` until pasta has created a non-loopback interface.
 ///
 /// This resolves the race between pasta's async network setup and the container
 /// process starting to use the network.  Returns as soon as the interface is
-/// visible, or after a 2-second timeout (which allows the container to proceed
-/// even if pasta is unusually slow).
-fn wait_for_pasta_network(child_pid: u32) {
+/// visible, pasta exits unexpectedly, or a 5-second timeout fires.
+///
+/// When pasta exits before the TAP appears its exit status is logged at `warn!`
+/// level; the caller's stderr thread will collect pasta's output and log it at
+/// teardown.  On timeout the warning includes the container PID so the operator
+/// can inspect `/proc/{pid}/net/dev` and pasta's process state manually.
+fn wait_for_pasta_network(child_pid: u32, process: &mut std::process::Child) {
     let net_dev = format!("/proc/{}/net/dev", child_pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
+        // Detect pasta exiting before the TAP interface appears — almost always
+        // means pasta encountered an error (permission denied, missing /dev/net/tun,
+        // bad PID, etc.).  The exit status is the only clue available here; stderr
+        // output is collected by the reader thread and logged in teardown.
+        if let Ok(Some(status)) = process.try_wait() {
+            log::warn!(
+                "pasta exited (status: {}) before TAP interface appeared in \
+                 /proc/{}/net/dev — network setup failed; stderr output will be \
+                 logged at teardown",
+                status,
+                child_pid
+            );
+            return;
+        }
+
         if let Ok(contents) = std::fs::read_to_string(&net_dev) {
             // /proc/{pid}/net/dev has one line per interface; lo is always present.
             // A second interface means pasta has created the TAP.
@@ -1738,21 +1778,48 @@ fn wait_for_pasta_network(child_pid: u32) {
                     !iface.is_empty() && iface != "lo"
                 });
             if has_non_lo {
+                log::debug!(
+                    "pasta: TAP interface appeared in /proc/{}/net/dev",
+                    child_pid
+                );
                 return;
             }
         }
+
         if std::time::Instant::now() >= deadline {
-            log::warn!("pasta network setup timeout — proceeding anyway");
+            log::warn!(
+                "pasta network setup timeout (5s) — no non-loopback interface in \
+                 /proc/{}/net/dev; container will proceed without pasta networking",
+                child_pid
+            );
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
-/// Kill the pasta relay process (best-effort; errors are non-fatal).
+/// Kill the pasta relay process and collect its stderr output for diagnostics.
+///
+/// Kills pasta (best-effort), reaps the process, then joins the stderr reader
+/// thread.  Any output pasta wrote to stderr is logged at `warn!` level so
+/// operators can diagnose setup failures without needing `RUST_LOG=debug`.
 pub fn teardown_pasta_network(setup: &mut PastaSetup) {
     let _ = setup.process.kill();
     let _ = setup.process.wait();
+    // Join the stderr reader thread now that pasta's pipe is closed.
+    if let Some(thread) = setup.stderr_thread.take() {
+        match thread.join() {
+            Ok(stderr) if !stderr.trim().is_empty() => {
+                log::warn!("pasta stderr output:\n{}", stderr.trim());
+            }
+            Ok(_) => {
+                log::debug!("pasta stderr: (empty)");
+            }
+            Err(_) => {
+                log::debug!("pasta stderr reader thread panicked");
+            }
+        }
+    }
 }
 
 /// Returns true if `pasta` is on PATH and responds to `--version`.
