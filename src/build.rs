@@ -1267,7 +1267,11 @@ fn execute_run(
     // We inject the OCI/Docker-standard fallback PATH when the image config does
     // not supply one.  This exactly matches Docker's behaviour: if the image config
     // lacks a PATH entry, Docker inserts the platform default before exec.
-    if !config.env.iter().any(|e| e == "PATH" || e.starts_with("PATH=")) {
+    if !config
+        .env
+        .iter()
+        .any(|e| e == "PATH" || e.starts_with("PATH="))
+    {
         log::warn!(
             "build: image config has no PATH; injecting OCI default \
              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

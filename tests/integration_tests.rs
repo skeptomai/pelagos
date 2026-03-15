@@ -18100,9 +18100,8 @@ mod issue_110_path_fallback {
         // to /bin/sh rather than expanding it to empty (unknown variable → "").
         // The shell inside the container then expands $PATH from its own environment,
         // which should be the OCI default PATH injected by execute_run.
-        let remfile = format!(
-            "FROM {test_tag}\nRUN chmod 644 /etc/hostname && printenv PATH > /out.txt\n",
-        );
+        let remfile =
+            format!("FROM {test_tag}\nRUN chmod 644 /etc/hostname && printenv PATH > /out.txt\n",);
         let instructions = build::parse_remfile(&remfile).expect("parse_remfile");
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let _ = image::remove_image(out_tag);
