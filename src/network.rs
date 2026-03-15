@@ -1698,6 +1698,21 @@ pub fn setup_pasta_network(
     // Without this flag pasta only creates the TAP; the container would need to run
     // a DHCP client (udhcpc) before the interface has an IP or default route.
     args.push("--config-net".to_string());
+    // Run in the foreground (don't fork into the background).
+    //
+    // pasta's default is to daemonise: the spawned process forks and the parent
+    // exits immediately with status 0.  This breaks pelagos in two ways:
+    //
+    //  1. try_wait() sees the parent exit with success and incorrectly reports
+    //     "pasta exited before TAP appeared" — a false-positive failure.
+    //
+    //  2. The relay child is orphaned: teardown_pasta_network kills the parent
+    //     (already dead), leaving the child running after the container exits.
+    //
+    // With --foreground pasta stays as a single process: try_wait() is
+    // accurate, kill() in teardown reaches the relay, and the stderr thread
+    // correctly collects output when pasta exits for any reason.
+    args.push("--foreground".to_string());
     args.push("--quiet".to_string());
     // PID must come last (positional argument).
     args.push(child_pid.to_string());
