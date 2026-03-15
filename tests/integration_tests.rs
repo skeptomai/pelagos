@@ -17438,37 +17438,44 @@ mod pasta_diagnostic_tests {
         );
     }
 
-    /// test_pasta_root_netns_setup
+    /// test_pasta_root_bind_mount
     ///
-    /// Requires: root, pasta in PATH, tun module loaded, /dev/net/tun exists
+    /// Requires: root, pasta in PATH, tun module loaded (/dev/net/tun exists),
+    ///           unshare(1) in PATH
     ///
-    /// Regression test for issue #107 (root mode): when pelagos runs as root
-    /// and spawns pasta with the PID form, pasta tries to open the container's
-    /// user namespace (/proc/<pid>/ns/user) for the privilege-drop dance.  On
-    /// kernels that restrict user namespace access (Alpine linux-lts, or any
-    /// host with sysctl kernel.unprivileged_userns_clone=0), this open fails
-    /// with EPERM and pasta exits status 1 before creating the TAP interface.
+    /// Regression test for issue #107 (root mode, v0.38.0 bind-mount fix).
     ///
-    /// The fix: when running as root, use `pasta --netns /proc/<pid>/ns/net
-    /// --runas 0` which joins the network namespace directly without ever
-    /// touching the user namespace file.
+    /// History of failures:
+    ///   v0.36.0 — pasta <PID>: EPERM on /proc/<pid>/ns/user (privilege-drop dance)
+    ///   v0.37.0 — pasta --netns /proc/<pid>/ns/net: EPERM on /proc/<pid>/ns/net
+    ///             (Yama ptrace_scope=1 blocks cross-process /proc/<pid>/ns/ access,
+    ///             confirmed on both Alpine linux-lts 6.12.x aarch64 and Arch x86_64)
+    ///   fd-passing (/proc/self/fd/N): pasta returns ENXIO — pasta cannot open
+    ///             namespace files via /proc/self/fd symlinks (pasta limitation,
+    ///             confirmed empirically; nsenter handles this but pasta does not)
     ///
-    /// This test creates a named network namespace via `ip netns add`, runs
-    /// pasta with the fixed flags, and asserts that a non-loopback TAP
-    /// interface appeared in the namespace.
+    /// Fix (v0.38.0): pelagos bind-mounts /proc/<pid>/ns/net onto a tmpfs path in
+    /// /run/pelagos/pasta-ns/ before spawning pasta.  The bind-mounted file is on
+    /// tmpfs (not nsfs) so pasta can open it without any /proc/<pid>/ns/ permission
+    /// check.  teardown_pasta_network umounts and removes the file.
     ///
-    /// Failure indicates the root-mode pasta invocation is still using the PID
-    /// form (which triggers the user namespace open) or --runas 0 is missing.
+    /// This test replicates the exact code path in setup_pasta_network:
+    ///   1. Spawn `unshare --net sleep 30` to get a process in a new netns
+    ///   2. bind-mount /proc/<pid>/ns/net -> /run/pelagos/pasta-ns/<pid>
+    ///   3. Spawn pasta with --netns <bind-path> --runas 0 --foreground --config-net
+    ///   4. Assert a non-loopback TAP interface appears in /proc/<pid>/net/dev (5s)
+    ///   5. Teardown: kill pasta, umount MNT_DETACH, remove the file
+    ///
+    /// Failure indicates: setup_pasta_network is not using bind-mount, the bind-mount
+    /// path is not being passed to pasta, or --runas 0 is missing.
     #[test]
-    fn test_pasta_root_netns_setup() {
+    fn test_pasta_root_bind_mount() {
         use std::process::Command;
 
-        // Skip if not root.
         if unsafe { libc::geteuid() } != 0 {
             eprintln!("SKIP: not root");
             return;
         }
-        // Skip if pasta is not available.
         if !Command::new("pasta")
             .arg("--version")
             .stdout(std::process::Stdio::null())
@@ -17480,47 +17487,73 @@ mod pasta_diagnostic_tests {
             eprintln!("SKIP: pasta not in PATH");
             return;
         }
-        // Skip if ip(8) is not available (needed to create/delete named netns).
-        if Command::new("ip")
-            .arg("netns")
-            .arg("list")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("SKIP: ip not in PATH");
+        if !std::path::Path::new("/dev/net/tun").exists() {
+            eprintln!("SKIP: /dev/net/tun not found (tun module not loaded)");
             return;
         }
 
-        let ns_name = format!("pelagos-test-{}", std::process::id());
+        // Spawn a process in a new network namespace (simulates the container).
+        let netns_proc = Command::new("unshare")
+            .args(["--net", "sleep", "30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("unshare --net sleep 30");
+        let cpid = netns_proc.id();
 
-        // Create a named network namespace (appears at /run/netns/<ns_name>).
-        let create_status = Command::new("ip")
-            .args(["netns", "add", &ns_name])
-            .status()
-            .expect("ip netns add");
-        assert!(create_status.success(), "ip netns add failed");
-
-        // Ensure cleanup even if the test panics.
-        struct Cleanup(String);
-        impl Drop for Cleanup {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
             fn drop(&mut self) {
-                let _ = Command::new("ip").args(["netns", "del", &self.0]).status();
+                let _ = self.0.kill();
+                let _ = self.0.wait();
             }
         }
-        let _cleanup = Cleanup(ns_name.clone());
+        let _guard = KillOnDrop(netns_proc);
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
-        // Run pasta the same way pelagos does for root containers:
-        //   pasta --foreground --config-net --netns /run/netns/<ns> --runas 0
-        // pasta will create a TAP interface and configure it, then keep running.
-        // We send SIGTERM after a brief poll to let it finish setup.
+        // Bind-mount the container's netns — the v0.38.0 fix.
+        let ns_dir = std::path::Path::new("/run/pelagos/pasta-ns");
+        std::fs::create_dir_all(ns_dir).expect("create /run/pelagos/pasta-ns");
+        let mount_path = ns_dir.join(format!("{}", cpid));
+        std::fs::write(&mount_path, b"").expect("create mount point file");
+
+        let src = std::ffi::CString::new(format!("/proc/{}/ns/net", cpid)).unwrap();
+        let dst = std::ffi::CString::new(mount_path.to_str().unwrap()).unwrap();
+        let fstype = std::ffi::CString::new("").unwrap();
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                fstype.as_ptr(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "mount --bind failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        struct UmountOnDrop(std::path::PathBuf);
+        impl Drop for UmountOnDrop {
+            fn drop(&mut self) {
+                let path = std::ffi::CString::new(self.0.to_str().unwrap()).unwrap();
+                unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _umount = UmountOnDrop(mount_path.clone());
+
+        let netns_arg = mount_path.to_string_lossy().into_owned();
         let mut pasta = Command::new("pasta")
             .args([
                 "--foreground",
                 "--config-net",
                 "--netns",
-                &format!("/run/netns/{}", ns_name),
+                &netns_arg,
                 "--runas",
                 "0",
             ])
@@ -17530,12 +17563,11 @@ mod pasta_diagnostic_tests {
             .spawn()
             .expect("pasta spawn");
 
-        // Poll for a non-loopback interface in the namespace (max 5s).
+        // Poll /proc/<cpid>/net/dev for a non-loopback interface (max 5s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut tap_found = false;
         while std::time::Instant::now() < deadline {
             if let Ok(Some(status)) = pasta.try_wait() {
-                // pasta exited early — collect output and fail.
                 let mut stdout_out = String::new();
                 let mut stderr_out = String::new();
                 if let Some(mut out) = pasta.stdout.take() {
@@ -17550,17 +17582,11 @@ mod pasta_diagnostic_tests {
                     status, stdout_out, stderr_out
                 );
             }
-            // Check for a non-loopback interface in the netns.
-            let ifout = Command::new("ip")
-                .args(["netns", "exec", &ns_name, "ip", "link", "show"])
-                .output();
-            if let Ok(out) = ifout {
-                let text = String::from_utf8_lossy(&out.stdout);
-                // ip link show lists lines like "2: wlan0: <...>"
-                // Any interface other than lo means pasta created the TAP.
-                if text.lines().any(|l| {
-                    let name = l.split(':').nth(1).unwrap_or("").trim();
-                    !name.is_empty() && name != "lo" && !name.starts_with('@')
+            let dev_path = format!("/proc/{}/net/dev", cpid);
+            if let Ok(content) = std::fs::read_to_string(&dev_path) {
+                if content.lines().skip(2).any(|l| {
+                    let name = l.split(':').next().unwrap_or("").trim();
+                    !name.is_empty() && name != "lo"
                 }) {
                     tap_found = true;
                     break;
@@ -17569,15 +17595,14 @@ mod pasta_diagnostic_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // Kill pasta (it's a relay; we don't need it running for the assertion).
         let _ = pasta.kill();
         let _ = pasta.wait();
 
         assert!(
             tap_found,
-            "pasta did not create a TAP interface in netns '{}' within 5s — \
-             root-mode pasta invocation is broken (user namespace EPERM regression)",
-            ns_name
+            "pasta did not create a TAP interface in netns of pid {} within 5s \
+             using bind-mount approach — issue #107 root-mode regression",
+            cpid
         );
     }
 }

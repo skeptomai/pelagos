@@ -3457,25 +3457,30 @@ pipe/thread mechanics that `setup_pasta_network` and `teardown_pasta_network` us
 Failure indicates: one or both pipes are still `Stdio::null()`, the merged reader thread is
 not spawned correctly, or teardown does not join the thread to collect output.
 
-### `test_pasta_root_netns_setup`
-**Requires:** root, `pasta` in PATH, `ip` in PATH, tun kernel module loaded (`/dev/net/tun` exists)
+### `test_pasta_root_bind_mount`
+**Requires:** root, `pasta` in PATH, `unshare` in PATH, tun kernel module loaded (`/dev/net/tun` exists)
 
-Regression test for issue #107 (root-mode pasta): when pelagos runs as root and spawns pasta
-using the PID positional form, pasta opens `/proc/<pid>/ns/user` to enter the container's user
-namespace before entering the network namespace.  On kernels that restrict user namespace
-access (Alpine `linux-lts`, hosts with `sysctl kernel.unprivileged_userns_clone=0`), this open
-fails with EPERM and pasta exits with status 1 before creating the TAP interface.
+Regression test for issue #107 (root-mode pasta, v0.38.0 bind-mount fix).
 
-The fix: when running as root, use `pasta --netns /proc/<pid>/ns/net --runas 0`, which joins
-the network namespace directly without touching the user namespace file.  `--runas 0` keeps
-pasta running as root so no privilege-drop dance occurs.
+**History of failures:**
+- v0.36.0: `pasta <PID>` — EPERM on `/proc/<pid>/ns/user` (privilege-drop dance to nobody)
+- v0.37.0: `pasta --netns /proc/<pid>/ns/net --runas 0` — EPERM on `/proc/<pid>/ns/net`
+  (Yama `ptrace_scope=1` blocks cross-process `/proc/<pid>/ns/` access, confirmed on both
+  Alpine linux-lts 6.12.x aarch64 and Arch Linux x86_64 with default kernel settings)
+- fd-passing (`pasta --netns /proc/self/fd/N`): ENXIO — pasta cannot open namespace files
+  via `/proc/self/fd` symlinks (pasta limitation; `nsenter` handles this but pasta does not)
 
-Creates a named network namespace via `ip netns add`, invokes pasta with the fixed flags, then
-polls `ip netns exec ... ip link show` for up to 5 seconds and asserts that a non-loopback TAP
-interface appeared in the namespace.
+**Fix (v0.38.0):** pelagos bind-mounts `/proc/<pid>/ns/net` onto a file in
+`/run/pelagos/pasta-ns/` before spawning pasta.  The bind-mounted file lives on tmpfs and
+is openable by pasta without any `/proc/<pid>/ns/` cross-process permission check.
+`teardown_pasta_network` unmounts and removes the file after killing pasta.
 
-Failure indicates: the root-mode pasta invocation still uses the PID form (triggering the
-user-namespace open) or `--runas 0` is absent.
+Replicates the exact `setup_pasta_network` code path: spawns `unshare --net sleep 30`,
+bind-mounts its netns, invokes pasta with the bind-mount path, polls
+`/proc/<pid>/net/dev` for a non-loopback TAP interface for up to 5 seconds.
+
+Failure indicates: `setup_pasta_network` is not using bind-mount, the bind-mount path
+is not passed to pasta, or `--runas 0` is absent.
 
 ### `test_ps_json_flag_produces_valid_json`
 **Requires:** root

@@ -443,6 +443,9 @@ pub struct PastaSetup {
     process: std::process::Child,
     /// Background thread draining pasta's stdout+stderr pipes.  Joined in teardown.
     output_thread: Option<std::thread::JoinHandle<String>>,
+    /// In root mode, the bind-mount path used for the netns file.
+    /// Unmounted and removed during teardown.
+    ns_bind_mount: Option<std::path::PathBuf>,
 }
 
 // ── Name generation ───────────────────────────────────────────────────────────
@@ -1727,18 +1730,65 @@ pub fn setup_pasta_network(
     // NOTE: do NOT pass --quiet here. pasta writes error messages to either stdout
     // or stderr depending on the error path and version; suppressing either channel
     // silently discards the actual failure message.
-    if running_as_root {
-        // Root mode: join netns directly, stay as root — avoids the user namespace.
+    // In root mode, pasta cannot open /proc/<pid>/ns/net directly:
+    //
+    //   v0.36.0: pasta <PID> form — EPERM opening /proc/<pid>/ns/user (privilege-drop)
+    //   v0.37.0: pasta --netns /proc/<pid>/ns/net — EPERM opening /proc/<pid>/ns/net
+    //            (Yama LSM ptrace_scope=1 blocks cross-process /proc/<pid>/ns/ access)
+    //   fd-passing (/proc/self/fd/N): rejected by pasta with ENXIO — pasta cannot
+    //            open namespace files via /proc/self/fd symlinks (pasta limitation)
+    //
+    // Solution (v0.38.0): bind-mount the container's netns file onto a path that pasta
+    // CAN open.  pelagos performs the bind mount as root (CAP_SYS_ADMIN) BEFORE
+    // spawning pasta; the resulting bind-mounted file lives on tmpfs (/run/pelagos/)
+    // and is openable by pasta without any /proc/<pid>/ns/ access.
+    //
+    // The bind-mount path is stored in PastaSetup.ns_bind_mount and unmounted in
+    // teardown_pasta_network after pasta is killed.
+    let ns_bind_mount = if running_as_root {
+        let ns_dir = std::path::Path::new("/run/pelagos/pasta-ns");
+        std::fs::create_dir_all(ns_dir)?;
+        let mount_path = ns_dir.join(format!("{}", child_pid));
+        // Create an empty regular file as the bind-mount target.
+        std::fs::write(&mount_path, b"")
+            .map_err(|e| io::Error::new(e.kind(), format!("create netns mount point: {}", e)))?;
+        let src = std::ffi::CString::new(format!("/proc/{}/ns/net", child_pid)).unwrap();
+        let dst = std::ffi::CString::new(mount_path.as_os_str().as_encoded_bytes()).unwrap();
+        let fstype = std::ffi::CString::new("").unwrap();
+        // SAFETY: all pointers are valid CStrings; MS_BIND is a safe mount flag.
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                fstype.as_ptr(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        if rc == -1 {
+            let _ = std::fs::remove_file(&mount_path);
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!(
+                    "mount --bind /proc/{}/ns/net {}: {}",
+                    child_pid,
+                    mount_path.display(),
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
         args.push("--netns".to_string());
-        args.push(format!("/proc/{}/ns/net", child_pid));
+        args.push(mount_path.to_string_lossy().into_owned());
         args.push("--runas".to_string());
         args.push("0".to_string());
+        Some(mount_path)
     } else {
         // Rootless mode: PID form — pasta joins the container's user namespace
         // before the network namespace (required when the container has a user ns).
         // PID must come last (positional argument).
         args.push(child_pid.to_string());
-    }
+        None
+    };
 
     let mut process = SysCmd::new("pasta")
         .args(&args)
@@ -1747,6 +1797,16 @@ pub fn setup_pasta_network(
         .stderr(std::process::Stdio::piped()) // captured for diagnostics
         .spawn()
         .map_err(|e| {
+            // Clean up bind mount if spawn fails.
+            if let Some(ref p) = ns_bind_mount {
+                unsafe {
+                    libc::umount2(
+                        p.as_os_str().as_encoded_bytes().as_ptr() as *const libc::c_char,
+                        libc::MNT_DETACH,
+                    )
+                };
+                let _ = std::fs::remove_file(p);
+            }
             io::Error::other(format!("failed to start pasta (is it installed?): {}", e))
         })?;
 
@@ -1792,6 +1852,7 @@ pub fn setup_pasta_network(
     Ok(PastaSetup {
         process,
         output_thread,
+        ns_bind_mount,
     })
 }
 
@@ -1876,6 +1937,24 @@ pub fn teardown_pasta_network(setup: &mut PastaSetup) {
                 log::debug!("pasta output reader thread panicked");
             }
         }
+    }
+    // Remove the bind-mounted netns file created in root mode.
+    if let Some(ref p) = setup.ns_bind_mount {
+        // SAFETY: pointer is valid for the duration of this call.
+        let rc = unsafe {
+            libc::umount2(
+                p.as_os_str().as_encoded_bytes().as_ptr() as *const libc::c_char,
+                libc::MNT_DETACH,
+            )
+        };
+        if rc == -1 {
+            log::warn!(
+                "pasta netns bind-mount umount2 failed for {}: {}",
+                p.display(),
+                io::Error::last_os_error()
+            );
+        }
+        let _ = std::fs::remove_file(p);
     }
 }
 
