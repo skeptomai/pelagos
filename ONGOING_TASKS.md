@@ -33,21 +33,23 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #48 | track: runtime-tools process_rlimits broken by Go 1.19+ (upstream) | upstream |
 | #49 | track: runtime-tools delete tests hardcoded for cgroupv1 (upstream) | upstream |
 
-## Current Baseline (2026-03-13, SHA 5ba58ad / pelagos-mac fac01b5)
+## Current Baseline (2026-03-15, SHA 0e43705 / pelagos-mac fac01b5)
 
-- pelagos unit tests: **299/299 pass**
-- pelagos integration tests: **258/258 pass, 6 ignored**, ~27s
-- pelagos v0.27.1 released: https://github.com/skeptomai/pelagos/releases/tag/v0.27.1
+- pelagos unit tests: **305/305 pass**
+- pelagos integration tests: CI green (v0.35.0 release workflow passed)
+- pelagos v0.35.0 released: https://github.com/skeptomai/pelagos/releases/tag/v0.35.0
 - pelagos-mac: compiles on macOS only (objc2-virtualization); clean at fac01b5
 - Both trees: clean
 
-**Completed this session (2026-03-13):**
-- Fixed namespace capture ordering bug (c252337): `Namespace::MOUNT` auto-add was happening
-  after `let namespaces = self.namespaces` capture, so `unshare(CLONE_NEWNS)` was never
-  called — pivot_root returned EINVAL. Moved auto-add to before the capture.
-- Fixed parallel test race (b238a43): all containers sharing the same rootfs competed on
-  `.pivot_root_old`. Fixed by generating unique name (parent-PID + `PIVOT_ROOT_COUNTER`)
-  before fork, passing it as parameter to `do_pivot_root()`.
+**Completed this session (2026-03-15): issues #103–#107**
+- #103 fix (c0698c5): `COPY . /dest/` ENOENT — bare dot treated as contents mode in `execute_copy()`
+- #104 fix (c0698c5): `FROM <local-tag>` — try local ref before normalised `docker.io/library/` path
+- #105 fix (2617115): `FROM ${VAR}` substitution + `FROM <stage-alias>` resolved via `completed_stages`
+  (type changed from `HashMap<String,Vec<String>>` to `HashMap<String,(Vec<String>,ImageConfig)>`)
+- #106 fix (453f469): COPY `--chown=` and `--chmod=` flags parsed in a loop instead of treated as source
+- #107 fix (61e4258 + 0e43705): pasta stderr captured + `--foreground` flag added to prevent
+  pasta from daemonising (orphaning the relay child) which caused false-positive `try_wait()` exit
+  detection and silent TAP setup failures
 - Confirmed no bind-mount leak: DNS bind-mounts always happen after `unshare(CLONE_NEWNS)`;
   guard at spawn() prevents DNS setup without MOUNT namespace.
 - Bumped to v0.27.1, tagged, released. CI: all 5 jobs pass.
