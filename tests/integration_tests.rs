@@ -14448,6 +14448,173 @@ CMD [\"cat\", \"/marker\"]\n";
         result.unwrap();
     }
 
+    /// test_from_stage_alias_with_build_arg
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Regression test for issue #105: `FROM ${VAR}` where VAR is passed via
+    /// `--build-arg` and the resolved value is a prior stage's alias.
+    ///
+    /// Before the fix, `completed_stages` was only used for `COPY --from`; the
+    /// `FROM` base-image resolution always went to the image store.  After
+    /// substitution `base_ref = "stage0"` failed `image::load_image` because
+    /// no image named `stage0` is registered, even though `stage0` is a
+    /// completed build stage.
+    ///
+    /// Builds a two-stage Remfile where stage 1's FROM uses `${VAR}` seeded by
+    /// `--build-arg`.  Asserts the build succeeds and the resulting image can
+    /// cat a file that was laid down in stage 0.
+    ///
+    /// Failure indicates: `FROM <stage-alias>` does not check `completed_stages`
+    /// before the image store, or sub_vars is not seeded from --build-arg.
+    #[test]
+    fn test_from_stage_alias_with_build_arg() {
+        if !is_root() {
+            eprintln!("SKIP test_from_stage_alias_with_build_arg: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_from_stage_alias_with_build_arg: alpine not pulled \
+                 (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("marker"), b"stage-alias-build-arg\n").unwrap();
+
+        // The devcontainer CLI pattern: ARG inside stage 0, FROM ${VAR} in stage 1,
+        // value supplied via --build-arg.
+        let remfile = "\
+FROM alpine AS base_stage\n\
+COPY marker /marker\n\
+ARG NEXT_IMAGE=base_stage\n\
+FROM ${NEXT_IMAGE} AS final_stage\n\
+CMD [\"cat\", \"/marker\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-stage-alias-buildarg:latest";
+
+        let mut build_args = HashMap::new();
+        build_args.insert("NEXT_IMAGE".to_string(), "base_stage".to_string());
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &build_args,
+        )
+        .expect(
+            "execute_build with FROM ${VAR} stage alias (--build-arg) should succeed (issue #105)",
+        );
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            let mut child = Command::new("cat")
+                .args(["/marker"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("spawn");
+
+            let (status, stdout, _stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            assert!(status.success(), "container exited non-zero");
+            assert_eq!(
+                out.trim(),
+                "stage-alias-build-arg",
+                "marker from stage0 not visible in stage1 — stage alias inheritance broken"
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
+    /// test_from_stage_alias_with_arg_default
+    ///
+    /// Requires: root, alpine image pre-pulled
+    ///
+    /// Companion to test_from_stage_alias_with_build_arg: same pattern but
+    /// WITHOUT `--build-arg`.  The ARG instruction inside stage 0 provides the
+    /// default value.  After stage 0's loop runs, `sub_vars` must contain the
+    /// ARG name so that stage 1's `FROM ${VAR}` substitution succeeds.
+    ///
+    /// Failure indicates: `sub_vars` is not updated by ARG processing inside a
+    /// stage's body, so inter-stage FROM substitution fails when the caller
+    /// provides no --build-arg override.
+    #[test]
+    fn test_from_stage_alias_with_arg_default() {
+        if !is_root() {
+            eprintln!("SKIP test_from_stage_alias_with_arg_default: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_from_stage_alias_with_arg_default: alpine not pulled \
+                 (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let ctx = tempfile::TempDir::new().unwrap();
+        std::fs::write(ctx.path().join("marker2"), b"stage-alias-default\n").unwrap();
+
+        // No --build-arg; ARG default inside stage 0 seeds sub_vars.
+        let remfile = "\
+FROM alpine AS base_default\n\
+COPY marker2 /marker2\n\
+ARG NEXT_IMAGE=base_default\n\
+FROM ${NEXT_IMAGE} AS final_default\n\
+CMD [\"cat\", \"/marker2\"]\n";
+        let instructions = build::parse_remfile(remfile).unwrap();
+        let tag = "pelagos-test-stage-alias-default:latest";
+
+        let manifest = build::execute_build(
+            &instructions,
+            ctx.path(),
+            tag,
+            NetworkMode::None,
+            false,
+            &HashMap::new(), // no --build-arg
+        )
+        .expect(
+            "execute_build with FROM ${VAR} stage alias (ARG default) should succeed (issue #105)",
+        );
+
+        let result = std::panic::catch_unwind(|| {
+            let layers = image::layer_dirs(&manifest);
+            let mut child = Command::new("cat")
+                .args(["/marker2"])
+                .with_image_layers(layers)
+                .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+                .env("PATH", ALPINE_PATH)
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Piped)
+                .spawn()
+                .expect("spawn");
+
+            let (status, stdout, _stderr) = child.wait_with_output().expect("wait");
+            let out = String::from_utf8_lossy(&stdout);
+            assert!(status.success(), "container exited non-zero");
+            assert_eq!(
+                out.trim(),
+                "stage-alias-default",
+                "marker from base_default stage not visible — ARG default sub_vars threading broken"
+            );
+        });
+
+        cleanup_image(tag);
+        result.unwrap();
+    }
+
     /// Verify that the rootless bridge guard fires when `pelagos run --network bridge` is invoked
     /// as a non-root user.  Uses `sudo -u nobody` to execute the installed binary without root.
     ///

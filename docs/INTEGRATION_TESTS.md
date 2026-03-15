@@ -3390,3 +3390,34 @@ second build succeeds and the sentinel from the base image is visible inside the
 
 Failure indicates the local-ref lookup is missing and `FROM <local>` unconditionally hits the
 registry normalisation path, which does not know about locally built images.
+
+### `test_from_stage_alias_with_build_arg`
+**Requires:** root, `docker.io/library/alpine:latest` pulled
+
+Regression test for issue #105: `FROM ${VAR}` where the variable value resolves to a prior
+stage's alias, with the value supplied via `--build-arg`.
+
+Before the fix, `completed_stages` was only consulted for `COPY --from` lookups; the FROM
+base-image resolution always went straight to the image store.  After substitution
+`base_ref = "stage0"` failed `image::load_image` because no image named `stage0` is stored,
+even though `stage0` is a completed build stage.
+
+Builds a two-stage Remfile where stage 1's `FROM ${NEXT_IMAGE}` is seeded by
+`--build-arg NEXT_IMAGE=base_stage`.  Asserts the build succeeds and the file laid down in
+stage 0 is visible in the final container.
+
+Failure indicates: `FROM <stage-alias>` does not check `completed_stages` before the image
+store, or `sub_vars` is not seeded from `--build-arg` at `execute_build` entry.
+
+### `test_from_stage_alias_with_arg_default`
+**Requires:** root, `docker.io/library/alpine:latest` pulled
+
+Companion to `test_from_stage_alias_with_build_arg`: same Dockerfile pattern but without any
+`--build-arg`.  The `ARG NEXT_IMAGE=base_default` instruction inside stage 0 supplies the
+default.  After stage 0's instruction loop processes the ARG, `sub_vars` must contain the
+key so that stage 1's `FROM ${NEXT_IMAGE}` can be substituted.
+
+Asserts the build succeeds and the file from stage 0 is visible in the resulting image.
+
+Failure indicates: `sub_vars` is not updated by ARG processing inside a stage's body, so
+inter-stage FROM substitution fails when the caller provides no `--build-arg` override.

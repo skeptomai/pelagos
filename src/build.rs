@@ -632,7 +632,7 @@ fn execute_stage(
     args_map: &mut HashMap<String, String>,
     sub_vars: &mut HashMap<String, String>,
     remignore: Option<&ignore::gitignore::Gitignore>,
-    completed_stages: &HashMap<String, Vec<String>>,
+    completed_stages: &HashMap<String, (Vec<String>, ImageConfig)>,
 ) -> Result<(Vec<String>, ImageConfig), BuildError> {
     // Find the FROM instruction to load the base image.
     let from_idx = instructions
@@ -645,10 +645,25 @@ fn execute_stage(
             Instruction::From { ref image, .. } => image.clone(),
             _ => unreachable!(),
         };
+        log::debug!(
+            "build: FROM resolved to {:?} (after substitution)",
+            base_ref
+        );
 
         // FROM scratch: empty base, no image to load.
         if base_ref == "scratch" {
             (Vec::new(), ImageConfig::default())
+        } else if let Some((stage_layers, stage_config)) = completed_stages.get(&base_ref) {
+            // FROM <stage-alias> or FROM <stage-index>: inherit a completed stage.
+            // This is the standard multi-stage-build pattern where a later stage
+            // starts from the filesystem of an earlier named stage rather than
+            // pulling a registry image.
+            log::debug!(
+                "build: FROM {:?} resolved to completed stage ({} layers)",
+                base_ref,
+                stage_layers.len()
+            );
+            (stage_layers.clone(), stage_config.clone())
         } else {
             // Try local reference first (bare name with :latest if no tag),
             // then fall back to the normalised registry reference.
@@ -658,6 +673,12 @@ fn execute_stage(
                 base_ref.clone()
             };
             let normalised = normalise_image_reference(&base_ref);
+            log::debug!(
+                "build: FROM {:?} not a completed stage; trying local={:?} normalised={:?}",
+                base_ref,
+                local_ref,
+                normalised
+            );
             let base_manifest = image::load_image(&local_ref)
                 .or_else(|_| image::load_image(&normalised))
                 .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?;
@@ -682,12 +703,23 @@ fn execute_stage(
                 ref name,
                 ref default,
             } => {
+                let from_build_arg = args_map.contains_key(name);
                 let value = args_map
                     .entry(name.clone())
                     .or_insert_with(|| default.clone().unwrap_or_default())
                     .clone();
                 sub_vars.insert(name.clone(), value.clone());
                 eprintln!("Step {}/{}: ARG {}={}", step, total, name, value);
+                log::debug!(
+                    "build: ARG {} = {:?} (source: {})",
+                    name,
+                    value,
+                    if from_build_arg {
+                        "--build-arg"
+                    } else {
+                        "default"
+                    }
+                );
             }
             Instruction::Run(ref cmd_text) => {
                 let cache_key = if cache_active {
@@ -723,13 +755,13 @@ fn execute_stage(
                         "Step {}/{}: COPY --from={} {} {}",
                         step, total, stage_name, src, dest
                     );
-                    let stage_layers =
-                        completed_stages
-                            .get(stage_name)
-                            .ok_or_else(|| BuildError::Parse {
-                                line: 0,
-                                message: format!("COPY --from={}: unknown stage", stage_name),
-                            })?;
+                    let stage_layers = completed_stages
+                        .get(stage_name)
+                        .map(|(l, _)| l.as_slice())
+                        .ok_or_else(|| BuildError::Parse {
+                            line: 0,
+                            message: format!("COPY --from={}: unknown stage", stage_name),
+                        })?;
                     let digest =
                         execute_copy_from_stage(src, dest, stage_layers, &config.working_dir)?;
                     layers.push(digest);
@@ -973,16 +1005,37 @@ pub fn execute_build(
     // Process pre-FROM ARGs.
     for instr in &instructions[..first_non_arg] {
         if let Instruction::Arg { name, default } = instr {
-            args_map
+            let val = args_map
                 .entry(name.clone())
-                .or_insert_with(|| default.clone().unwrap_or_default());
+                .or_insert_with(|| default.clone().unwrap_or_default())
+                .clone();
+            log::debug!(
+                "build: pre-FROM ARG {} = {:?} ({})",
+                name,
+                val,
+                if build_args.contains_key(name) {
+                    "--build-arg"
+                } else {
+                    "default"
+                }
+            );
         }
     }
 
     // Build substitution context: ARG values override ENV on conflict.
+    // All --build-arg values are seeded here unconditionally so that
+    // FROM ${VAR} lines in any stage can resolve them even when the ARG
+    // declaration lives inside a prior stage's body rather than before the
+    // first FROM.
     let mut sub_vars: HashMap<String, String> = HashMap::new();
-    // (ENV vars will be added as we encounter them; ARG values are already in args_map)
-    sub_vars.extend(args_map.iter().map(|(k, v)| (k.clone(), v.clone())));
+    for (k, v) in &args_map {
+        log::debug!(
+            "build: seeding sub_vars from --build-arg/pre-FROM ARG: {} = {:?}",
+            k,
+            v
+        );
+        sub_vars.insert(k.clone(), v.clone());
+    }
 
     let from_instr = substitute_instruction(&instructions[first_non_arg], &sub_vars);
     let _base_ref = match &from_instr {
@@ -996,8 +1049,9 @@ pub fn execute_build(
     // Split into stages (multi-stage builds).
     let stages = split_into_stages(instructions);
 
-    // Track completed stages for COPY --from resolution.
-    let mut completed_stages: HashMap<String, Vec<String>> = HashMap::new();
+    // Track completed stages for COPY --from and FROM <alias> resolution.
+    // Value is (layers, config) so a later FROM <alias> can inherit both.
+    let mut completed_stages: HashMap<String, (Vec<String>, ImageConfig)> = HashMap::new();
     let mut final_layers = Vec::new();
     let mut final_config = ImageConfig::default();
     let num_stages = stages.len();
@@ -1022,12 +1076,13 @@ pub fn execute_build(
             &completed_stages,
         )?;
 
-        // Record this stage's layers for COPY --from.
+        // Record this stage's layers+config for COPY --from and FROM <alias>.
         if let Some(ref alias) = stage.alias {
-            completed_stages.insert(alias.clone(), layers.clone());
+            log::debug!("build: recording completed stage alias {:?}", alias);
+            completed_stages.insert(alias.clone(), (layers.clone(), config.clone()));
         }
         // Also track by stage index.
-        completed_stages.insert(stage_idx.to_string(), layers.clone());
+        completed_stages.insert(stage_idx.to_string(), (layers.clone(), config.clone()));
 
         if is_final {
             final_layers = layers;
@@ -2490,5 +2545,64 @@ HEALTHCHECK CMD ["pg_isready", "-U", "postgres"]"#;
     fn test_copy_no_trailing_slash_dest_resolution() {
         let dest = resolve_copy_dest(".", "myapp", "/app");
         assert_eq!(dest, "/app/myapp");
+    }
+
+    // -- issue #105: FROM ${VAR} substitution with inter-stage ARG --
+
+    /// Verify that `${VAR}` in a FROM line is correctly substituted when the
+    /// variable is seeded from --build-arg (the Docker devcontainer CLI pattern).
+    #[test]
+    fn test_from_var_substituted_from_build_arg() {
+        let remfile = "\
+FROM alpine AS stage0\n\
+ARG _DEV_CONTAINERS_BASE_IMAGE=stage0\n\
+FROM ${_DEV_CONTAINERS_BASE_IMAGE} AS stage1\n";
+        let instructions = parse_remfile(remfile).unwrap();
+        let stages = split_into_stages(&instructions);
+        assert_eq!(stages.len(), 2);
+        // Simulate sub_vars seeded from --build-arg (as execute_build does).
+        let mut sub_vars = std::collections::HashMap::new();
+        sub_vars.insert(
+            "_DEV_CONTAINERS_BASE_IMAGE".to_string(),
+            "stage0".to_string(),
+        );
+        let from1 = substitute_instruction(&stages[1].instructions[0], &sub_vars);
+        match from1 {
+            Instruction::From { ref image, .. } => {
+                assert_eq!(
+                    image, "stage0",
+                    "FROM ${{_DEV_CONTAINERS_BASE_IMAGE}} should expand to 'stage0' \
+                     when sub_vars is seeded from --build-arg"
+                );
+            }
+            _ => panic!("expected FROM instruction"),
+        }
+    }
+
+    /// Verify that `${VAR}` in a FROM line is correctly substituted when the
+    /// variable is seeded from an ARG default inside the prior stage (no
+    /// --build-arg passed by the caller).
+    #[test]
+    fn test_from_var_substituted_from_arg_default() {
+        let remfile = "\
+FROM alpine AS stage0\n\
+ARG NEXT=stage0\n\
+FROM ${NEXT} AS stage1\n";
+        let instructions = parse_remfile(remfile).unwrap();
+        let stages = split_into_stages(&instructions);
+        assert_eq!(stages.len(), 2);
+        // Simulate what execute_stage does when processing stage0's ARG NEXT=stage0.
+        let mut sub_vars = std::collections::HashMap::new();
+        sub_vars.insert("NEXT".to_string(), "stage0".to_string());
+        let from1 = substitute_instruction(&stages[1].instructions[0], &sub_vars);
+        match from1 {
+            Instruction::From { ref image, .. } => {
+                assert_eq!(
+                    image, "stage0",
+                    "FROM ${{NEXT}} should expand to 'stage0' when seeded from ARG default"
+                );
+            }
+            _ => panic!("expected FROM instruction"),
+        }
     }
 }

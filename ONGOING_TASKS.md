@@ -6,6 +6,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Kind |
 |---|-------|------|
+| #105 | bug: FROM ${VAR} not substituted + FROM <stage-alias> not found in completed_stages | bug/FIXED |
 | #103 | bug: COPY . /dest/ fails with ENOENT (bare dot not treated as contents mode) | bug/FIXED |
 | #104 | bug: FROM <local-tag> cannot find locally-built images (normalise_image_reference) | bug/FIXED |
 | #96 | epic: replace chroot with pivot_root as default root isolation | epic/COMPLETE |
