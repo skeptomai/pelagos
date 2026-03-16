@@ -925,6 +925,7 @@ fn execute_copy_from_stage(
                 std::fs::copy(&candidate, &dest_in_tmp)?;
             }
 
+            fix_staging_dir_perms(tmp.path());
             return Ok(create_layer_from_dir(tmp.path())?);
         }
     }

@@ -3684,3 +3684,19 @@ directory, preserving all 12 permission bits (including the sticky bit) from the
 Mirrors the devcontainer feature install pattern: COPY into `/tmp/dev-features/`, then
 `chmod -R 0755 /tmp/dev-features/node` followed by a write to `/tmp`. Asserts `/tmp-mode.txt`
 contains `1777`. Failure indicates `copy_dir_recursive` is not preserving directory permissions.
+
+### `test_build_copy_from_stage_tmp_writable`
+**Requires:** root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+
+Regression test for issue #111 v0.48.0 fix: `COPY --from=<stage>` into `/tmp` must also
+produce a layer where `/tmp` has mode 1777.
+
+v0.47.0 added `fix_staging_dir_perms` to `execute_copy` but not `execute_copy_from_stage`.
+The devcontainer feature Dockerfile uses `COPY --from=<stage> /tmp/build-features/ /tmp/...`
+which goes through `execute_copy_from_stage`. Without the fix, `/tmp` ended up at mode 755
+in the layer store, blocking `apt-key` with EACCES in the subsequent `apt-get update`.
+
+Two-stage Remfile: stage 0 (`FROM scratch`) places a file at `/tmp/build-features/probe.txt`;
+stage 1 (`FROM ubuntu`) uses `COPY --from=0` to pull it out, then `stat -c '%a' /tmp`.
+Asserts `/tmp-mode.txt` contains `1777`. Failure indicates `fix_staging_dir_perms` is absent
+from `execute_copy_from_stage` in `build.rs`.
