@@ -120,12 +120,25 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok())
             .unwrap_or(pid)
     };
-    // Only read /proc/environ when no image manifest is available (rootfs containers).
-    let container_env: Vec<(String, String)> = if image_env.is_empty() {
-        read_proc_environ(environ_pid)
-    } else {
-        Vec::new()
-    };
+    // Read the container's live /proc/environ to pick up runtime --env vars
+    // (e.g. MY_EXEC_VAR=hello set via `pelagos run --env`).  These are NOT
+    // in the image config and must still be inherited by exec'd processes.
+    //
+    // Merge strategy: image_env is the base, /proc/environ supplies any key
+    // that is NOT already in image_env.  This ensures:
+    //   • PATH (and other Dockerfile ENV vars) always come from the image config
+    //     even when the container was started before the #114 fix (where the
+    //     live environ had the wrong default PATH overwriting the image's PATH).
+    //   • Runtime --env vars that are absent from the image config are still
+    //     inherited by the exec'd process.
+    //   • CLI -e flags override everything (applied after this block).
+    let proc_env = read_proc_environ(environ_pid);
+    let image_env_keys: std::collections::HashSet<&str> =
+        image_env.iter().map(|(k, _)| k.as_str()).collect();
+    let container_env: Vec<(String, String)> = proc_env
+        .into_iter()
+        .filter(|(k, _)| !image_env_keys.contains(k.as_str()))
+        .collect();
 
     // 4. Build Command
     let exe = &args.args[0];
