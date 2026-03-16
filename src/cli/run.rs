@@ -450,7 +450,21 @@ fn build_image_run(
         // than replacing them.
         .add_namespaces(Namespace::UTS | Namespace::PID);
 
-    // Apply image config defaults: environment.
+    // Apply image config environment.  This includes any PATH set by Dockerfile
+    // ENV instructions.  apply_cli_options no longer injects a fallback PATH
+    // (doing so unconditionally would clobber the image's custom PATH — issue #114).
+    // Inject the OCI-default PATH here only when the image config omits it.
+    if !manifest
+        .config
+        .env
+        .iter()
+        .any(|e| e == "PATH" || e.starts_with("PATH="))
+    {
+        cmd = cmd.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+    }
     for env_str in &manifest.config.env {
         if let Some((k, v)) = env_str.split_once('=') {
             cmd = cmd.env(k, v);
@@ -517,7 +531,13 @@ fn build_command(
         .with_chroot(rootfs_dir)
         .with_namespaces(Namespace::UTS | Namespace::MOUNT | Namespace::PID)
         .with_proc_mount()
-        .with_dev_mount();
+        .with_dev_mount()
+        // Rootfs-based runs have no image config; inject the OCI default PATH
+        // so executables in standard locations are always findable.
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
 
     cmd = apply_cli_options(
         cmd,
@@ -633,11 +653,11 @@ fn apply_cli_options(
             cmd = cmd.env(e, v);
         }
     }
-    // Always set a sensible PATH
-    cmd = cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    );
+    // Do NOT set a fallback PATH here.  Callers (build_command for rootfs,
+    // build_image_run for image runs) are responsible for injecting a default
+    // PATH when neither the image config nor --env provides one.  Doing it here
+    // unconditionally overwrites Dockerfile `ENV PATH=...` entries that were
+    // already applied before apply_cli_options is called (issue #114).
 
     // User
     if let Some(ref u) = args.user {

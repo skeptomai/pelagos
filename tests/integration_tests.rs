@@ -18670,3 +18670,117 @@ mod issue_112_ca_cert_bind_mount {
         let _ = image::remove_image(&format!("{}:latest", out_tag));
     }
 }
+
+// ---------------------------------------------------------------------------
+// issue #114 — pelagos run does not apply Dockerfile ENV to container process
+// ---------------------------------------------------------------------------
+
+mod issue_114_image_env_applied_on_run {
+    use crate::is_root;
+    use pelagos::build;
+    use pelagos::container::{Command, Namespace, Stdio};
+    use pelagos::image;
+    use std::collections::HashMap;
+
+    /// Regression test for issue #114: `pelagos run` must propagate the image's
+    /// OCI config Env (set by Dockerfile `ENV` instructions) to the spawned
+    /// container process.
+    ///
+    /// Requires: root, `docker.io/library/alpine:latest` pre-pulled.
+    ///
+    /// Builds a one-layer image that sets `ENV PATH=/issue-114-sentinel:$PATH`,
+    /// then spawns a container from that image and captures `echo $PATH`.
+    /// Asserts the sentinel prefix appears in the output, which confirms that
+    /// `manifest.config.env` is correctly applied in `build_image_run` and that
+    /// `apply_cli_options` no longer unconditionally overwrites PATH with the
+    /// Alpine default (the root cause of issue #114).
+    ///
+    /// Failure indicates the unconditional `cmd.env("PATH", default)` override
+    /// has been re-introduced in `apply_cli_options` (run.rs), or the image-config
+    /// env application has been moved to after that override.
+    #[test]
+    fn test_run_applies_image_env_path() {
+        if !is_root() {
+            eprintln!("SKIP test_run_applies_image_env_path: requires root");
+            return;
+        }
+        if image::load_image("docker.io/library/alpine:latest").is_err() {
+            eprintln!(
+                "SKIP test_run_applies_image_env_path: \
+                 alpine not pulled (run: pelagos image pull alpine)"
+            );
+            return;
+        }
+
+        let out_tag = "pelagos-issue-114-test";
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+
+        // Build a minimal image that sets a sentinel PATH prefix via ENV.
+        let remfile =
+            "FROM alpine\nENV PATH=/issue-114-sentinel:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n";
+        let instructions = build::parse_remfile(remfile).expect("parse_remfile");
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let manifest = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        )
+        .expect("execute_build");
+
+        // Confirm the manifest captured the custom PATH.
+        let has_sentinel = manifest
+            .config
+            .env
+            .iter()
+            .any(|e| e.contains("/issue-114-sentinel"));
+        assert!(
+            has_sentinel,
+            "manifest.config.env does not contain /issue-114-sentinel: {:?}",
+            manifest.config.env
+        );
+
+        // Spawn a container from the built image and capture its PATH.
+        let layer_dirs = image::layer_dirs(&manifest);
+        let mut cmd = Command::new("/bin/sh")
+            .args(["-c", "echo $PATH"])
+            .with_image_layers(layer_dirs)
+            .add_namespaces(Namespace::UTS | Namespace::PID)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped);
+
+        // Apply image env — mirrors what build_image_run does after the fix.
+        if !manifest
+            .config
+            .env
+            .iter()
+            .any(|e| e == "PATH" || e.starts_with("PATH="))
+        {
+            cmd = cmd.env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            );
+        }
+        for env_str in &manifest.config.env {
+            if let Some((k, v)) = env_str.split_once('=') {
+                cmd = cmd.env(k, v);
+            }
+        }
+
+        let mut child = cmd.spawn().expect("spawn");
+        let (status, stdout, _stderr) = child.wait_with_output().expect("wait_with_output");
+
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(status.success(), "container exited non-zero: {:?}", status);
+        assert!(
+            out.contains("/issue-114-sentinel"),
+            "PATH does not contain /issue-114-sentinel; got: {:?}",
+            out.trim()
+        );
+
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+    }
+}

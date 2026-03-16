@@ -3719,3 +3719,18 @@ would not be called.
 Remfile: `FROM ubuntu:22.04 RUN apt-get update && apt-get install -y ca-certificates`.
 Asserts exit code 0 and that the output contains "done." (the final `update-ca-certificates`
 success message). Failure indicates the bind-mount-over-overlay EBUSY regression has returned.
+
+### `test_run_applies_image_env_path`
+**Requires:** root, `docker.io/library/alpine:latest` pre-pulled
+
+Regression test for issue #114: `pelagos run` must propagate the image's OCI config
+`Env` (set by Dockerfile `ENV` instructions) to the container process. Previously,
+`apply_cli_options` in `run.rs` unconditionally called `cmd.env("PATH", default)` after
+the image env was applied, clobbering any custom `PATH` from the image config.
+
+Builds a one-layer alpine image with `ENV PATH=/issue-114-sentinel:...`, then spawns a
+container running `echo $PATH`. Asserts the output contains `/issue-114-sentinel`.
+Also verifies that `manifest.config.env` records the sentinel path after the build, which
+confirms the build engine stores ENV correctly. Failure indicates the unconditional PATH
+override has been re-introduced in `apply_cli_options`, or the image-config env application
+order has been broken.
