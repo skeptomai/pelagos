@@ -1830,10 +1830,20 @@ fn dir_has_content(dir: &Path) -> Result<bool, io::Error> {
     Ok(entries.next().is_some())
 }
 
-/// Recursively copy a directory tree.
+/// Recursively copy a directory tree, preserving permissions.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), io::Error> {
     if !dst.exists() {
         std::fs::create_dir_all(dst)?;
+    }
+    // Preserve the source directory's permissions — create_dir_all uses the
+    // process umask and would strip the sticky bit (e.g. 1777 → 755 on /tmp).
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = std::fs::metadata(src) {
+            let mode = meta.mode() & 0o7777; // preserve all 12 permission bits
+            let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode));
+        }
     }
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

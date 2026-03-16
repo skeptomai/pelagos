@@ -3664,3 +3664,23 @@ is not shadowed by a 755 entry, and RUN steps see both the correct permissions a
 The test builds a Remfile that COPYs a sentinel file to `/tmp/sentinel.txt` then RUNs
 `cat /tmp/sentinel.txt`. Failure would indicate a tmpfs is mounted on `/tmp` in `execute_run`,
 hiding overlay content.
+
+### `test_build_tmp_writable_after_copy`
+**Requires:** root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+
+Regression test for issue #111 v0.47.0 fix: `/tmp` must be mode 1777 (world-writable + sticky)
+in RUN steps that follow a COPY instruction writing into `/tmp`.
+
+Root cause: `copy_dir_recursive` used `create_dir_all` (mode 755 from umask) for directories and
+never called `set_permissions`. When `create_layer_from_dir` stored the COPY layer via
+`copy_dir_recursive`, the staging `/tmp` (set to 1777 by `fix_staging_dir_perms`) ended up as 755
+in the layer store, shadowing the base image's `/tmp` (1777). This caused `apt-key`'s `mkstemp`
+on `/tmp/apt.conf.*` to fail with EACCES (world-write bit missing), blocking `apt-get update` in
+devcontainer feature builds.
+
+Fix (v0.47.0): `copy_dir_recursive` now calls `set_permissions` after creating each destination
+directory, preserving all 12 permission bits (including the sticky bit) from the source.
+
+Mirrors the devcontainer feature install pattern: COPY into `/tmp/dev-features/`, then
+`chmod -R 0755 /tmp/dev-features/node` followed by a write to `/tmp`. Asserts `/tmp-mode.txt`
+contains `1777`. Failure indicates `copy_dir_recursive` is not preserving directory permissions.

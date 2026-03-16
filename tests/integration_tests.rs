@@ -18411,4 +18411,101 @@ mod issue_111_tmp_writable {
 
         let _ = image::remove_image(&format!("{}:latest", out_tag));
     }
+
+    /// test_build_tmp_writable_after_copy
+    ///
+    /// Requires: root, `public.ecr.aws/docker/library/ubuntu:22.04` pre-pulled
+    ///
+    /// Regression test for issue #111 v0.47.0 fix: /tmp must remain mode 1777
+    /// (world-writable + sticky) in RUN steps that follow a COPY instruction
+    /// which writes into /tmp.
+    ///
+    /// Root cause: `copy_dir_recursive` creates directories via `create_dir_all`
+    /// which applies the process umask (022 → 755), losing the sticky bit set by
+    /// `fix_staging_dir_perms`. When the layer is stored via `copy_dir_recursive`,
+    /// `/tmp` appears as 755 in the layer store, shadowing the base image's 1777.
+    ///
+    /// Fix (v0.47.0): `copy_dir_recursive` now preserves source directory permissions
+    /// by calling `set_permissions` immediately after creating each destination directory.
+    ///
+    /// Failure would indicate `copy_dir_recursive` is not preserving directory
+    /// permissions when copying to the layer store in `create_layer_from_dir`.
+    #[test]
+    fn test_build_tmp_writable_after_copy() {
+        if !is_root() {
+            eprintln!("SKIP test_build_tmp_writable_after_copy: requires root");
+            return;
+        }
+
+        let ecr_ubuntu = "public.ecr.aws/docker/library/ubuntu:22.04";
+        if image::load_image(ecr_ubuntu).is_err() {
+            eprintln!(
+                "SKIP test_build_tmp_writable_after_copy: \
+                 ECR ubuntu not pulled (run: pelagos image pull {})",
+                ecr_ubuntu
+            );
+            return;
+        }
+
+        let out_tag = "pelagos-issue-111-copy-tmp-perm-test";
+        let _ = image::remove_image(out_tag);
+        let _ = image::remove_image(&format!("{}:latest", out_tag));
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmpdir.path().join("features/node")).expect("mkdir");
+        std::fs::write(
+            tmpdir.path().join("features/node/setup.sh"),
+            "#!/bin/sh\necho ok\n",
+        )
+        .expect("write script");
+
+        // Mirrors the devcontainer feature pattern:
+        // COPY writes into /tmp/dev-features/, then RUN uses chmod + writes to /tmp.
+        let remfile = format!(
+            "FROM {ecr_ubuntu}\n\
+             COPY features/ /tmp/dev-features/\n\
+             RUN chmod -R 0755 /tmp/dev-features/node \
+               && stat -c '%a' /tmp > /tmp-mode.txt \
+               && touch /tmp/apt-canary.txt\n"
+        );
+
+        let instructions = build::parse_remfile(&remfile).expect("parse_remfile");
+
+        let result = build::execute_build(
+            &instructions,
+            tmpdir.path(),
+            out_tag,
+            pelagos::network::NetworkMode::Loopback,
+            false,
+            &HashMap::new(),
+        );
+
+        let manifest = result.expect(
+            "execute_build failed — /tmp was not writable after COPY into /tmp. \
+             copy_dir_recursive may not be preserving directory permissions \
+             (sticky bit 1777 → 755 due to umask). Check copy_dir_recursive in build.rs.",
+        );
+
+        // Read /tmp-mode.txt from the built image to verify /tmp had mode 1777.
+        let layer_dirs = image::layer_dirs(&manifest);
+        let cmd = pelagos::container::Command::new("/bin/cat")
+            .args(["/tmp-mode.txt"])
+            .with_image_layers(layer_dirs)
+            .stdin(pelagos::container::Stdio::Null)
+            .stdout(pelagos::container::Stdio::Piped)
+            .stderr(pelagos::container::Stdio::Null);
+        let mut child = cmd.spawn().expect("spawn cat");
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        assert!(status.success(), "cat /tmp-mode.txt failed");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("1777"),
+            "/tmp mode was not 1777 after COPY into /tmp in RUN step. \
+             apt-key and devcontainer feature installs require sticky + world-writable /tmp. \
+             Got: {:?}",
+            out
+        );
+
+        let _ = image::remove_image(&manifest.reference);
+    }
 }
