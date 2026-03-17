@@ -19398,6 +19398,17 @@ mod issue_118_start_returns_promptly {
         let name = "start-prompt-test";
         cleanup(name);
 
+        // Pull alpine if not already present.
+        let pull = std::process::Command::new(bin())
+            .args(["image", "pull", "public.ecr.aws/docker/library/alpine:latest"])
+            .output()
+            .expect("pelagos image pull");
+        assert!(
+            pull.status.success(),
+            "image pull failed: {}",
+            String::from_utf8_lossy(&pull.stderr)
+        );
+
         // 1. Start a long-running container detached.
         let out = std::process::Command::new(bin())
             .args([
