@@ -1004,14 +1004,10 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Create attach pipes before fork (O_CLOEXEC so the container grandchild's exec() closes them).
     // Slot 0 = stdout pipe, slot 1 = stderr pipe.  Each: [read_fd, write_fd].
     let mut attach_pipes: [[i32; 2]; 2] = [[-1, -1], [-1, -1]];
-    if attach_stdout
-        && unsafe { libc::pipe2(attach_pipes[0].as_mut_ptr(), libc::O_CLOEXEC) } != 0
-    {
+    if attach_stdout && unsafe { libc::pipe2(attach_pipes[0].as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
-    if attach_stderr
-        && unsafe { libc::pipe2(attach_pipes[1].as_mut_ptr(), libc::O_CLOEXEC) } != 0
-    {
+    if attach_stderr && unsafe { libc::pipe2(attach_pipes[1].as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
 
