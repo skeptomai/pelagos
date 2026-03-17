@@ -2,7 +2,7 @@
 
 All work is tracked in GitHub Issues. This file is a brief index.
 
-## Session in progress: 2026-03-17
+## Session completed: 2026-03-17 (SHA fbefebc, v0.57.0)
 
 ### Issues closed this session
 
