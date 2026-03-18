@@ -7439,21 +7439,31 @@ mod exec {
         }
         assert!(started, "container did not start within 10s");
 
-        // Verify exec works inside a PID-namespace container by running a simple
-        // command that does NOT depend on /proc/self.  Using /bin/echo avoids the
-        // known limitation that `setns(CLONE_NEWPID)` in exec requires a double-fork
-        // to take effect on the exec'd process itself; the container's /proc is
-        // mounted for its own PID namespace, so /proc/self is not accessible from
-        // an exec'd process that stays in the host PID namespace.
-        //
-        // Known limitation: exec'd processes currently run in the HOST PID namespace
-        // even when the container has its own PID namespace.  Joining an existing
-        // PID namespace via setns(CLONE_NEWPID) requires a subsequent fork() (the
-        // double-fork mechanism) to take effect — this is tracked for a future fix.
-        let exec_out = std::process::Command::new(bin)
+        // Verify basic exec works.
+        let exec_echo = std::process::Command::new(bin)
             .args(["exec", name, "/bin/echo", "hello-from-exec"])
             .output()
             .expect("pelagos exec /bin/echo");
+        assert!(
+            exec_echo.status.success(),
+            "pelagos exec /bin/echo failed: {}",
+            String::from_utf8_lossy(&exec_echo.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&exec_echo.stdout).trim(),
+            "hello-from-exec",
+            "exec output mismatch"
+        );
+
+        // Verify that /proc/self/ns/mnt is readable — this requires that the
+        // exec'd process joined the container's PID namespace (fix for issue #121).
+        // Before the fix, setns(CLONE_NEWPID) was skipped and /proc/self was a
+        // dangling 0-byte symlink inside the container's /proc, causing readlink
+        // to exit non-zero and breaking VS Code's resolveAuthority() probe.
+        let exec_readlink = std::process::Command::new(bin)
+            .args(["exec", name, "readlink", "/proc/self/ns/mnt"])
+            .output()
+            .expect("pelagos exec readlink");
 
         let _ = std::process::Command::new(bin)
             .args(["stop", name])
@@ -7462,15 +7472,19 @@ mod exec {
             .args(["rm", "-f", name])
             .output();
 
+        let readlink_out = String::from_utf8_lossy(&exec_readlink.stdout);
         assert!(
-            exec_out.status.success(),
-            "pelagos exec /bin/echo failed: {}",
-            String::from_utf8_lossy(&exec_out.stderr)
+            exec_readlink.status.success(),
+            "readlink /proc/self/ns/mnt failed (exit {:?}): /proc/self is dangling — \
+             PID namespace join not working (issue #121)\nstdout: {}\nstderr: {}",
+            exec_readlink.status.code(),
+            readlink_out,
+            String::from_utf8_lossy(&exec_readlink.stderr)
         );
-        assert_eq!(
-            String::from_utf8_lossy(&exec_out.stdout).trim(),
-            "hello-from-exec",
-            "exec output mismatch"
+        assert!(
+            readlink_out.trim().starts_with("mnt:["),
+            "readlink /proc/self/ns/mnt output unexpected: {}",
+            readlink_out.trim()
         );
     }
 

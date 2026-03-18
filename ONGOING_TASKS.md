@@ -2,6 +2,24 @@
 
 All work is tracked in GitHub Issues. This file is a brief index.
 
+## Session in progress: 2026-03-17
+
+### Issues closed this session
+
+| # | Title | Fixed in |
+|---|-------|---------|
+| #121 | fix(exec): join container PID namespace — /proc/self no longer dangling | v0.58.0 |
+
+### Key implementation details
+
+**#121 (exec-into doesn't join PID namespace — /proc/self dangling):**
+- Root cause: `cmd_exec` always skipped `setns(CLONE_NEWPID)` due to a misunderstanding — the "double-fork" limitation applies to *creating* a new PID namespace, not *joining* an existing one
+- Fix: for root exec, save the PID ns path in the ns_entries loop, then call `setns(CLONE_NEWPID)` **in the parent process** right before `spawn()`. The fork inside `spawn()` then creates the child in the container's PID namespace
+- Rootless exec still skips (PID ns owned by container's user ns; joining it in parent would change parent's credentials — known limitation)
+- Updated `test_exec_joins_pid_namespace` to assert `readlink /proc/self/ns/mnt` exits 0 and returns `mnt:[...]`
+
+---
+
 ## Session completed: 2026-03-17 (SHA fbefebc, v0.57.0)
 
 ### Issues closed this session

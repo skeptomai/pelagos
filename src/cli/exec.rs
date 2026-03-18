@@ -182,6 +182,8 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut user_ns_path: Option<PathBuf> = None;
     // Late namespaces: joined after USER inside the user_pre_exec callback.
     let mut late_ns_paths: Vec<(PathBuf, Namespace)> = Vec::new();
+    // PID namespace path for root exec — joined in the parent before fork.
+    let mut pid_ns_path_for_root: Option<PathBuf> = None;
     for (path, ns) in &ns_entries {
         match *ns {
             Namespace::MOUNT => has_mount_ns = true,
@@ -190,9 +192,20 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
                 user_ns_path = Some(path.clone());
             }
             Namespace::PID => {
-                // Skip PID: the double-fork mechanism in container.rs runs
-                // before user_pre_exec and would fail without caps.
-                log::debug!("exec: skipping PID namespace join (host PID namespace limitation)");
+                if !is_rootless {
+                    // Root exec: join in the parent process before fork.
+                    // setns(CLONE_NEWPID) only updates pid_for_children for the
+                    // calling thread; the fork inside spawn() then creates the child
+                    // in the container's PID namespace so exec'd processes appear in
+                    // the container's /proc and /proc/self resolves correctly.
+                    pid_ns_path_for_root = Some(path.clone());
+                } else {
+                    // Rootless: the PID namespace is owned by the container's user
+                    // namespace.  Joining it requires being in that user namespace
+                    // first, which we cannot do in the parent without changing our
+                    // own credentials.  Known limitation for rootless exec.
+                    log::debug!("exec: skipping PID namespace join in rootless mode");
+                }
             }
             _ if is_rootless && has_user_ns => {
                 // UTS/IPC/NET/CGROUP: join after USER in the callback.
@@ -374,7 +387,30 @@ pub fn cmd_exec(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         cmd = cmd.with_uid(uid);
     }
 
-    // 5. Spawn
+    // 5. Join PID namespace in the parent thread before fork (root exec only).
+    //
+    // setns(CLONE_NEWPID) updates this thread's pid_for_children to the
+    // container's PID namespace.  The fork() inside spawn() then creates the
+    // child inside that namespace, so the exec'd process:
+    //   • gets a valid PID entry in the container's /proc
+    //   • sees /proc/self as a live symlink (not a dangling 0-byte one)
+    //   • can readlink /proc/self/ns/mnt without error
+    //
+    // This must happen after all command setup is complete and immediately
+    // before spawn() so that no other forking happens in between.
+    let _pid_ns_file_keep; // keep alive until after spawn()
+    if let Some(ref p) = pid_ns_path_for_root {
+        let f = std::fs::File::open(p).map_err(|e| format!("open pid ns {:?}: {}", p, e))?;
+        let r = unsafe { libc::setns(f.as_raw_fd(), libc::CLONE_NEWPID) };
+        if r != 0 {
+            return Err(format!("setns(CLONE_NEWPID): {}", std::io::Error::last_os_error()).into());
+        }
+        _pid_ns_file_keep = Some(f);
+    } else {
+        _pid_ns_file_keep = None;
+    }
+
+    // 6. Spawn
     if args.interactive {
         let session = cmd
             .spawn_interactive()

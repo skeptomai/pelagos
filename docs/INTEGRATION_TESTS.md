@@ -1404,13 +1404,20 @@ The `--rootfs` path always enables `Namespace::PID`, so `state.pid` is the
 intermediate process P whose `/proc/P/ns/pid` is the host PID namespace, but
 `/proc/P/ns/pid_for_children` points to the container's PID namespace.
 
-Runs `pelagos exec <name> readlink /proc/self/ns/pid` and asserts the output
-matches `readlink /proc/{intermediate_pid}/ns/pid_for_children` read from the host.
+Runs `pelagos exec <name> /bin/echo hello-from-exec` to verify basic exec, then runs
+`pelagos exec <name> readlink /proc/self/ns/mnt` and asserts it exits 0 and returns
+a `mnt:[...]` string.
 
-Failure indicates `discover_namespaces` is not using the `pid_for_children` fallback
-or the double-fork in `container.rs` step 1.65 is not putting the exec'd process in
-the target PID namespace. A failing test means `ps` inside exec'd shells shows host
-PIDs instead of container-scoped PIDs.
+The `readlink /proc/self/ns/mnt` assertion is the regression test for issue #121:
+before the fix, `setns(CLONE_NEWPID)` was skipped in `cmd_exec` so exec'd processes
+ran in the host PID namespace. Inside the container's /proc (which is mounted for the
+container's PID namespace), `/proc/self` was a dangling 0-byte symlink for processes
+not in that namespace, causing `readlink` to fail with exit code 1. VS Code's
+`resolveAuthority()` runs exactly this probe and rejects non-zero exit.
+
+Failure indicates `cmd_exec` is no longer calling `setns(CLONE_NEWPID)` in the parent
+before fork, or `discover_namespaces` is not finding the PID namespace via the
+`pid_for_children` fallback.
 
 ---
 
