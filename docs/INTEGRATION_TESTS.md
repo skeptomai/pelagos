@@ -3854,3 +3854,28 @@ asserts the output contains `127.0.1.1 mycontainer`.
 Failure indicates that the hostname alias is missing from `/etc/hosts`, which would cause
 `getaddrinfo(hostname)` to fail inside the container — matching Docker's behaviour of
 always providing a `127.0.1.1` alias for the container's hostname.
+
+### `test_run_foreground_state_written_before_output_issue_124`
+**Requires:** root, network (alpine image pull)
+**Module:** `issue_124_run_state_ordering`
+
+Spawns `pelagos run` (foreground, no `--detach`) with stdout piped. Reads until
+the container's first output line (`echo ready`) appears, then immediately reads
+`state.json` and asserts `pid > 0`.
+
+Failure indicates that container output reached the caller before `state.json`
+was written with the real PID — the ordering bug described in issue #124.  Any
+tool using container stdout as a readiness signal would call `pelagos exec` and
+see `pid=0`, causing exec-into to fail.
+
+### `test_run_detached_state_ready_on_return_issue_124`
+**Requires:** root, network (alpine image pull)
+**Module:** `issue_124_run_state_ordering`
+
+Runs `pelagos run --detach` and immediately reads `state.json` the moment the
+command returns.  Asserts `pid > 0`.
+
+Failure indicates the parent returned (printed the container name) before the
+watcher had written state with the real PID — the sync-pipe guarantee is broken.
+A concurrent `pelagos exec` immediately after `pelagos run --detach` would see
+`pid=0` and fail.

@@ -2,6 +2,25 @@
 
 All work is tracked in GitHub Issues. This file is a brief index.
 
+## Session in progress: v0.59.0 (branch fix/run-state-ordering-issue-124)
+
+### Issues in progress
+
+| # | Title | Fix |
+|---|-------|-----|
+| #124 | fix(run): write state with real PID before relaying stdout | v0.59.0 |
+
+### Key implementation details
+
+**#124 (run state ordering race):**
+- Two distinct races: (A) `run_foreground` — stdout Inherit let container output flow before `write_state(real_pid)`; (B) `run_detached` non-attach — parent exited before watcher wrote real PID
+- Fix A: change stdout/stderr to `Stdio::Piped`, call `write_state(real_pid)` immediately after spawn, then start relay threads — data only flows after state is written
+- Fix B: sync pipe (O_CLOEXEC) created before fork; watcher writes 1 byte after `write_state(real_pid)`; parent blocks on read before printing name / starting relay
+- `run_detached` with `-a STDOUT/-a STDERR` was already correctly ordered (relay starts after write_state); sync pipe added there too for explicit guarantee and to avoid SIGPIPE
+- Two integration tests: `test_run_foreground_state_written_before_output_issue_124`, `test_run_detached_state_ready_on_return_issue_124`
+
+---
+
 ## Session completed: 2026-03-17 (SHA 21b80d7, v0.58.0)
 
 ### Issues closed this session

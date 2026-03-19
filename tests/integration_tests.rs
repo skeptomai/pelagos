@@ -19612,3 +19612,163 @@ mod issue_120_etc_hosts {
         );
     }
 }
+
+mod issue_124_run_state_ordering {
+    use std::io::BufRead;
+    use std::time::Duration;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn cleanup(name: &str) {
+        let _ = std::process::Command::new(bin())
+            .args(["stop", name])
+            .output();
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = std::process::Command::new(bin())
+            .args(["rm", "-f", name])
+            .output();
+    }
+
+    fn pull_alpine() {
+        let _ = std::process::Command::new(bin())
+            .args([
+                "image",
+                "pull",
+                "public.ecr.aws/docker/library/alpine:latest",
+            ])
+            .output();
+    }
+
+    /// Verifies that `pelagos run` (foreground) writes state with a valid PID
+    /// *before* any container output reaches the caller.
+    ///
+    /// Requires root + network (image pull).  A race here produces pid=0 in
+    /// state.json at the moment the first output line appears on stdout.
+    ///
+    /// The fix: switch stdout/stderr to Piped and write state with real PID
+    /// before starting relay threads, so data only flows after state is written.
+    #[test]
+    fn test_run_foreground_state_written_before_output_issue_124() {
+        use crate::is_root;
+        use std::io::BufReader;
+        use std::process::Stdio;
+
+        if !is_root() {
+            eprintln!(
+                "SKIP: test_run_foreground_state_written_before_output_issue_124 requires root"
+            );
+            return;
+        }
+
+        let name = "test-fg-state-124";
+        pull_alpine();
+        cleanup(name);
+
+        // Spawn `pelagos run` (foreground) with piped stdout so we can read
+        // the container's first output line from inside the test.
+        let mut child = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--name",
+                name,
+                "public.ecr.aws/docker/library/alpine:latest",
+                "/bin/sh",
+                "-c",
+                "echo ready; sleep 10",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pelagos run");
+
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read first output line");
+
+        assert_eq!(
+            line.trim(),
+            "ready",
+            "expected 'ready' on stdout, got: {:?}",
+            line
+        );
+
+        // At this point the relay has delivered the first line — state must
+        // already have a valid PID (relay starts after write_state in the fix).
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let raw = std::fs::read_to_string(&state_path)
+            .expect("state.json missing when first output appeared");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("state.json parse failed");
+        let pid = v["pid"].as_i64().unwrap_or(0);
+        assert!(
+            pid > 0,
+            "state.pid should be > 0 when first output appears (issue #124), got {}",
+            pid
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup(name);
+    }
+
+    /// Verifies that `pelagos run --detach` writes state with a valid PID
+    /// before it returns to the caller.
+    ///
+    /// Requires root + network (image pull).  Previously the parent process
+    /// exited immediately after fork, before the watcher had written the real
+    /// PID — so any exec-into immediately after would see pid=0 (issue #124).
+    ///
+    /// The fix: a sync pipe causes the parent to block until the watcher writes
+    /// state with the real PID, then returns.
+    #[test]
+    fn test_run_detached_state_ready_on_return_issue_124() {
+        use crate::is_root;
+
+        if !is_root() {
+            eprintln!("SKIP: test_run_detached_state_ready_on_return_issue_124 requires root");
+            return;
+        }
+
+        let name = "test-dtch-state-124";
+        pull_alpine();
+        cleanup(name);
+
+        let out = std::process::Command::new(bin())
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "public.ecr.aws/docker/library/alpine:latest",
+                "sleep",
+                "30",
+            ])
+            .output()
+            .expect("pelagos run --detach");
+
+        assert!(
+            out.status.success(),
+            "pelagos run --detach failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Immediately after `pelagos run --detach` returns, state must have
+        // a valid (non-zero) PID — the sync pipe blocks the parent until
+        // the watcher has written it.
+        let state_path = format!("/run/pelagos/containers/{}/state.json", name);
+        let raw = std::fs::read_to_string(&state_path)
+            .expect("state.json missing immediately after pelagos run --detach");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("state.json parse failed");
+        let pid = v["pid"].as_i64().unwrap_or(0);
+        assert!(
+            pid > 0,
+            "state.pid should be > 0 immediately after `pelagos run --detach` \
+             returns (issue #124), got {}",
+            pid
+        );
+
+        cleanup(name);
+    }
+}
