@@ -31,7 +31,7 @@ use super::{
 use pelagos::container::{Capability, Command, Namespace, Stdio, Volume};
 use pelagos::network::NetworkMode;
 use pelagos::wasm::WasmRuntime;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
@@ -860,55 +860,95 @@ fn run_foreground(
     spawn_config: Option<SpawnConfig>,
     labels: std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Use Piped for stdout/stderr so we can write state with the real PID
+    // before any container output reaches the caller (issue #124).
+    // stdin stays Inherit so the user's terminal input flows to the container.
     cmd = cmd
         .stdin(Stdio::Inherit)
-        .stdout(Stdio::Inherit)
-        .stderr(Stdio::Inherit);
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped);
 
-    // Write initial state
     std::fs::create_dir_all(containers_dir())?;
-    let state = ContainerState {
+
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
+    let pid = child.pid();
+
+    // Gather network info before writing state.
+    let mnt_ns_inode = super::read_mnt_ns_inode(pid);
+    let bridge_ip = child.container_ip();
+    let all_ips: Vec<(String, String)> = child
+        .container_ips()
+        .into_iter()
+        .map(|(name, ip)| (name.to_string(), ip))
+        .collect();
+    let network_ips: std::collections::HashMap<String, String> = all_ips.iter().cloned().collect();
+
+    // Write state with real PID *before* starting the relay threads.
+    // Guarantees concurrent `pelagos ps` / exec-into callers see a valid PID
+    // before any container output reaches them (issue #124).
+    let mut state = ContainerState {
         name: name.clone(),
         rootfs,
         status: ContainerStatus::Running,
-        pid: 0,
+        pid,
         watcher_pid: 0,
         started_at: super::now_iso8601(),
         exit_code: None,
         command: command.clone(),
         stdout_log: None,
         stderr_log: None,
-        bridge_ip: None,
-        network_ips: std::collections::HashMap::new(),
+        bridge_ip,
+        network_ips,
         health: None,
         health_config: None,
         spawn_config,
         labels,
-        mnt_ns_inode: None,
+        mnt_ns_inode,
     };
     write_state(&state)?;
-
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
-    let pid = child.pid();
-
-    // Update state with real PID, mount-namespace inode, and network IPs.
-    let mut state2 = state;
-    state2.pid = pid;
-    state2.mnt_ns_inode = super::read_mnt_ns_inode(pid);
-    state2.bridge_ip = child.container_ip();
-    let all_ips: Vec<(String, String)> = child
-        .container_ips()
-        .into_iter()
-        .map(|(name, ip)| (name.to_string(), ip))
-        .collect();
-    state2.network_ips = all_ips.iter().cloned().collect();
-    write_state(&state2)?;
 
     // Register container with embedded DNS daemon for each bridge network.
     register_dns(&name, &all_ips);
 
+    // Relay threads: pipe container stdout/stderr to our stdout/stderr.
+    // Data only flows after write_state above, satisfying the ordering guarantee.
+    let child_stdout = child.take_stdout();
+    let child_stderr = child.take_stderr();
+    let stdout_relay = std::thread::spawn(move || {
+        if let Some(mut src) = child_stdout {
+            let mut buf = [0u8; 8192];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = io::stdout().write_all(&buf[..n]);
+                        let _ = io::stdout().flush();
+                    }
+                }
+            }
+        }
+    });
+    let stderr_relay = std::thread::spawn(move || {
+        if let Some(mut src) = child_stderr {
+            let mut buf = [0u8; 8192];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = io::stderr().write_all(&buf[..n]);
+                        let _ = io::stderr().flush();
+                    }
+                }
+            }
+        }
+    });
+
     let exit = child.wait().map_err(|e| format!("wait failed: {}", e))?;
     let code = exit.code().unwrap_or(1);
+
+    // Drain relay threads after container exits.
+    let _ = stdout_relay.join();
+    let _ = stderr_relay.join();
 
     // Deregister container from DNS.
     deregister_dns(&name, &all_ips);
@@ -918,10 +958,9 @@ fn run_foreground(
         let dir = super::container_dir(&name);
         let _ = std::fs::remove_dir_all(&dir);
     } else {
-        // Update final state
-        state2.status = ContainerStatus::Exited;
-        state2.exit_code = Some(code);
-        write_state(&state2)?;
+        state.status = ContainerStatus::Exited;
+        state.exit_code = Some(code);
+        write_state(&state)?;
     }
 
     std::process::exit(code);
@@ -1011,6 +1050,15 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(io::Error::last_os_error().into());
     }
 
+    // Sync pipe (issue #124): watcher writes 1 byte after write_state(real_pid) so the
+    // parent blocks until state is durably visible to concurrent `pelagos ps` / exec-into
+    // callers.  O_CLOEXEC closes it in the container grandchild's exec().
+    // [0] = read (parent), [1] = write (watcher).
+    let mut sync_pipe: [i32; 2] = [-1, -1];
+    if unsafe { libc::pipe2(sync_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+
     // Fork a watcher child; parent either streams output (attach mode) or prints name and exits.
     let fork_result = unsafe { libc::fork() };
     match fork_result {
@@ -1025,6 +1073,8 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
                     unsafe { libc::close(slot[0]) };
                 }
             }
+            // Close read end of sync pipe — only the parent reads it.
+            unsafe { libc::close(sync_pipe[0]) };
             // Detach from parent's session so we're adopted by init when parent exits.
             unsafe { libc::setsid() };
 
@@ -1114,6 +1164,13 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             let _ = write_state(&updated);
 
+            // Signal parent: state with real PID is now visible to concurrent
+            // readers.  Parent blocks on sync_pipe[0] until this write (issue #124).
+            unsafe {
+                libc::write(sync_pipe[1], b"\x00".as_ptr() as *const libc::c_void, 1);
+                libc::close(sync_pipe[1]);
+            }
+
             // Register container with embedded DNS daemon.
             register_dns(&name, &all_ips);
 
@@ -1179,6 +1236,23 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if slot[1] >= 0 {
                     unsafe { libc::close(slot[1]) };
                 }
+            }
+
+            // Wait for the watcher to signal that state.json has been written with the
+            // real container PID before we return (or relay output) to the caller.
+            // This eliminates the race between `pelagos run` returning and concurrent
+            // `pelagos ps` / exec-into callers reading a stale pid=0 (issue #124).
+            // In attach mode the attach-pipe mechanism already provides ordering, but
+            // we also wait here to make the guarantee explicit and to avoid SIGPIPE
+            // on the watcher's write end.
+            unsafe { libc::close(sync_pipe[1]) };
+            let mut one = [0u8; 1];
+            let n = unsafe { libc::read(sync_pipe[0], one.as_mut_ptr() as *mut libc::c_void, 1) };
+            unsafe { libc::close(sync_pipe[0]) };
+            if n <= 0 {
+                return Err(
+                    "container failed to start (watcher exited before writing state)".into(),
+                );
             }
 
             if attach_stdout || attach_stderr {
