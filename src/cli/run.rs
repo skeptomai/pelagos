@@ -914,6 +914,7 @@ fn prepare_persistent_upper(
     Ok((cmd, Some(upper)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_foreground(
     name: String,
     rootfs: String,
@@ -1035,6 +1036,7 @@ fn run_foreground(
 // Interactive mode
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_interactive(
     name: String,
     rootfs: String,
