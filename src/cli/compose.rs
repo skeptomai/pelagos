@@ -613,6 +613,7 @@ fn spawn_service(
         spawn_config: None,
         labels: std::collections::HashMap::new(),
         mnt_ns_inode: super::read_mnt_ns_inode(pid),
+        upper_dir: None,
     };
     write_state(&cstate)?;
 
