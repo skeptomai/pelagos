@@ -301,7 +301,15 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             attach_stderr,
         })
     } else if args.interactive {
-        run_interactive(cmd)
+        run_interactive(
+            name,
+            rootfs_label,
+            exe_and_args,
+            cmd,
+            args.rm,
+            Some(spawn_config),
+            labels,
+        )
     } else {
         run_foreground(
             name,
@@ -970,17 +978,79 @@ fn run_foreground(
 // Interactive mode
 // ---------------------------------------------------------------------------
 
-fn run_interactive(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
+fn run_interactive(
+    name: String,
+    rootfs: String,
+    command: Vec<String>,
+    cmd: Command,
+    auto_remove: bool,
+    spawn_config: Option<SpawnConfig>,
+    labels: std::collections::HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = cmd
         .spawn_interactive()
         .map_err(|e| format!("spawn_interactive failed: {}", e))?;
-    match session.run() {
-        Ok(status) => {
-            let code = status.code().unwrap_or(0);
-            std::process::exit(code);
+
+    let pid = session.child.pid();
+
+    // Gather network info and write Running state before the relay starts,
+    // so `pelagos ps` sees the container immediately (mirrors run_foreground).
+    let mnt_ns_inode = super::read_mnt_ns_inode(pid);
+    let bridge_ip = session.child.container_ip();
+    let all_ips: Vec<(String, String)> = session
+        .child
+        .container_ips()
+        .into_iter()
+        .map(|(n, ip)| (n.to_string(), ip))
+        .collect();
+    let network_ips: std::collections::HashMap<String, String> =
+        all_ips.iter().cloned().collect();
+
+    std::fs::create_dir_all(containers_dir())?;
+    let mut state = ContainerState {
+        name: name.clone(),
+        rootfs,
+        status: ContainerStatus::Running,
+        pid,
+        watcher_pid: 0,
+        started_at: super::now_iso8601(),
+        exit_code: None,
+        command: command.clone(),
+        stdout_log: None,
+        stderr_log: None,
+        bridge_ip,
+        network_ips,
+        health: None,
+        health_config: None,
+        spawn_config,
+        labels,
+        mnt_ns_inode,
+    };
+    write_state(&state)?;
+    register_dns(&name, &all_ips);
+
+    let result = session.run();
+
+    deregister_dns(&name, &all_ips);
+
+    let code = match result {
+        Ok(status) => status.code().unwrap_or(0),
+        Err(e) => {
+            eprintln!("interactive session failed: {}", e);
+            1
         }
-        Err(e) => Err(format!("interactive session failed: {}", e).into()),
+    };
+
+    if auto_remove {
+        let dir = super::container_dir(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        state.status = ContainerStatus::Exited;
+        state.exit_code = Some(code);
+        write_state(&state)?;
     }
+
+    std::process::exit(code);
 }
 
 // ---------------------------------------------------------------------------
