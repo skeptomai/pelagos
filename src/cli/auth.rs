@@ -122,7 +122,8 @@ pub(crate) fn call_credential_helper(
     if let Some(prefix) = extra_path_prefix {
         let current = std::env::var_os("PATH").unwrap_or_default();
         let new_path = std::env::join_paths(
-            std::iter::once(prefix.as_os_str()).chain(std::env::split_paths(&current)),
+            std::iter::once(prefix.to_path_buf())
+                .chain(std::env::split_paths(&current)),
         )
         .unwrap_or_default();
         cmd.env("PATH", new_path);
