@@ -665,7 +665,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.push(3);
         buf.extend_from_slice(b"app");
-        buf.push(6);
+        buf.push(7);
         buf.extend_from_slice(b"pelagos");
         buf.push(0);
 
