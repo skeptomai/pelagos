@@ -1,28 +1,38 @@
 //! `pelagos start` — restart an exited container.
 //!
 //! Reads the saved `SpawnConfig` from the container's `state.json`, converts it
-//! back into `RunArgs`, and calls `cmd_run` in detached mode.  The container
-//! always restarts detached; use `pelagos logs -f <name>` to follow output.
+//! back into `RunArgs`, and calls `cmd_run`.
 //!
-//! Overlay semantics: the restarted container gets a fresh upper/work dir on top
-//! of the same image layers.  Writable-layer changes from the previous run are
-//! NOT preserved (future enhancement).
+//! By default the container restarts detached with its original command.
+//! Pass `interactive: true` to run with a PTY attached, and `cmd_override`
+//! to replace the command for this run only (without updating `SpawnConfig`).
 
 use super::run::{cmd_run, RunArgs};
 use super::{read_state, ContainerStatus};
 
 /// Restart one or more exited pelagos containers by name.
 ///
+/// `interactive` — run with a PTY (like `pelagos run -it`).
+/// `cmd_override` — replace the command for this run only (does not update SpawnConfig).
+///
 /// Returns `Ok(())` after all named containers have been started.  If any
 /// name fails the error is returned immediately (remaining names are not started).
-pub fn cmd_start(names: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_start(
+    names: &[String],
+    interactive: bool,
+    cmd_override: Option<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     for name in names {
-        start_one(name)?;
+        start_one(name, interactive, cmd_override.as_deref())?;
     }
     Ok(())
 }
 
-fn start_one(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn start_one(
+    name: &str,
+    interactive: bool,
+    cmd_override: Option<&[String]>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let state = read_state(name).map_err(|_| format!("container '{}' not found", name))?;
 
     match state.status {
@@ -44,7 +54,29 @@ fn start_one(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
-    let run_args = spawn_config_to_run_args(name, sc, &state.rootfs);
+    let mut run_args = spawn_config_to_run_args(name, sc, &state.rootfs);
+
+    // Reuse the persisted writable layer if it still exists on disk.
+    run_args.upper_dir = state.upper_dir.filter(|p| p.is_dir());
+
+    // Apply interactive flag: foreground PTY session instead of detached.
+    if interactive {
+        run_args.detach = false;
+        run_args.interactive = true;
+    }
+
+    // Apply command override: replace positional args while keeping the image prefix.
+    if let Some(cmd) = cmd_override {
+        if !run_args.args.is_empty() && run_args.rootfs.is_none() {
+            // Image container: args = [image_ref, exe, ...args].  Keep image_ref, replace rest.
+            let image = run_args.args[0].clone();
+            run_args.args = std::iter::once(image).chain(cmd.iter().cloned()).collect();
+        } else {
+            // Rootfs container: args = [exe, ...args].  Replace entirely.
+            run_args.args = cmd.to_vec();
+        }
+    }
+
     cmd_run(run_args)
 }
 
@@ -110,5 +142,6 @@ fn spawn_config_to_run_args(
         label: sc.labels,
         attach: vec![],
         sig_proxy: None,
+        upper_dir: None, // set by start_one after this call
     }
 }

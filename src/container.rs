@@ -1904,6 +1904,24 @@ impl Command {
         self
     }
 
+    /// Override the auto-generated upper and work directories for the overlay.
+    ///
+    /// Call this *after* [`with_image_layers`](Self::with_image_layers) to reuse a
+    /// persisted writable layer from a previous container run.  `upper_dir` must
+    /// already exist.  `work_dir` must be an empty directory on the same filesystem
+    /// as `upper_dir` — create and pass a fresh empty directory each run.
+    pub fn with_upper_dir<P1: Into<PathBuf>, P2: Into<PathBuf>>(
+        mut self,
+        upper_dir: P1,
+        work_dir: P2,
+    ) -> Self {
+        if let Some(ref mut ov) = self.overlay {
+            ov.upper_dir = upper_dir.into();
+            ov.work_dir = work_dir.into();
+        }
+        self
+    }
+
     /// Clear the environment for the child process (inherit nothing from parent).
     ///
     /// After calling this, only environment variables set via [`env`](Self::env)

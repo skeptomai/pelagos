@@ -135,9 +135,9 @@ impl std::fmt::Display for ContainerStatus {
 /// Populated by `cmd_run` at container creation and persisted in `state.json`.
 /// On restart, `cmd_start` converts this back into `RunArgs` and calls `cmd_run`.
 ///
-/// Note: the overlay writable layer is NOT preserved between runs. A restarted
-/// container gets a fresh upper dir on top of the same image layers. Filesystem
-/// changes from the previous run are lost (future enhancement: overlay preservation).
+/// Note: the overlay writable layer is preserved between runs for non-`--rm`
+/// containers.  The upper dir lives in the container state directory
+/// (`data_dir/containers/<name>/upper/`) and is reused on `pelagos start`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SpawnConfig {
     /// Image reference used to pull/locate layer dirs (e.g. "ubuntu:22.04").
@@ -259,6 +259,12 @@ pub struct ContainerState {
     /// has been recycled by an unrelated process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mnt_ns_inode: Option<u64>,
+    /// Persisted writable overlay upper dir for this container.
+    ///
+    /// Set for non-`--rm` containers; `pelagos start` passes this back as the
+    /// overlay upper dir so filesystem changes survive stop/start cycles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upper_dir: Option<std::path::PathBuf>,
 }
 
 pub fn now_iso8601() -> String {

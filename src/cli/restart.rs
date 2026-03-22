@@ -37,5 +37,5 @@ pub fn cmd_restart(name: &str, time: u64) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
-    cmd_start(&[name.to_string()])
+    cmd_start(&[name.to_string()], false, None)
 }
