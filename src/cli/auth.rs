@@ -57,7 +57,7 @@ pub fn parse_docker_config(registry: &str) -> Option<(String, String)> {
 
     // 1. Per-registry or global credential helper.
     if let Some(helper) = find_credential_helper(&value, registry) {
-        if let Some(creds) = call_credential_helper(&helper, registry) {
+        if let Some(creds) = call_credential_helper(&helper, registry, None) {
             return Some(creds);
         }
     }
@@ -102,18 +102,33 @@ pub(crate) fn find_credential_helper(config: &serde_json::Value, registry: &str)
 ///
 /// Writes the registry hostname to the helper's stdin, reads JSON from stdout.
 /// Returns `None` if the helper binary is not found or returns an error.
-pub(crate) fn call_credential_helper(helper: &str, registry: &str) -> Option<(String, String)> {
+///
+/// `extra_path_prefix` — if `Some`, prepended to PATH for the subprocess only
+/// (avoids mutating the global process environment, useful in tests).
+pub(crate) fn call_credential_helper(
+    helper: &str,
+    registry: &str,
+    extra_path_prefix: Option<&std::path::Path>,
+) -> Option<(String, String)> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
     let binary = format!("docker-credential-{}", helper);
-    let mut child = Command::new(&binary)
-        .arg("get")
+    let mut cmd = Command::new(&binary);
+    cmd.arg("get")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    if let Some(prefix) = extra_path_prefix {
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = std::env::join_paths(
+            std::iter::once(prefix.to_path_buf())
+                .chain(std::env::split_paths(&current)),
+        )
+        .unwrap_or_default();
+        cmd.env("PATH", new_path);
+    }
+    let mut child = cmd.spawn().ok()?;
 
     // Write registry hostname (bare, without scheme) to stdin.
     let bare = registry
@@ -401,6 +416,7 @@ fn base64_decode(b64: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_base64_roundtrip() {
@@ -428,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_parse_docker_config_synthetic() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let docker_dir = tmp.path().join(".docker");
@@ -458,6 +475,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_auth_env() {
         std::env::set_var("PELAGOS_REGISTRY_USER", "envuser");
         std::env::set_var("PELAGOS_REGISTRY_PASS", "envpass");
@@ -474,6 +492,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_auth_cli_priority() {
         std::env::set_var("PELAGOS_REGISTRY_USER", "envuser");
         std::env::set_var("PELAGOS_REGISTRY_PASS", "envpass");
@@ -490,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_auth_anonymous() {
         std::env::remove_var("PELAGOS_REGISTRY_USER");
         std::env::remove_var("PELAGOS_REGISTRY_PASS");
@@ -548,7 +568,7 @@ mod tests {
     /// Verify `call_credential_helper` parses the JSON output of a fake helper.
     ///
     /// Writes a small shell script that emits the expected JSON on stdout,
-    /// adds the temp dir to PATH, then calls the helper.
+    /// passes the temp dir as extra_path_prefix (no global env mutation).
     #[test]
     fn test_call_credential_helper_get() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -562,14 +582,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Prepend tmp dir to PATH so our fake binary is found.
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{}", tmp.path().display(), original_path);
-        std::env::set_var("PATH", &new_path);
-
-        let result = call_credential_helper("fake-pelagos-test", "ghcr.io");
-
-        std::env::set_var("PATH", original_path);
+        // Pass tmp dir as PATH prefix directly to the subprocess — no global env mutation.
+        let result = call_credential_helper("fake-pelagos-test", "ghcr.io", Some(tmp.path()));
 
         let (u, p) = result.expect("helper should return creds");
         assert_eq!(u, "testuser");
@@ -578,6 +592,7 @@ mod tests {
 
     /// Verify that `parse_docker_config` uses a configured helper over static auths.
     #[test]
+    #[serial]
     fn test_parse_docker_config_uses_helper() {
         let tmp = tempfile::tempdir().expect("tempdir");
 

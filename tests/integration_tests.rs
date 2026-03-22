@@ -1526,7 +1526,7 @@ mod user_notif {
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_proc_mount()
             .with_tmpfs("/tmp", "")
-            .with_seccomp_user_notif(vec![libc::SYS_chmod], DenyAll)
+            .with_seccomp_user_notif(vec![libc::SYS_fchmodat], DenyAll)
             .spawn()
             .expect("spawn failed");
 
@@ -1568,7 +1568,7 @@ mod user_notif {
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_proc_mount()
             .with_tmpfs("/tmp", "")
-            .with_seccomp_user_notif(vec![libc::SYS_chmod], handler)
+            .with_seccomp_user_notif(vec![libc::SYS_fchmodat], handler)
             .spawn()
             .expect("spawn failed");
 
