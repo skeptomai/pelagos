@@ -30,6 +30,7 @@ pub mod ps;
 pub mod relay;
 pub mod rm;
 pub mod rootfs;
+pub mod restart;
 pub mod run;
 pub mod start;
 pub mod stop;

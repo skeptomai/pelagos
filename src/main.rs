@@ -91,6 +91,15 @@ pub(crate) enum CliCommand {
         name: String,
     },
 
+    /// Stop then start a container (running or exited)
+    Restart {
+        /// Container name
+        name: String,
+        /// Seconds to wait for clean exit before sending SIGKILL (default: 10)
+        #[clap(long, short = 't', default_value = "10")]
+        time: u64,
+    },
+
     /// Remove a container
     Rm {
         /// Container name
@@ -437,6 +446,7 @@ fn main() {
             filter,
         } => cli::ps::cmd_ps(all, json || format == OutputFormat::Json, &filter),
         CliCommand::Stop { name } => cli::stop::cmd_stop(&name),
+        CliCommand::Restart { name, time } => cli::restart::cmd_restart(&name, time),
         CliCommand::Rm { name, force } => cli::rm::cmd_rm(&name, force),
         CliCommand::Logs { name, follow } => cli::logs::cmd_logs(&name, follow),
 
