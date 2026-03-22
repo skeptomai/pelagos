@@ -326,6 +326,189 @@ pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             Some(spawn_config),
             labels,
             persistent_upper,
+        )
+    } else {
+        run_foreground(
+            name,
+            rootfs_label,
+            exe_and_args,
+            cmd,
+            args.rm,
+            Some(spawn_config),
+            labels,
+            persistent_upper,
+        )
+    }
+}
+
+/// Set up the persistent overlay upper dir for a non-ephemeral container.
+///
+/// On first run: creates a fresh `upper/` and `work/` under `container_dir(name)`.
+/// On restart: reuses the existing `upper/` (if `existing_upper` is provided and
+/// the directory exists); always recreates `work/` (must be empty at mount time).
+///
+/// Returns `(cmd_with_upper_dir_injected, upper_dir_path)`.
+fn prepare_persistent_upper(
+    name: &str,
+    cmd: Command,
+    existing_upper: Option<&std::path::Path>,
+) -> Result<(Command, Option<PathBuf>), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let container_d = container_dir(name);
+    std::fs::create_dir_all(&container_d)?;
+
+    let upper = match existing_upper {
+        Some(p) if p.is_dir() => p.to_path_buf(),
+        _ => {
+            let u = container_d.join("upper");
+            std::fs::create_dir_all(&u)?;
+            let _ = std::fs::set_permissions(&u, std::fs::Permissions::from_mode(0o755));
+            u
+        }
+    };
+
+    // Work dir must be empty at mount time — recreate it every run.
+    let work = container_d.join("work");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)?;
+    let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755));
+
+    let cmd = cmd.with_upper_dir(&upper, &work);
+    Ok((cmd, Some(upper)))
+}
+
+// ---------------------------------------------------------------------------
+// Foreground mode
+// ---------------------------------------------------------------------------
+
+fn run_foreground(
+    name: String,
+    rootfs: String,
+    command: Vec<String>,
+    mut cmd: Command,
+    auto_remove: bool,
+    spawn_config: Option<SpawnConfig>,
+    labels: std::collections::HashMap<String, String>,
+    upper_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Use Piped for stdout/stderr so we can write state with the real PID
+    // before any container output reaches the caller (issue #124).
+    // stdin stays Inherit so the user's terminal input flows to the container.
+    cmd = cmd
+        .stdin(Stdio::Inherit)
+        .stdout(Stdio::Piped)
+        .stderr(Stdio::Piped);
+
+    std::fs::create_dir_all(containers_dir())?;
+
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
+    let pid = child.pid();
+
+    // Gather network info before writing state.
+    let mnt_ns_inode = super::read_mnt_ns_inode(pid);
+    let bridge_ip = child.container_ip();
+    let all_ips: Vec<(String, String)> = child
+        .container_ips()
+        .into_iter()
+        .map(|(name, ip)| (name.to_string(), ip))
+        .collect();
+    let network_ips: std::collections::HashMap<String, String> = all_ips.iter().cloned().collect();
+
+    // Write state with real PID *before* starting the relay threads.
+    let mut state = ContainerState {
+        name: name.clone(),
+        rootfs,
+        status: ContainerStatus::Running,
+        pid,
+        watcher_pid: 0,
+        started_at: super::now_iso8601(),
+        exit_code: None,
+        command: command.clone(),
+        stdout_log: None,
+        stderr_log: None,
+        bridge_ip,
+        network_ips,
+        health: None,
+        health_config: None,
+        spawn_config,
+        labels,
+        mnt_ns_inode,
+        upper_dir,
+    };
+    write_state(&state)?;
+
+    // Register container with embedded DNS daemon for each bridge network.
+    register_dns(&name, &all_ips);
+
+    // Relay threads: pipe container stdout/stderr to our stdout/stderr.
+    let child_stdout = child.take_stdout();
+    let child_stderr = child.take_stderr();
+    let stdout_relay = std::thread::spawn(move || {
+        if let Some(mut src) = child_stdout {
+            let mut buf = [0u8; 8192];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = io::stdout().write_all(&buf[..n]);
+                        let _ = io::stdout().flush();
+                    }
+                }
+            }
+        }
+    });
+    let stderr_relay = std::thread::spawn(move || {
+        if let Some(mut src) = child_stderr {
+            let mut buf = [0u8; 8192];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = io::stderr().write_all(&buf[..n]);
+                        let _ = io::stderr().flush();
+                    }
+                }
+            }
+        }
+    });
+
+    let exit = child.wait().map_err(|e| format!("wait failed: {}", e))?;
+    let code = exit.code().unwrap_or(1);
+
+    // Drain relay threads after container exits.
+    let _ = stdout_relay.join();
+    let _ = stderr_relay.join();
+
+    // Deregister container from DNS.
+    deregister_dns(&name, &all_ips);
+
+    if auto_remove {
+        // Remove state directory immediately; ignore errors (best-effort).
+        let dir = super::container_dir(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        state.status = ContainerStatus::Exited;
+        state.exit_code = Some(code);
+        write_state(&state)?;
+    }
+
+    std::process::exit(code);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive mode
+// ---------------------------------------------------------------------------
+
+fn run_interactive(
+    name: String,
+    rootfs: String,
+    command: Vec<String>,
+    cmd: Command,
+    auto_remove: bool,
+    spawn_config: Option<SpawnConfig>,
+    labels: std::collections::HashMap<String, String>,
+    upper_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = cmd
         .spawn_interactive()
