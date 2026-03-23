@@ -540,19 +540,8 @@ fn build_image_run(
     Ok((full_ref, exe_and_args, cmd, health_config))
 }
 
-/// Expand bare image names: "alpine" → "docker.io/library/alpine:latest".
 fn normalise_image_reference(reference: &str) -> String {
-    let r = reference.to_string();
-    let r = if !r.contains(':') && !r.contains('@') {
-        format!("{}:latest", r)
-    } else {
-        r
-    };
-    if !r.contains('/') {
-        format!("docker.io/library/{}", r)
-    } else {
-        r
-    }
+    pelagos::image::normalise_reference(reference)
 }
 
 fn build_command(

@@ -195,6 +195,33 @@ impl ImageManifest {
     }
 }
 
+/// Expand a bare image reference to a fully-qualified OCI reference.
+///
+/// Resolution rules:
+/// - If the reference already contains `/` it is returned as-is (already has an
+///   organisation or hostname component).
+/// - Otherwise a `:latest` tag is appended when no `:` or `@` is present, then
+///   the result is prefixed with the *default registry*:
+///   1. The `PELAGOS_DEFAULT_REGISTRY` environment variable (if set).
+///   2. `docker.io/library` — Docker Hub official images (fallback).
+///
+/// Setting `PELAGOS_DEFAULT_REGISTRY=public.ecr.aws/docker/library` redirects
+/// all unqualified pulls to ECR Public, which has no unauthenticated rate limit.
+pub fn normalise_reference(reference: &str) -> String {
+    let r = if !reference.contains(':') && !reference.contains('@') {
+        format!("{}:latest", reference)
+    } else {
+        reference.to_string()
+    };
+    if !r.contains('/') {
+        let default_reg = std::env::var("PELAGOS_DEFAULT_REGISTRY")
+            .unwrap_or_else(|_| "docker.io/library".to_string());
+        format!("{}/{}", default_reg, r)
+    } else {
+        r
+    }
+}
+
 /// Convert an image reference like `"alpine:latest"` to a safe directory name (`"alpine_latest"`).
 pub fn reference_to_dirname(reference: &str) -> String {
     reference.replace([':', '/', '@'], "_")
@@ -564,6 +591,46 @@ pub fn layer_dirs(manifest: &ImageManifest) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalise_reference_bare() {
+        assert_eq!(
+            normalise_reference("alpine"),
+            "docker.io/library/alpine:latest"
+        );
+        assert_eq!(
+            normalise_reference("alpine:3.19"),
+            "docker.io/library/alpine:3.19"
+        );
+        assert_eq!(
+            normalise_reference("ubuntu@sha256:abc"),
+            "docker.io/library/ubuntu@sha256:abc"
+        );
+    }
+
+    #[test]
+    fn test_normalise_reference_qualified() {
+        assert_eq!(
+            normalise_reference("myregistry.io/myorg/myimage:v1"),
+            "myregistry.io/myorg/myimage:v1"
+        );
+        assert_eq!(
+            normalise_reference("public.ecr.aws/docker/library/alpine:latest"),
+            "public.ecr.aws/docker/library/alpine:latest"
+        );
+        assert_eq!(
+            normalise_reference("ghcr.io/myorg/myapp"),
+            "ghcr.io/myorg/myapp:latest"
+        );
+    }
+
+    #[test]
+    fn test_normalise_reference_default_registry_env() {
+        std::env::set_var("PELAGOS_DEFAULT_REGISTRY", "public.ecr.aws/docker/library");
+        let result = normalise_reference("alpine");
+        std::env::remove_var("PELAGOS_DEFAULT_REGISTRY");
+        assert_eq!(result, "public.ecr.aws/docker/library/alpine:latest");
+    }
 
     #[test]
     fn test_blob_path_strips_prefix() {

@@ -439,18 +439,11 @@ fn is_mutable_tag(reference: &str) -> bool {
 }
 
 /// Expand bare image names to fully qualified references.
+///
+/// Delegates to [`pelagos::image::normalise_reference`]; see that function for
+/// the full resolution rules including `PELAGOS_DEFAULT_REGISTRY` support.
 pub fn normalise_reference(reference: &str) -> String {
-    let r = reference.to_string();
-    let r = if !r.contains(':') && !r.contains('@') {
-        format!("{}:latest", r)
-    } else {
-        r
-    };
-    if !r.contains('/') {
-        format!("docker.io/library/{}", r)
-    } else {
-        r
-    }
+    pelagos::image::normalise_reference(reference)
 }
 
 /// Resolve a reference for local-image operations: try the local (un-prefixed)

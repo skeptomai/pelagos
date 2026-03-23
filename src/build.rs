@@ -1983,19 +1983,8 @@ fn compute_manifest_digest(layers: &[String]) -> String {
     format!("sha256:{:x}", hash)
 }
 
-/// Expand bare image names: "alpine" -> "docker.io/library/alpine:latest".
 fn normalise_image_reference(reference: &str) -> String {
-    let r = reference.to_string();
-    let r = if !r.contains(':') && !r.contains('@') {
-        format!("{}:latest", r)
-    } else {
-        r
-    };
-    if !r.contains('/') {
-        format!("docker.io/library/{}", r)
-    } else {
-        r
-    }
+    image::normalise_reference(reference)
 }
 
 // ---------------------------------------------------------------------------

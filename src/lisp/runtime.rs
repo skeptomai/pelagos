@@ -1777,18 +1777,8 @@ fn resolve_image(image_ref: &str) -> Result<(String, image::ImageManifest), Lisp
     Ok((normalised, m))
 }
 
-/// Normalize short image references (e.g. `alpine` → `docker.io/library/alpine:latest`).
 fn normalise_image_reference(r: &str) -> String {
-    let (name, tag) = r.split_once(':').map_or((r, "latest"), |(n, t)| (n, t));
-    if name.contains('/') {
-        if name.contains('.') || name.contains(':') {
-            format!("{}:{}", name, tag)
-        } else {
-            format!("docker.io/{}:{}", name, tag)
-        }
-    } else {
-        format!("docker.io/library/{}:{}", name, tag)
-    }
+    crate::image::normalise_reference(r)
 }
 
 /// Scope a network name to a project (mirrors the binary's `scoped_network_name`).
