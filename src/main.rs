@@ -168,6 +168,9 @@ pub(crate) enum CliCommand {
     /// Remove stale network namespaces, overlay dirs, and temp dirs from dead containers
     Cleanup,
 
+    /// Remove all stopped containers
+    Prune,
+
     // ── OCI lifecycle ─────────────────────────────────────────────────────
     /// OCI lifecycle: create a container (machine interface)
     Create {
@@ -551,6 +554,7 @@ fn main() {
 
         // Cleanup
         CliCommand::Cleanup => cli::cleanup::cmd_cleanup(),
+        CliCommand::Prune => cli::prune::cmd_prune(),
 
         // OCI lifecycle
         CliCommand::Create {
