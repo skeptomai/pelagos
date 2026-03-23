@@ -27,6 +27,7 @@ pub mod image;
 pub mod logs;
 pub mod network;
 pub mod ps;
+pub mod prune;
 pub mod relay;
 pub mod restart;
 pub mod rm;
