@@ -945,12 +945,27 @@ fn run_nft_quiet(script: &str) -> io::Result<()> {
 /// Uses `flock(LOCK_EX)` on the per-network NAT refcount file to serialise
 /// concurrent spawns. IP forwarding is written to `/proc/sys/net/ipv4/ip_forward`
 /// once (never disabled on teardown — other software may rely on it).
-/// Returns `true` if the named network namespace still exists on the host.
+/// Returns `true` if the named network namespace is an *active* kernel namespace.
 ///
-/// Used to detect stale entries in the NAT active-set file left by containers
-/// that exited without calling `disable_nat()` (e.g. due to a process crash).
+/// A simple file-existence check is insufficient: after a VM restart or process
+/// crash, `/run/netns/{name}` may still exist on disk as a regular file (the
+/// bind mount was torn down with the kernel) while the namespace itself is gone.
+/// Such stale files cause DNAT rules for dead containers to accumulate in the
+/// nftables prerouting chain, where the first matching (stale) rule silently
+/// drops forwarded connections.
+///
+/// The `NS_GET_NSTYPE` ioctl (Linux 4.11+) distinguishes a live namespace fd
+/// from a plain regular file: it returns the namespace type on a real nsfs inode
+/// and `ENOTTY` / `EBADF` on anything else.
 fn netns_exists(ns_name: &str) -> bool {
-    std::path::Path::new(&format!("/run/netns/{}", ns_name)).exists()
+    let path = format!("/run/netns/{}", ns_name);
+    let Ok(file) = std::fs::File::open(&path) else {
+        return false;
+    };
+    // NS_GET_NSTYPE = _IO(0xb7, 0x1) — returns namespace type if fd is a live nsfs.
+    const NS_GET_NSTYPE: libc::c_ulong = 0xb701;
+    // SAFETY: ioctl with a read-only query on a file fd; no memory aliasing.
+    unsafe { libc::ioctl(file.as_raw_fd(), NS_GET_NSTYPE) >= 0 }
 }
 
 /// Increment the NAT active set; install nftables rules when the set goes from empty → 1.
@@ -1240,8 +1255,10 @@ fn build_prerouting_script(
 /// concurrent spawns. The network's nft table / prerouting chain are created
 /// idempotently, so this is safe whether NAT is enabled or not.
 ///
-/// Stale entries (whose `/run/netns/{ns_name}` no longer exists) are evicted on
-/// each call — the same crash-safe strategy as `enable_nat`.
+/// Stale entries (whose netns is no longer a live kernel namespace) are evicted
+/// on each call — the same crash-safe strategy as `enable_nat`.  Liveness is
+/// verified via the `NS_GET_NSTYPE` ioctl rather than a plain file-existence
+/// check; plain files survive VM restarts while the kernel namespace is gone.
 fn enable_port_forwards(
     ns_name: &str,
     net: &NetworkDef,
@@ -1261,6 +1278,15 @@ fn enable_port_forwards(
         .open(&pf_path)?;
 
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+
+    // DNAT rules in the PREROUTING chain redirect packets from an external interface
+    // (e.g. eth0) to the container IP on the bridge (pelagos0).  That cross-interface
+    // forwarding requires ip_forward=1 regardless of whether outbound MASQUERADE is
+    // also configured.  Enable it here so that callers do not need to remember to
+    // pass --nat in addition to -p.
+    if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n") {
+        log::warn!("port-forwards: could not enable ip_forward: {}", e);
+    }
 
     // Load existing entries and evict stale ones (crashed containers).
     let existing = read_port_forwards_locked(&mut file)?;
