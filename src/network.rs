@@ -2215,6 +2215,59 @@ mod tests {
         assert!(h3.len() <= 15);
     }
 
+    // ── netns_exists tests ───────────────────────────────────────────────
+
+    /// `netns_exists` must return false for a name with no file at all.
+    #[test]
+    fn test_netns_exists_nonexistent_returns_false() {
+        assert!(!netns_exists("__no_such_netns_xyzzy__"));
+    }
+
+    /// `netns_exists` must return false for a plain regular file.
+    ///
+    /// Regression test for pelagos#145.  Before the fix, `netns_exists` used
+    /// `Path::exists()` which returns true for any file — including the stale
+    /// ext4 directory entries that persist at `/run/netns/` after a VM restart
+    /// (the bind mounts are gone but the filenames remain).  The fix uses
+    /// `NS_GET_NSTYPE` ioctl which fails with ENOTTY on plain files, so only
+    /// live nsfs inodes return true.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_netns_exists_plain_file_returns_false() {
+        use std::io::Write;
+
+        let name = format!("__test_stale_{}", std::process::id());
+        let path = format!("/run/netns/{}", name);
+
+        // Skip gracefully if we can't write to /run/netns/ (non-root or path
+        // absent) — the integration test suite covers the root-only path.
+        if std::fs::create_dir_all("/run/netns").is_err() {
+            eprintln!(
+                "Skipping test_netns_exists_plain_file_returns_false: \
+                 cannot create /run/netns"
+            );
+            return;
+        }
+        let Ok(mut f) = std::fs::File::create(&path) else {
+            eprintln!(
+                "Skipping test_netns_exists_plain_file_returns_false: \
+                 cannot write to /run/netns/"
+            );
+            return;
+        };
+        let _ = f.write_all(b"stale");
+        drop(f);
+
+        let result = netns_exists(&name);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !result,
+            "netns_exists must return false for a plain file (not a live \
+             nsfs inode) — pelagos#145 regression"
+        );
+    }
+
     // ── PortProto tests ──────────────────────────────────────────────────
 
     #[test]

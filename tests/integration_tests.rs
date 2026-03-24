@@ -3710,6 +3710,62 @@ mod networking {
         );
     }
 
+    /// N4-regression: `enable_port_forwards` must set ip_forward=1.
+    ///
+    /// Regression test for pelagos#144.  Before the fix, DNAT'd packets were
+    /// silently dropped because `ip_forward` was 0 — nftables redirects traffic
+    /// from `eth0` to the container IP on `pelagos0`, but the kernel won't
+    /// forward across interfaces without `ip_forward=1`.
+    ///
+    /// This test resets ip_forward to 0, spawns a container with a port
+    /// forward, then asserts the sysctl is 1 immediately after spawn returns.
+    #[test]
+    #[serial(nat)]
+    fn test_ip_forward_enabled_on_port_forward() {
+        if !is_root() {
+            eprintln!("Skipping test_ip_forward_enabled_on_port_forward: requires root");
+            return;
+        }
+
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!(
+                "Skipping test_ip_forward_enabled_on_port_forward: alpine-rootfs not found"
+            );
+            return;
+        };
+
+        // Start from a known bad state: ip_forward disabled.
+        let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "0\n");
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "sleep 2"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(18089, 80)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn port-forward container");
+
+        // enable_port_forwards() runs in the parent during spawn(); by the
+        // time spawn() returns the sysctl must already be 1.
+        let val =
+            std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default();
+
+        child.wait().expect("wait for port-forward container");
+
+        assert_eq!(
+            val.trim(),
+            "1",
+            "ip_forward must be 1 after a container with port-forward starts \
+             (pelagos#144 regression)"
+        );
+    }
+
     /// N4-UDP: `with_port_forward_udp` installs a UDP DNAT rule in nftables.
     ///
     /// Spawns a bridge+NAT container with a UDP port mapping.  The nftables
