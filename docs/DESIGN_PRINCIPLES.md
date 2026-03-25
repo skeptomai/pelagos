@@ -139,6 +139,56 @@ Lima. Lima is an excellent project; that is not the point. The point is
 that pelagos's failure modes and release cadence should belong to
 pelagos.
 
+## 7b. Static musl Binaries
+
+pelagos ships as a **statically linked musl binary** for both
+`aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl`. This is
+the right default for a container runtime and follows naturally from the
+dependency philosophy above.
+
+### Why static musl over dynamic glibc
+
+A dynamically linked glibc binary requires that the *host* system has
+a compatible glibc version. Container runtimes run on diverse hosts —
+Alpine initramfs VMs, minimal Debian, embedded systems — where glibc
+may be absent or version-mismatched. A static musl binary runs
+everywhere with no prerequisites.
+
+The alternative — shipping a dynamic glibc build in addition to the
+musl build — was considered and rejected. Maintaining two ABIs doubles
+the surface area for subtle divergence. The complexity cost is not
+justified when the musl build already covers all real deployment targets.
+
+### C library dependencies are not required
+
+Two common assumptions about container runtimes are wrong for pelagos:
+
+**seccomp**: Most runtimes link against `libseccomp.so`. pelagos uses
+the `seccompiler` crate, which compiles BPF programs in pure Rust with
+no C library dependency. `libseccomp` is not linked.
+
+**capabilities**: Most runtimes link against `libcap.so`. pelagos calls
+`libc::syscall(SYS_capset, ...)` directly. `libcap` is not linked.
+
+**compression**: `bzip2` and `xz2` are linked with
+`features = ["static"]` so the C code compiles into the binary rather
+than linking against system `.so` files.
+
+### Platform-specific type compatibility
+
+musl and glibc define some syscall-adjacent types differently. The
+affected cases in pelagos:
+
+- `rlimit` resource argument: `c_uint` (musl) vs `c_int` (glibc) —
+  gated with `#[cfg(target_env = "gnu")]`
+- `ioctl` request argument: `c_ulong` (musl) vs `c_int` (glibc) —
+  resolved with `as _` cast
+- `statfs.f_type`: `__fsword_t` does not exist in musl headers — use
+  `i64` (the underlying type on aarch64/x86_64)
+
+These are one-time fixes. The musl build is the primary build; the
+glibc path exists only to avoid breaking development on glibc hosts.
+
 ## 8. Test Everything
 
 A feature is not done until it has integration tests in the same commit.
