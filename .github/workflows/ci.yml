@@ -86,5 +86,9 @@ jobs:
         with:
           targets: wasm32-wasip1,wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
+      - name: Install wasmtime
+        run: |
+          curl -fsSL https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
       - name: Run embedded Wasm e2e tests
         run: sudo -E env "PATH=$PATH" bash scripts/test-wasm-embedded-e2e.sh

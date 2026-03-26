@@ -19472,7 +19472,7 @@ mod issue_118_start_returns_promptly {
             .args([
                 "image",
                 "pull",
-                "public.ecr.aws/docker/library/alpine:latest",
+                "docker.io/library/alpine:latest",
             ])
             .output()
             .expect("pelagos image pull");
@@ -19489,7 +19489,7 @@ mod issue_118_start_returns_promptly {
                 "--detach",
                 "--name",
                 name,
-                "public.ecr.aws/docker/library/alpine:latest",
+                "docker.io/library/alpine:latest",
                 "/bin/sh",
                 "-c",
                 "sleep 60",
@@ -19691,7 +19691,7 @@ mod issue_124_run_state_ordering {
             .args([
                 "image",
                 "pull",
-                "public.ecr.aws/docker/library/alpine:latest",
+                "docker.io/library/alpine:latest",
             ])
             .output();
     }
@@ -19728,7 +19728,7 @@ mod issue_124_run_state_ordering {
                 "run",
                 "--name",
                 name,
-                "public.ecr.aws/docker/library/alpine:latest",
+                "docker.io/library/alpine:latest",
                 "/bin/sh",
                 "-c",
                 "echo ready; sleep 10",
@@ -19796,7 +19796,7 @@ mod issue_124_run_state_ordering {
                 "--detach",
                 "--name",
                 name,
-                "public.ecr.aws/docker/library/alpine:latest",
+                "docker.io/library/alpine:latest",
                 "sleep",
                 "30",
             ])
