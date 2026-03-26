@@ -109,6 +109,7 @@ fn spawn_config_to_run_args(
         detach: true,
         rm: false,
         interactive: false,
+        tty: false,
         network: sc.network,
         publish: sc.publish,
         nat: sc.nat,

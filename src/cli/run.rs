@@ -53,6 +53,11 @@ pub struct RunArgs {
     #[clap(long, short = 'i')]
     pub interactive: bool,
 
+    /// Allocate a PTY — accepted for Docker CLI compatibility (`-it`), equivalent to `-i`.
+    /// Pelagos has no "stdin without PTY" mode; `-t` is a no-op alias. (pelagos#149)
+    #[clap(long = "tty", short = 't')]
+    pub tty: bool,
+
     /// Network mode (repeatable for multi-network): none, loopback, bridge, pasta, or named
     /// First value is primary; additional values attach secondary bridge interfaces.
     #[clap(long)]
@@ -197,7 +202,11 @@ pub struct RunArgs {
     pub args: Vec<String>,
 }
 
-pub fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // -t/--tty is a no-op alias for -i/--interactive (pelagos#149).
+    if args.tty {
+        args.interactive = true;
+    }
     if args.detach && args.interactive {
         return Err("--detach and --interactive are mutually exclusive".into());
     }
