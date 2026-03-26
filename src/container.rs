@@ -4882,42 +4882,48 @@ impl Command {
             });
         }
 
-        // ── Subprocess path: fallback when embedded-wasm feature is off ──
-        let extra_args: Vec<std::ffi::OsString> =
-            self.inner.get_args().map(|a| a.to_owned()).collect();
+        // ── Subprocess path: used when embedded-wasm feature is off ──
+        // When embedded-wasm is on the block above always returns; this code is
+        // unreachable in that configuration but must remain for type-checking.
+        #[allow(unreachable_code)]
+        {
+            let extra_args: Vec<std::ffi::OsString> =
+                self.inner.get_args().map(|a| a.to_owned()).collect();
 
-        let stdin = match self.stdio_in {
-            Stdio::Inherit => std::process::Stdio::inherit(),
-            Stdio::Null => std::process::Stdio::null(),
-            Stdio::Piped => std::process::Stdio::piped(),
-        };
-        let stdout = match self.stdio_out {
-            Stdio::Inherit => std::process::Stdio::inherit(),
-            Stdio::Null => std::process::Stdio::null(),
-            Stdio::Piped => std::process::Stdio::piped(),
-        };
-        let stderr = match self.stdio_err {
-            Stdio::Inherit => std::process::Stdio::inherit(),
-            Stdio::Null => std::process::Stdio::null(),
-            Stdio::Piped => std::process::Stdio::piped(),
-        };
+            let stdin = match self.stdio_in {
+                Stdio::Inherit => std::process::Stdio::inherit(),
+                Stdio::Null => std::process::Stdio::null(),
+                Stdio::Piped => std::process::Stdio::piped(),
+            };
+            let stdout = match self.stdio_out {
+                Stdio::Inherit => std::process::Stdio::inherit(),
+                Stdio::Null => std::process::Stdio::null(),
+                Stdio::Piped => std::process::Stdio::piped(),
+            };
+            let stderr = match self.stdio_err {
+                Stdio::Inherit => std::process::Stdio::inherit(),
+                Stdio::Null => std::process::Stdio::null(),
+                Stdio::Piped => std::process::Stdio::piped(),
+            };
 
-        let inner = crate::wasm::spawn_wasm(&prog_path, &extra_args, &wasi, stdin, stdout, stderr)
-            .map_err(Error::Io)?;
+            let inner =
+                crate::wasm::spawn_wasm(&prog_path, &extra_args, &wasi, stdin, stdout, stderr)
+                    .map_err(Error::Io)?;
 
-        Ok(Child {
-            inner: ChildInner::Process(inner),
-            cgroup: None,
-            network: None,
-            secondary_networks: Vec::new(),
-            pasta: None,
-            overlay_merged_dir: None,
-            dns_temp_dir: None,
-            hosts_temp_dir: None,
-            fuse_overlay_child: None,
-            fuse_overlay_merged: None,
-            supervisor_thread: None,
-        })
+            Ok(Child {
+                inner: ChildInner::Process(inner),
+                cgroup: None,
+                network: None,
+                secondary_networks: Vec::new(),
+                pasta: None,
+                overlay_merged_dir: None,
+                dns_temp_dir: None,
+                hosts_temp_dir: None,
+                fuse_overlay_child: None,
+                fuse_overlay_merged: None,
+                supervisor_thread: None,
+            })
+        }
     }
 
     /// Spawn the container with a PTY for proper session isolation.
