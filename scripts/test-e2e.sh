@@ -471,16 +471,29 @@ OUT=$($BINARY run --ulimit nofile=16:16 alpine /bin/sh -c 'ulimit -n' 2>&1 || tr
 check_contains "$OUT" "16" "ulimit nofile=16"
 
 echo "--- Test: --memory 128m ---"
-OUT=$($BINARY run --memory 128m alpine /bin/echo mem-ok 2>&1 || true)
-check_contains "$OUT" "mem-ok" "memory 128m"
+CGROUP_CONTROLLERS="$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)"
+if echo "$CGROUP_CONTROLLERS" | grep -q "memory"; then
+    OUT=$($BINARY run --memory 128m alpine /bin/echo mem-ok 2>&1 || true)
+    check_contains "$OUT" "mem-ok" "memory 128m"
+else
+    skip "memory 128m (memory cgroup controller not delegated)"
+fi
 
 echo "--- Test: --pids-limit 32 ---"
-OUT=$($BINARY run --pids-limit 32 alpine /bin/echo pids-ok 2>&1 || true)
-check_contains "$OUT" "pids-ok" "pids-limit 32"
+if echo "$CGROUP_CONTROLLERS" | grep -q "pids"; then
+    OUT=$($BINARY run --pids-limit 32 alpine /bin/echo pids-ok 2>&1 || true)
+    check_contains "$OUT" "pids-ok" "pids-limit 32"
+else
+    skip "pids-limit 32 (pids cgroup controller not delegated)"
+fi
 
 echo "--- Test: --cpus 0.5 ---"
-OUT=$($BINARY run --cpus 0.5 alpine /bin/echo cpu-ok 2>&1 || true)
-check_contains "$OUT" "cpu-ok" "cpus 0.5"
+if echo "$CGROUP_CONTROLLERS" | grep -q "cpu"; then
+    OUT=$($BINARY run --cpus 0.5 alpine /bin/echo cpu-ok 2>&1 || true)
+    check_contains "$OUT" "cpu-ok" "cpus 0.5"
+else
+    skip "cpus 0.5 (cpu cgroup controller not delegated)"
+fi
 
 # ===================================================================
 echo ""

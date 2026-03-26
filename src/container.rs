@@ -4803,33 +4803,86 @@ impl Command {
         // ── Embedded path: available when feature is on and all stdio is Inherit ──
         #[cfg(feature = "embedded-wasm")]
         {
-            let use_embedded = matches!(
-                (&self.stdio_in, &self.stdio_out, &self.stdio_err),
-                (Stdio::Inherit, Stdio::Inherit, Stdio::Inherit)
-            );
-            if use_embedded {
-                let extra_args: Vec<std::ffi::OsString> =
-                    self.inner.get_args().map(|a| a.to_owned()).collect();
-                let handle = std::thread::spawn(move || {
-                    crate::wasm::run_wasm_embedded(&prog_path, &extra_args, &wasi)
-                });
-                return Ok(Child {
-                    inner: ChildInner::Embedded(Some(handle)),
-                    cgroup: None,
-                    network: None,
-                    secondary_networks: Vec::new(),
-                    pasta: None,
-                    overlay_merged_dir: None,
-                    dns_temp_dir: None,
-                    hosts_temp_dir: None,
-                    fuse_overlay_child: None,
-                    fuse_overlay_merged: None,
-                    supervisor_thread: None,
-                });
-            }
+            use std::os::unix::io::{FromRawFd, OwnedFd};
+
+            // Create OS pipes for any Piped stdio channel so the relay threads
+            // in cli/run.rs can stream output from the embedded Wasm thread.
+            // The write-ends are dup2'd into the thread before wasmtime runs;
+            // the read-ends are returned as ChildStdout/ChildStderr.
+            //
+            // Safety: pipe2() returns valid fds; we immediately wrap them in
+            // OwnedFd / ChildStdout so they are closed on drop. dup2() in the
+            // thread is safe here because each `pelagos run` invocation is a
+            // separate process, so no concurrent threads are writing to fd 1/2.
+            let (stdout_read, stdout_write) = if matches!(self.stdio_out, Stdio::Piped) {
+                let mut fds = [-1i32; 2];
+                // SAFETY: fds is a valid 2-element array.
+                if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+                    let r =
+                        unsafe { std::process::ChildStdout::from(OwnedFd::from_raw_fd(fds[0])) };
+                    (Some(r), Some(fds[1]))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            let (stderr_read, stderr_write) = if matches!(self.stdio_err, Stdio::Piped) {
+                let mut fds = [-1i32; 2];
+                // SAFETY: fds is a valid 2-element array.
+                if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+                    let r =
+                        unsafe { std::process::ChildStderr::from(OwnedFd::from_raw_fd(fds[0])) };
+                    (Some(r), Some(fds[1]))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            let extra_args: Vec<std::ffi::OsString> =
+                self.inner.get_args().map(|a| a.to_owned()).collect();
+            let handle = std::thread::spawn(move || {
+                // Redirect stdout/stderr to the pipe write-ends so the relay
+                // threads in cli/run.rs receive output from the Wasm module.
+                if let Some(wfd) = stdout_write {
+                    // SAFETY: wfd is a valid open fd; dup2 and close are always safe.
+                    unsafe {
+                        libc::dup2(wfd, libc::STDOUT_FILENO);
+                        libc::close(wfd);
+                    }
+                }
+                if let Some(wfd) = stderr_write {
+                    // SAFETY: same as above.
+                    unsafe {
+                        libc::dup2(wfd, libc::STDERR_FILENO);
+                        libc::close(wfd);
+                    }
+                }
+                crate::wasm::run_wasm_embedded(&prog_path, &extra_args, &wasi)
+            });
+            return Ok(Child {
+                inner: ChildInner::Embedded {
+                    handle: Some(handle),
+                    stdout: stdout_read,
+                    stderr: stderr_read,
+                },
+                cgroup: None,
+                network: None,
+                secondary_networks: Vec::new(),
+                pasta: None,
+                overlay_merged_dir: None,
+                dns_temp_dir: None,
+                hosts_temp_dir: None,
+                fuse_overlay_child: None,
+                fuse_overlay_merged: None,
+                supervisor_thread: None,
+            });
         }
 
-        // ── Subprocess path: fallback (piped stdio, feature off, or non-Inherit stdio) ──
+        // ── Subprocess path: fallback when embedded-wasm feature is off ──
         let extra_args: Vec<std::ffi::OsString> =
             self.inner.get_args().map(|a| a.to_owned()).collect();
 
@@ -6870,8 +6923,14 @@ pub(crate) enum ChildInner {
     ///
     /// The thread returns the WASI exit code as `i32`.
     /// Wrapped in `Option` so it can be taken by value in `wait()`.
+    /// stdout/stderr are the read-ends of OS pipes when Stdio::Piped was
+    /// requested; the write-ends are dup2'd into the thread before wasmtime runs.
     #[cfg(feature = "embedded-wasm")]
-    Embedded(Option<std::thread::JoinHandle<i32>>),
+    Embedded {
+        handle: Option<std::thread::JoinHandle<i32>>,
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
+    },
 }
 
 pub struct Child {
@@ -6926,7 +6985,7 @@ impl Child {
         match &self.inner {
             ChildInner::Process(c) => c.id() as i32,
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => 0,
+            ChildInner::Embedded { .. } => 0,
         }
     }
 
@@ -6996,7 +7055,7 @@ impl Child {
         match &mut self.inner {
             ChildInner::Process(c) => c.stdout.take(),
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => None,
+            ChildInner::Embedded { stdout, .. } => stdout.take(),
         }
     }
 
@@ -7008,7 +7067,7 @@ impl Child {
         match &mut self.inner {
             ChildInner::Process(c) => c.stderr.take(),
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => None,
+            ChildInner::Embedded { stderr, .. } => stderr.take(),
         }
     }
 
@@ -7019,7 +7078,7 @@ impl Child {
         match &mut self.inner {
             ChildInner::Process(c) => c.wait().map_err(Error::Wait),
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(h) => {
+            ChildInner::Embedded { handle: h, .. } => {
                 let code = h
                     .take()
                     .expect("wait_inner() called twice on embedded child")
@@ -7080,8 +7139,13 @@ impl Child {
                 }
             }
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(_) => {
-                // Embedded P3a: inherit stdio only; no piped buffers.
+            ChildInner::Embedded { stdout, stderr, .. } => {
+                if let Some(mut out) = stdout.take() {
+                    let _ = out.read_to_end(&mut stdout_buf);
+                }
+                if let Some(mut err) = stderr.take() {
+                    let _ = err.read_to_end(&mut stderr_buf);
+                }
             }
         }
         let status = self.wait_inner()?;
@@ -7211,7 +7275,7 @@ impl Drop for Child {
                 let _ = c.wait();
             }
             #[cfg(feature = "embedded-wasm")]
-            ChildInner::Embedded(h) => {
+            ChildInner::Embedded { handle: h, .. } => {
                 // Detach: thread completes on its own (cannot kill a thread safely).
                 drop(h.take());
             }
