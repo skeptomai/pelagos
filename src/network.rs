@@ -2003,7 +2003,26 @@ pub fn teardown_pasta_network(setup: &mut PastaSetup) {
     if let Some(thread) = setup.output_thread.take() {
         match thread.join() {
             Ok(out) if !out.trim().is_empty() => {
-                log::warn!("pasta output:\n{}", out.trim());
+                // Strip \r so pasta's \r\n line endings don't garble the terminal.
+                let cleaned = out
+                    .lines()
+                    .map(|l| l.trim_end_matches('\r'))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let cleaned = cleaned.trim();
+                // Log at warn only if pasta printed something that looks like an
+                // error; its normal startup summary is purely informational.
+                let looks_like_error = cleaned
+                    .lines()
+                    .any(|l| {
+                        let l = l.to_ascii_lowercase();
+                        l.contains("error") || l.contains("fatal") || l.contains("failed")
+                    });
+                if looks_like_error {
+                    log::warn!("pasta output:\n{}", cleaned);
+                } else {
+                    log::debug!("pasta output:\n{}", cleaned);
+                }
             }
             Ok(_) => {
                 log::debug!("pasta output: (empty)");
