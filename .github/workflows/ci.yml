@@ -75,7 +75,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
-        with:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - name: Install wasmtime
@@ -94,7 +93,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.0"
-        with:
           targets: wasm32-wasip1,wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - name: Install wasmtime
