@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::paths::containers_dir;
+use super::containers_dir;
 
 // ---------------------------------------------------------------------------
 // Wire types (must match GuestEvent / ContainerSnapshot in pelagos-guest)
@@ -23,13 +23,11 @@ use crate::paths::containers_dir;
 struct ContainerSnapshot {
     name: String,
     status: String,
-    #[serde(default)]
     pid: i32,
     rootfs: String,
     started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
-    #[serde(default)]
     ports: Vec<String>,
 }
 
@@ -201,34 +199,19 @@ fn emit(event: &Event) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-fn install_signal_handler() -> Arc<AtomicBool> {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = Arc::clone(&running);
+static RUNNING: AtomicBool = AtomicBool::new(true);
 
-    // Use nix to register SIGINT + SIGTERM handlers that set the flag.
-    // Safety: the handler only stores to an AtomicBool — async-signal-safe.
+extern "C" fn handle_signal(_: libc::c_int) {
+    // async-signal-safe: only stores to an AtomicBool.
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
+fn install_signal_handler() {
     unsafe {
         let handler = nix::sys::signal::SigHandler::Handler(handle_signal);
         let _ = nix::sys::signal::signal(nix::sys::signal::Signal::SIGINT, handler);
         let _ = nix::sys::signal::signal(nix::sys::signal::Signal::SIGTERM, handler);
-    }
-
-    // Store the Arc globally so the handler can reach it.
-    *RUNNING.lock().unwrap() = Some(r);
-
-    running
-}
-
-static RUNNING: std::sync::LazyLock<std::sync::Mutex<Option<Arc<AtomicBool>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-
-extern "C" fn handle_signal(_: libc::c_int) {
-    if let Ok(guard) = RUNNING.lock() {
-        if let Some(flag) = guard.as_ref() {
-            flag.store(false, Ordering::SeqCst);
-        }
     }
 }
 
@@ -237,7 +220,7 @@ extern "C" fn handle_signal(_: libc::c_int) {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_subscribe() -> Result<(), Box<dyn std::error::Error>> {
-    let running = install_signal_handler();
+    install_signal_handler();
 
     // Snapshot on connect.
     let mut prev = read_snapshots();
@@ -250,7 +233,7 @@ pub fn cmd_subscribe() -> Result<(), Box<dyn std::error::Error>> {
     let poll_interval = Duration::from_millis(250);
     let mut last_heartbeat = Instant::now();
 
-    while running.load(Ordering::SeqCst) {
+    while RUNNING.load(Ordering::SeqCst) {
         std::thread::sleep(poll_interval);
 
         let current = read_snapshots();
