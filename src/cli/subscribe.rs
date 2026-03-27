@@ -387,15 +387,12 @@ mod tests {
         let current = vec![make_snapshot("gamma", "exited", 0, "/rootfs")];
         let events = diff(&[], &current);
         assert_eq!(events.len(), 2);
-        let types: Vec<&str> = events
+        let types: Vec<String> = events
             .iter()
             .map(|e| event_json(e)["type"].as_str().unwrap().to_string())
-            .collect::<Vec<String>>()
-            .iter()
-            .map(|s| s.as_str())
             .collect();
-        assert!(types.contains(&"container_started"));
-        assert!(types.contains(&"container_exited"));
+        assert!(types.iter().any(|t| t == "container_started"));
+        assert!(types.iter().any(|t| t == "container_exited"));
     }
 
     #[test]
