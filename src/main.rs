@@ -164,6 +164,10 @@ pub(crate) enum CliCommand {
         cmd: ContainerCmd,
     },
 
+    // ── Subscribe ─────────────────────────────────────────────────────────
+    /// Stream container state events as NDJSON (for TUI clients)
+    Subscribe,
+
     // ── Cleanup ────────────────────────────────────────────────────────────
     /// Remove stale network namespaces, overlay dirs, and temp dirs from dead containers
     Cleanup,
@@ -551,6 +555,9 @@ fn main() {
 
         // Compose
         CliCommand::Compose { cmd } => cli::compose::cmd_compose(cmd),
+
+        // Subscribe
+        CliCommand::Subscribe => cli::subscribe::cmd_subscribe(),
 
         // Cleanup
         CliCommand::Cleanup => cli::cleanup::cmd_cleanup(),
