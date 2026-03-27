@@ -10,7 +10,7 @@ plus a Rust library API for embedding container isolation into your own programs
 ### Install
 
 ```bash
-git clone https://github.com/skeptomai/pelagos.git
+git clone https://github.com/pelagos-containers/pelagos.git
 cd pelagos
 
 # Option A: Install to /usr/local/bin (recommended)
@@ -24,7 +24,7 @@ sudo cargo install --path . --root /usr/local
 ```
 
 You can also download a pre-built binary from the
-[Releases](https://github.com/skeptomai/pelagos/releases) page and copy it
+[Releases](https://github.com/pelagos-containers/pelagos/releases) page and copy it
 to a directory on your PATH.
 
 Verify the installation:

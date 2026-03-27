@@ -108,4 +108,4 @@ default allowlist.
 
 Please report security vulnerabilities via GitHub Issues with the `security` label,
 or by opening a private security advisory at:
-https://github.com/skeptomai/pelagos/security/advisories/new
+https://github.com/pelagos-containers/pelagos/security/advisories/new
