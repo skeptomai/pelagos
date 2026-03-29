@@ -524,6 +524,15 @@ pub fn filter_from_oci(config: &crate::oci::OciSeccomp) -> Result<BpfProgram, io
         }
         if match_action.is_none() {
             match_action = Some(action.clone());
+        } else if Some(&action) != match_action.as_ref() {
+            // seccompiler supports only one match_action per filter.  Rules
+            // whose action differs from the first non-default action seen are
+            // silently dropped.  See issue #166 for the proper multi-filter fix.
+            log::warn!(
+                "seccomp: OCI rule action {:?} differs from filter match_action {:?} — rule(s) for {:?} dropped (issue #166)",
+                rule.action, match_action, rule.names
+            );
+            continue;
         }
         for name in &rule.names {
             if let Ok(num) = syscall_number(name) {
