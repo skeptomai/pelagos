@@ -145,9 +145,6 @@ pub fn docker_default_filter() -> Result<BpfProgram, io::Error> {
         "move_pages",    // Move process pages
         // Quota manipulation
         "quotactl", // Filesystem quotas
-        // User namespace credential manipulation (when not using user namespaces)
-        "setuid", // Set user ID (blocked by default, allowed with conditions in real Docker)
-        "setgid", // Set group ID
         // Architecture-specific personality (can bypass security)
         "personality", // Set execution domain
         // ACCT and system accounting
@@ -237,8 +234,6 @@ pub fn docker_iouring_filter() -> Result<BpfProgram, io::Error> {
         "migrate_pages",
         "move_pages",
         "quotactl",
-        "setuid",
-        "setgid",
         "personality",
         "acct",
         "lookup_dcookie",
