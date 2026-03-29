@@ -99,9 +99,9 @@
       (if (and (not (null? args)) (pair? (car args)))
           ;; All values are pairs (proper or dotted) — one service option per sub-value.
           (map (lambda (sub)
-                 (if (list? sub)
-                     `(list ',sym ,@sub)              ; proper list: splice all items
-                     `(list ',sym ,(car sub) ,(cdr sub)))) ; dotted pair: key . val
+                 (if (and (list? sub) (= (length sub) 2))
+                     `(list ',sym ,@sub)              ; 2-element list (key val): splice
+                     `(list ',sym ,(car sub) ,(cdr sub)))) ; dotted pair or complex cdr: key . val
                args)
           ;; Atom values → a single service option with all args.
           (list `(list ',sym ,@args)))))

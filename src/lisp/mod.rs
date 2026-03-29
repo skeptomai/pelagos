@@ -754,6 +754,126 @@ mod tests {
         }
     }
 
+    // ── define-service: dotted-pair env values with complex expressions (issue #159) ──
+
+    #[test]
+    fn test_define_service_env_dotted_pair_with_let() {
+        // Regression test for issue #159: a `let` expression as the cdr of a
+        // dotted-pair env value was treated as an unbound variable because the
+        // S-expression `("K" . (let ...))` is indistinguishable from `("K" let ...)`
+        // at the Value level (both are proper-list Pair chains).  The fix checks
+        // `(= (length sub) 2)` before taking the `,@sub` splice branch so that
+        // a list-valued cdr is kept together as a single expression rather than
+        // being spliced apart.
+        let mut i = interp();
+        eval_ok(&mut i, r#"(define base-val "hello")"#);
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("MY_VAR" . (let ((v base-val)) (if (null? v) "default" v))))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(
+                    s.env.get("MY_VAR").map(String::as_str),
+                    Some("hello"),
+                    "let expression in dotted-pair env value must be evaluated"
+                );
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_env_dotted_pair_with_if() {
+        // Guards against regression for other special forms used as dotted-pair
+        // cdr values.  `if` is a special form; before the fix it would have
+        // triggered "unbound variable: if" for the same reason as `let`.
+        let mut i = interp();
+        eval_ok(&mut i, r#"(define flag #t)"#);
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("MODE" . (if flag "production" "development")))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(
+                    s.env.get("MODE").map(String::as_str),
+                    Some("production"),
+                    "if expression in dotted-pair env value must be evaluated"
+                );
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_env_2element_list_unchanged() {
+        // The 2-element proper-list form ("K" "v") must continue to work after
+        // the length-check fix.  This is the primary documented syntax for
+        // env key-value pairs.
+        let mut i = interp();
+        eval_ok(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("FOO" "bar") ("BAZ" "qux"))"#,
+        );
+        let v = eval_ok(&mut i, "svc");
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.env.get("FOO").map(String::as_str), Some("bar"));
+                assert_eq!(s.env.get("BAZ").map(String::as_str), Some("qux"));
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+    }
+
+    #[test]
+    fn test_define_service_env_3element_sublist_errors() {
+        // A 3-element list `("K" "a" "b")` is ambiguous: the writer may have
+        // intended a dotted pair `("K" . "a")` with an extra stray token, or a
+        // multi-value form that has no documented meaning.
+        //
+        // OLD behaviour (`,@sub` for all proper lists): silently set K="a" and
+        // dropped "b" — a data-loss bug with no error.
+        //
+        // NEW behaviour (length-2 check): the `,(car sub) ,(cdr sub)` branch
+        // fires, producing `(list 'env "K" ("a" "b"))`.  The cdr `("a" "b")`
+        // is unquoted as a code form and evaluated as a function call, where
+        // `"a"` is not a procedure → "not a procedure: string".  This is still
+        // an error (good — the input is wrong), just earlier in the pipeline.
+        // Surfacing any error is strictly better than silent data loss.
+        let mut i = interp();
+        let err = eval_err(
+            &mut i,
+            r#"(define-service svc "myapp"
+                 :image "myapp:latest"
+                 :network "backend"
+                 :env ("MY_VAR" "a" "b"))"#,
+        );
+        assert!(
+            !err.is_empty(),
+            "3-element env sublist must produce an error, not silently drop data"
+        );
+        // The exact message depends on evaluation order but must not be empty.
+        // Document the current message so future changes don't silently revert
+        // to the old silent-data-loss behaviour.
+        assert!(
+            err.contains("not a procedure") || err.contains("expected string"),
+            "unexpected error message for 3-element env sublist: {}",
+            err
+        );
+    }
+
     #[test]
     fn test_on_ready_hook_registered() {
         let mut i = interp();
