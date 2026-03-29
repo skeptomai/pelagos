@@ -1039,9 +1039,7 @@ mod tests {
         std::env::remove_var("GRAFANA_LOG_LEVEL");
         std::env::remove_var("PROM_RETENTION");
 
-        let src = include_str!(
-            "../../examples/compose/monitoring-inline-let/compose.reml"
-        );
+        let src = include_str!("../../examples/compose/monitoring-inline-let/compose.reml");
         let mut i = interp();
         i.eval_str(src)
             .expect("monitoring-inline-let compose.reml failed to eval");
@@ -1076,7 +1074,10 @@ mod tests {
         // ── inline-let defaults ───────────────────────────────────────────
         // GRAFANA_PASSWORD unset → "admin"
         assert_eq!(
-            grafana.env.get("GF_SECURITY_ADMIN_PASSWORD").map(String::as_str),
+            grafana
+                .env
+                .get("GF_SECURITY_ADMIN_PASSWORD")
+                .map(String::as_str),
             Some("admin"),
             "inline let should default GF_SECURITY_ADMIN_PASSWORD to 'admin'"
         );
@@ -1094,7 +1095,10 @@ mod tests {
         );
         // Static env entries still work alongside inline-let entries.
         assert_eq!(
-            grafana.env.get("GF_USERS_ALLOW_SIGN_UP").map(String::as_str),
+            grafana
+                .env
+                .get("GF_USERS_ALLOW_SIGN_UP")
+                .map(String::as_str),
             Some("false")
         );
 
@@ -1123,7 +1127,10 @@ mod tests {
         let grafana2 = spec2.services.iter().find(|s| s.name == "grafana").unwrap();
 
         assert_eq!(
-            grafana2.env.get("GF_SECURITY_ADMIN_PASSWORD").map(String::as_str),
+            grafana2
+                .env
+                .get("GF_SECURITY_ADMIN_PASSWORD")
+                .map(String::as_str),
             Some("s3cr3t"),
             "GRAFANA_PASSWORD env var should override the inline-let default"
         );
