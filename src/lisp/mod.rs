@@ -875,6 +875,33 @@ mod tests {
     }
 
     #[test]
+    fn test_service_builtin_stop_grace_period() {
+        // (stop-grace-period N) sets ServiceSpec.stop_grace_period; absent = None.
+        let mut i = interp();
+        let v = eval_ok(
+            &mut i,
+            r#"(service "s"
+                 (list 'image "img:1")
+                 (list 'stop-grace-period 30))"#,
+        );
+        match v {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.stop_grace_period, Some(30), "stop_grace_period not set");
+            }
+            _ => panic!("expected ServiceSpec, got: {}", v),
+        }
+
+        // Absent → None.
+        let v2 = eval_ok(&mut i, r#"(service "s2" (list 'image "img:1"))"#);
+        match v2 {
+            Value::ServiceSpec(s) => {
+                assert_eq!(s.stop_grace_period, None);
+            }
+            _ => panic!("expected ServiceSpec"),
+        }
+    }
+
+    #[test]
     fn test_on_ready_hook_registered() {
         let mut i = interp();
         eval_ok(&mut i, r#"(on-ready "db" (lambda () (log "db is ready")))"#);

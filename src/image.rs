@@ -149,6 +149,10 @@ pub struct ImageConfig {
     /// Key-value labels (Docker `LABEL`).
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Signal used to stop the container (Docker `STOPSIGNAL`), e.g. `"SIGTERM"` or `"15"`.
+    /// Empty string means SIGTERM (the default when the image omits the field).
+    #[serde(default)]
+    pub stop_signal: String,
     /// Health check configuration (from `HEALTHCHECK` instruction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthConfig>,
@@ -689,6 +693,7 @@ mod tests {
                 working_dir: String::new(),
                 user: String::new(),
                 labels: HashMap::new(),
+                stop_signal: String::new(),
                 healthcheck: None,
             },
         };
@@ -713,6 +718,7 @@ mod tests {
                 working_dir: String::new(),
                 user: String::new(),
                 labels: HashMap::new(),
+                stop_signal: String::new(),
                 healthcheck: None,
             },
         };

@@ -68,6 +68,7 @@ pub fn register_pelagos_builtins(
                     cap_drop: Vec::new(),
                     apparmor_profile: None,
                     selinux_label: None,
+                    stop_grace_period: None,
                 };
                 parse_service_opts(&mut spec, &args[1..])?;
                 if spec.image.is_empty() {
@@ -428,6 +429,18 @@ fn apply_service_opt(spec: &mut ServiceSpec, key: &str, vals: &[Value]) -> Resul
             for v in vals {
                 spec.cap_drop.push(str_or_sym("cap-drop", v)?);
             }
+        }
+        "stop-grace-period" => {
+            let secs = match vals.first() {
+                Some(Value::Int(n)) => u64::try_from(*n)
+                    .map_err(|_| LispError::new("stop-grace-period: value out of range"))?,
+                _ => {
+                    return Err(LispError::new(
+                        "stop-grace-period: expected a non-negative integer",
+                    ))
+                }
+            };
+            spec.stop_grace_period = Some(secs);
         }
         other => {
             return Err(LispError::new(format!(

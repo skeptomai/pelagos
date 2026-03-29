@@ -3212,6 +3212,12 @@ impl Command {
                     }
                 }
 
+                // Pre-step: Become a process group leader so that compose/stop can
+                // kill the entire container subtree (including shell-entrypoint children)
+                // via kill(-pid, sig).  Safe for all spawn paths: in PTY mode setsid()
+                // runs shortly after and supersedes this; everywhere else pgid == pid.
+                libc::setpgid(0, 0);
+
                 // Step 0: For non-PID-namespace containers (single fork), add ourselves
                 // to the pre-created cgroup immediately so all subsequent memory
                 // allocations (including from exec'd code) are charged to it.

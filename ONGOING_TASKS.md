@@ -1,6 +1,232 @@
 # Ongoing Tasks
 
-All work is tracked in GitHub Issues. This file is a brief index.
+## In-progress: feat/compose-fixes-160-161-169
+
+### Issues targeted
+
+| # | Title | Kind |
+|---|-------|------|
+| #160 | feat: compose should auto-pull missing images on `compose up` | feat |
+| #161 | feat: compose should deregister ports on down/failure (Linux scope) | fix |
+| #169 | fix: compose down should wait for volumes to flush before SIGKILL | fix |
+
+Branch: `feat/compose-fixes-160-161-169`
+
+---
+
+### #169 — Process group kill + `stop_grace_period`
+
+**Root cause (primary):** `cmd_compose_down` sends `SIGTERM`/`SIGKILL` to `svc_state.pid`,
+which is the PID of the container's init process — typically a shell script entrypoint
+(`/run.sh`). That shell does not forward `SIGTERM` to the real process (prometheus, grafana,
+etc). When `SIGKILL` is sent, it kills the shell, but the actual prometheus binary is
+orphaned — re-parented to the compose subreaper — and continues running, holding the TSDB
+`flock()` on `/prometheus/lock`. The next `compose up` starts a new prometheus instance that
+races with the still-running orphan for the lock → `resource temporarily unavailable`.
+
+The 500ms post-SIGKILL delay does not help because prometheus is still alive. This is not a
+timing problem; it is a kill scope problem.
+
+**Root cause (secondary):** No per-service configurable `stop_grace_period`. Hardcoded 10s is
+too short for some services, but the real benefit requires the pgid fix first — `stop_grace_period`
+only helps processes that actually respond to SIGTERM.
+
+---
+
+**Changes (primary — pgid fix):**
+
+1. `src/container.rs` — early in the `pre_exec` closure, before Step 0 (cgroup self-assign)
+   ```rust
+   // Make every container process a process group leader so that
+   // compose/stop can kill the entire subtree with kill(-pid, sig).
+   libc::setpgid(0, 0);
+   ```
+   This is safe for all spawn paths (non-PTY and PTY). In PTY mode `setsid()` runs
+   immediately after and supersedes it; in all other cases it guarantees pgid == pid.
+
+2. `src/cli/compose.rs` — `cmd_compose_down`
+   - Change `kill(svc_state.pid, SIGTERM)` → `kill(-svc_state.pid, SIGTERM)`
+   - Change `kill(svc_state.pid, SIGKILL)` → `kill(-svc_state.pid, SIGKILL)`
+   - Also fix the fallback SIGKILL for services not in topo order (line ~787)
+   - Increase post-SIGKILL delay from 500ms to 2000ms (belt-and-suspenders)
+
+**Changes (secondary — `stop_signal` from image config):**
+
+`STOPSIGNAL` is a Dockerfile instruction (OCI `Config.StopSignal` field, e.g. `"SIGQUIT"` for
+nginx graceful drain) that specifies which signal to send instead of SIGTERM. Currently pelagos
+does not read it.
+
+3. `src/image.rs` — `ImageConfig`
+   ```rust
+   #[serde(default)]
+   pub stop_signal: String,   // "" means SIGTERM (absent in most images)
+   ```
+
+4. `src/cli/image.rs` — `parse_image_config`
+   ```rust
+   let stop_signal = container_config
+       .and_then(|c| c.get("StopSignal"))
+       .and_then(|v| v.as_str())
+       .unwrap_or("")
+       .to_string();
+   ```
+   Add `stop_signal` to the `ImageConfig { ... }` return.
+
+5. `src/cli/compose.rs` — `spawn_service` / `cmd_compose_down`
+   - `spawn_service` should record the resolved stop signal per service. Since
+     `ComposeServiceState` only stores container_name/status/pid, and `cmd_compose_down`
+     re-reads the compose file for topo order anyway, the cleanest approach is: in
+     `cmd_compose_down`, after resolving the grace period map, also resolve a
+     `stop_signal_map` by loading each service's image manifest and reading
+     `manifest.config.stop_signal`. Parse the signal name/number to a `libc::c_int`.
+   - Fall back to `SIGTERM` if absent, unparseable, or image manifest unavailable.
+   - Helper: `fn parse_signal(s: &str) -> libc::c_int` — handles `"SIGTERM"`, `"15"`,
+     `"SIGQUIT"`, `"3"`, etc.
+
+**Changes (tertiary — `stop_grace_period`):**
+
+6. `src/compose.rs`
+   - Add `stop_grace_period: Option<u64>` to `ServiceSpec` (seconds; `None` = default 10s)
+   - Add `"stop-grace-period"` arm in `parse_service_spec` match
+
+7. `src/lisp/pelagos.rs` — `apply_service_opt`
+   - Add `"stop-grace-period"` arm accepting an integer `Value::Int`
+
+8. `src/cli/compose.rs` — `cmd_compose_down`
+   - Build `grace_map` from re-read compose file
+   - Use `grace_map.get(svc_name).copied().unwrap_or(10)` instead of hardcoded `10`
+
+**Tests:**
+- Integration: `test_compose_down_kills_shell_entrypoint_descendants` — container whose
+  entrypoint is a shell script that forks a long-running child (`sh -c "sleep 999 & wait"`);
+  compose down; assert the sleep child is also dead. Direct regression test for the pgid fix.
+- Unit `test_parse_image_config_stop_signal` — JSON with `"StopSignal": "SIGQUIT"`, assert
+  `config.stop_signal == "SIGQUIT"`; JSON without the field, assert `config.stop_signal == ""`
+- Unit `test_parse_signal` — `"SIGTERM"` → 15, `"SIGQUIT"` → 3, `"9"` → 9, `""` → 15 (default)
+- Unit `test_compose_parse_stop_grace_period` — parse `(stop-grace-period 30)`, assert field
+- Unit `test_service_builtin_stop_grace_period` — Lisp builtin sets the field
+
+**Docs:** `docs/USER_GUIDE.md` — add `(stop-grace-period N)` to the service options table.
+
+---
+
+### #161 — Compose up failure cleanup (Linux scope)
+
+**Scope note:** The macOS PortDispatcher changes described in the issue comment are
+out of scope here (separate repo, separate daemon). Linux scope:
+- On `compose up` failure mid-run, partially-created state (containers, networks, DNS)
+  is not cleaned up, blocking re-runs.
+- On `compose up` with a stale state file (supervisor dead), the code silently proceeds
+  without cleaning up dangling container state or networks from the previous failed run.
+
+**Root cause analysis:**
+
+- `run_compose_with_hooks` creates networks before forking into the supervisor, then spawns
+  services one by one. If service N fails, services 1..N-1 are running and networks exist.
+  On error return, nothing is torn down.
+- `cmd_compose_up_reml` detects dead supervisor (via `check_liveness`) and proceeds, but
+  does not clean up stale container dirs, network state, or DNS entries.
+
+**Changes:**
+
+1. `src/cli/compose.rs` — `run_compose_with_hooks`
+   - After the service startup loop, if an error occurs, clean up before returning:
+     - SIGKILL all `container_pids` that were started
+     - Remove their container state dirs via `container_dir(&cn)`
+     - Remove DNS entries via `dns_remove_entry`
+     - Remove created networks via `cmd_network_rm` for each in `created_networks`
+     - This makes compose-up atomic from the user's perspective
+   - Implement as a cleanup closure/function called on the `Err` path
+
+2. `src/cli/compose.rs` — `cmd_compose_up_reml`
+   - After detecting dead supervisor (state file exists, supervisor not alive):
+     ```rust
+     // Stale state from previous failed/crashed run — clean up.
+     cleanup_stale_project(&existing);
+     ```
+   - `cleanup_stale_project` kills living containers in stale state, removes their dirs,
+     removes networks, removes DNS entries, removes the project state file
+
+**Tests:**
+- Integration: `test_compose_up_failure_cleans_up` — compose with service 1 = valid alpine image,
+  service 2 = deliberately nonexistent image (with `--no-pull`). Assert: compose up returns error,
+  networks are removed, no container state dirs remain.
+- Integration: `test_compose_up_restart_after_failure` — same setup; first run fails; second run
+  (with corrected config: both valid images) succeeds without manual `compose down`.
+
+---
+
+### #160 — Auto-pull missing images
+
+**Root cause:** `resolve_image()` returns an error immediately if the image is not in the local
+store. Docker Compose pulls missing images automatically (`--pull missing` default).
+
+**Changes:**
+
+1. `src/cli/compose.rs`
+   - Add `--no-pull` flag to `ComposeCmd::Up` (clap boolean, default false):
+     ```rust
+     #[clap(long)]
+     no_pull: bool,
+     ```
+   - Thread `no_pull` through `cmd_compose_up` → `cmd_compose_up_reml`
+   - Add `pull_missing_images(spec: &ComposeFile, no_pull: bool)` called upfront in
+     `cmd_compose_up_reml`, before network/volume creation and before forking. This ensures:
+     - All images are available before any containers start (fail-fast)
+     - Pull errors are printed to the terminal (parent process, before fork)
+     - Per-service pull progress is shown: `Pulling <image>...`
+   - Modify `resolve_image` to accept `no_pull: bool`; when image not found and `!no_pull`,
+     call `super::image::cmd_image_pull(image_ref, None, None, false, false)` then retry
+   - `pull_missing_images` iterates `spec.services`, deduplicates image refs, calls
+     `resolve_or_pull_image` for each — stops early and returns the first pull error
+
+**Test for upfront deduplication:** Multiple services using the same image should only trigger
+one pull attempt.
+
+**Tests:**
+- Unit: `test_compose_pull_deduplicates_images` — `pull_missing_images` called with two services
+  sharing the same image ref; only one pull happens (use counter or verify via mock)
+  - Actually this is hard to unit-test without mocking; instead test via the integration path
+- Integration: `test_compose_no_pull_fails_immediately` — compose with an image not in local cache
+  and `--no-pull` flag; assert error message contains "not found locally" and no pull was attempted
+- Integration: `test_compose_auto_pull_on_up` — compose with a real pullable image not in cache;
+  assert it's pulled and visible in `pelagos image ls` afterwards. Tag as `#[serial]` to avoid
+  concurrent ECR pulls.
+
+**Note on `--no-pull`:** With `--no-pull`, the behaviour is exactly what it is today — fail
+immediately if the image is not local. This is the right default for air-gapped environments.
+
+---
+
+### Implementation order
+
+1. #169 (standalone struct + parser changes, no moving parts)
+2. #160 (builds on working compose up, tests require pulls)
+3. #161 (cleanup logic; last because it changes error paths touched by #160 tests)
+
+Tests for each issue ship in the same commit as the code.
+
+---
+
+## Session completed: 2026-03-29 (SHA ce8c503, v0.59.0 + #159)
+
+### Issues closed this session
+
+| # | Title | Fixed in |
+|---|-------|---------|
+| #159 | fix(lisp): inline `let` in `define-service` dotted-pair cdr | ce8c503 |
+| #162 | dup of #163 — closed | — |
+
+### Key implementation details
+
+**#159 (inline let in define-service dotted-pair):**
+- Root cause: `("K" . (let ...))` with a list-valued cdr produces identical `Value::Pair` chain
+  to `("K" let ...)`. `(list? sub)` can't distinguish them; `(length sub)` can.
+- Fix: `(and (list? sub) (= (length sub) 2))` in `expand-opt` in `stdlib.lisp`
+- Four unit tests in `src/lisp/mod.rs`; new fixture `examples/compose/monitoring-inline-let/compose.reml`
+- `home-monitoring/remora/compose.reml` updated to use inline let (removed top-level define workarounds)
+
+---
 
 ## Session completed: 2026-03-19 (SHA 1e488ba, v0.59.0)
 
@@ -65,7 +291,7 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Fixed in |
 |---|-------|---------|
-| #118 | fix(start): redirect watcher stdio to /dev/null; pelagos start returns promptly | v0.56.0 |
+| #118 | fix(run): redirect watcher stdio to /dev/null; pelagos start returns promptly | v0.56.0 |
 
 ### Key implementation details
 
@@ -119,6 +345,9 @@ All work is tracked in GitHub Issues. This file is a brief index.
 
 | # | Title | Kind |
 |---|-------|------|
+| #160 | feat: compose auto-pull missing images | IN PROGRESS |
+| #161 | feat: compose up failure cleanup (Linux scope) | IN PROGRESS |
+| #169 | fix: stop_grace_period + post-SIGKILL delay | IN PROGRESS |
 | #73 | feat(wasm): persistent Wasm VM pool (epic #67 P4) | feat/low-pri |
 | #71 | feat(wasm): WASI preview 2 socket passthrough (epic #67 P2) | feat/low-pri |
 | #70 | feat(wasm): mixed Linux+Wasm compose validation (epic #67 P1) | feat/low-pri |
@@ -127,17 +356,3 @@ All work is tracked in GitHub Issues. This file is a brief index.
 | #61 | feat: CRIU checkpoint/restore support | feat/low-pri |
 | #49-47 | track: upstream runtime-tools test bugs | tracking |
 | #60 | feat: io_uring opt-in seccomp profile | feat/low-pri |
-
----
-
-## Next session: suggested starting point
-
-```bash
-cd /home/cb/Projects/pelagos
-git log --oneline -5
-cargo test --lib
-gh issue list --state open
-```
-
-All issues filed as of 2026-03-17 are either closed or low-priority.
-No in-progress work.  Repo is clean at v0.55.0.

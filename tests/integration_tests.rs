@@ -8866,6 +8866,7 @@ CMD ["8080"]"#;
             user: String::new(),
             labels: labels.clone(),
             healthcheck: None,
+            stop_signal: String::new(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -8898,6 +8899,7 @@ CMD ["8080"]"#;
             user: "1000:1000".to_string(),
             labels: HashMap::new(),
             healthcheck: None,
+            stop_signal: String::new(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -13704,6 +13706,7 @@ mod wasm_tests {
                 user: String::new(),
                 labels: HashMap::new(),
                 healthcheck: None,
+                stop_signal: String::new(),
             },
         };
         assert!(
@@ -13735,6 +13738,7 @@ mod wasm_tests {
                 user: String::new(),
                 labels: HashMap::new(),
                 healthcheck: None,
+                stop_signal: String::new(),
             },
         };
         assert!(
@@ -13765,6 +13769,7 @@ mod wasm_tests {
                 user: String::new(),
                 labels: HashMap::new(),
                 healthcheck: None,
+                stop_signal: String::new(),
             },
         };
         assert!(
@@ -18385,6 +18390,7 @@ mod issue_110_path_fallback {
                 user: String::new(),
                 labels: HashMap::new(),
                 healthcheck: None,
+                stop_signal: String::new(),
             },
         };
         image::save_image(&empty_env_manifest).expect("save_image with empty env");
@@ -19819,3 +19825,392 @@ mod issue_124_run_state_ordering {
         cleanup(name);
     }
 }
+
+// ---------------------------------------------------------------------------
+// compose shutdown tests (issues #160, #161, #169)
+// ---------------------------------------------------------------------------
+
+mod compose_shutdown_fixes {
+    use std::process::{Command, Stdio};
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    fn ensure_alpine() {
+        let status = Command::new(bin())
+            .args(["image", "pull", "docker.io/library/alpine:latest"])
+            .status()
+            .expect("pelagos image pull alpine");
+        assert!(status.success(), "pre-test alpine pull failed");
+    }
+
+    /// test_compose_down_kills_shell_entrypoint_descendants
+    ///
+    /// Requires root + alpine image.  Verifies that `pelagos compose down` kills
+    /// the entire process group of each service, not just the container's init PID.
+    ///
+    /// When a container entrypoint is a shell script that backgrounds a child
+    /// (`sh -c 'sleep 9999 & wait'`), sending SIGTERM/SIGKILL only to the shell
+    /// PID leaves the background child (sleep) running as an orphan.  The fix:
+    /// `setpgid(0, 0)` in pre_exec makes each container a process group leader;
+    /// compose down uses `kill(-pid, sig)` to kill the entire group.
+    ///
+    /// The test confirms that the sleep child has also exited after compose down.
+    /// Failure indicates the pgid fix (setpgid + kill(-pid)) is broken.
+    #[test]
+    fn test_compose_down_kills_shell_entrypoint_descendants() {
+        if !is_root() {
+            eprintln!("SKIP test_compose_down_kills_shell_entrypoint_descendants: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        // Write a compose file whose service entrypoint backgrounds a child process,
+        // simulating a shell-script wrapper that doesn't forward signals.
+        let tmp = std::env::temp_dir().join("pelagos-pgid-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let compose_file = tmp.join("compose.reml");
+        std::fs::write(
+            &compose_file,
+            r#"
+(define-service svc-shell "shell-bg"
+  :image "docker.io/library/alpine:latest"
+  :command "sh" "-c" "sleep 9999 & wait")
+
+(compose-up
+  (compose svc-shell))
+"#,
+        )
+        .unwrap();
+
+        let project = "pgid-test-169";
+
+        // Pre-clean any leftover state.
+        let _ = Command::new(bin())
+            .args([
+                "compose",
+                "down",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Bring the stack up.  Use .status() — compose up daemonises; .output()
+        // would block forever because the supervisor inherits the pipe FDs.
+        let up_status = Command::new(bin())
+            .args([
+                "compose",
+                "up",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .expect("compose up");
+        assert!(up_status.success(), "compose up failed");
+
+        // Wait for the container to appear in ps and record its PID.
+        let container_name = format!("{}-shell-bg", project);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut container_pid: Option<u32> = None;
+        while std::time::Instant::now() < deadline {
+            let ps = Command::new(bin()).args(["ps"]).output().unwrap();
+            if String::from_utf8_lossy(&ps.stdout).contains(&container_name) {
+                let state_path = format!("/run/pelagos/containers/{}/state.json", container_name);
+                if let Ok(raw) = std::fs::read_to_string(&state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        if let Some(pid) = v["pid"].as_u64().filter(|&p| p > 0) {
+                            container_pid = Some(pid as u32);
+                            break;
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
+        let container_pid = container_pid.expect("container never appeared in ps");
+
+        // Find the background sleep process by scanning /proc for pgid == container_pid.
+        // The container init (container_pid) calls setpgid(0,0) in pre_exec, making
+        // itself the process group leader.  sh and its backgrounded sleep child inherit
+        // the same PGID.  We search by PGID (field 5 in /proc/{pid}/stat) rather than
+        // PPID because sleep is a grandchild of container_pid, not a direct child.
+        let find_sleep_in_pgrp = |pgid: u32| -> Option<u32> {
+            std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+                let pid: u32 = e.file_name().to_string_lossy().parse().ok()?;
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+                let after_comm = stat.rfind(')')?;
+                let mut fields = stat[after_comm + 2..].trim_start().split_whitespace();
+                let _state = fields.next()?;
+                let _ppid = fields.next()?;
+                let pgrp: u32 = fields.next()?.parse().ok()?;
+                if pgrp != pgid {
+                    return None;
+                }
+                let comm =
+                    std::fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
+                (comm.trim() == "sleep").then_some(pid)
+            })
+        };
+
+        // Give the shell a moment to background the sleep process.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let sleep_pid = find_sleep_in_pgrp(container_pid)
+            .expect("could not find background sleep in container process group");
+
+        assert!(
+            unsafe { libc::kill(sleep_pid as i32, 0) } == 0,
+            "sleep child (pid {}) should be alive before compose down",
+            sleep_pid
+        );
+
+        // Tear down the stack.
+        let down = Command::new(bin())
+            .args([
+                "compose",
+                "down",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("compose down");
+        assert!(
+            down.status.success(),
+            "compose down failed: {}",
+            String::from_utf8_lossy(&down.stderr)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // The background sleep must also be dead (kill(pid,0) returns ESRCH).
+        let still_alive = unsafe { libc::kill(sleep_pid as i32, 0) } == 0;
+        assert!(
+            !still_alive,
+            "background sleep child (pid {}) is still alive after compose down — \
+         pgid kill is not working (issue #169)",
+            sleep_pid
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------------------------------------------------------------------------
+    // compose --no-pull / failure cleanup tests (issues #160, #161)
+    // ---------------------------------------------------------------------------
+
+    /// test_compose_no_pull_fails_immediately
+    ///
+    /// Requires root.  Verifies that `compose up --no-pull` returns a clear error
+    /// when a service image is not in the local cache, without attempting any pull.
+    ///
+    /// Failure indicates the --no-pull flag is not wired up or the error message
+    /// changed shape in a way that breaks user-visible output.
+    #[test]
+    fn test_compose_no_pull_fails_immediately() {
+        if !is_root() {
+            eprintln!("SKIP test_compose_no_pull_fails_immediately: requires root");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join("pelagos-nopull-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let compose_file = tmp.join("compose.reml");
+        // Use a deliberately-nonexistent local image tag (never pulled, UUID-style name).
+        std::fs::write(
+            &compose_file,
+            r#"
+(define-service svc "nopull-svc"
+  :image "localhost/this-image-does-not-exist-pelagos-test:nopull")
+
+(compose-up
+  (compose svc))
+"#,
+        )
+        .unwrap();
+
+        let project = "nopull-test-160";
+        let _ = Command::new(bin())
+            .args([
+                "compose",
+                "down",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .output();
+
+        let out = Command::new(bin())
+            .args([
+                "compose",
+                "up",
+                "--no-pull",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("compose up --no-pull");
+
+        assert!(
+            !out.status.success(),
+            "compose up --no-pull should fail for a missing image"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let combined = format!("{}{}", stderr, stdout);
+        assert!(
+            combined.contains("not found locally"),
+            "expected 'not found locally' in output, got: {}",
+            combined
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// test_compose_up_detects_stale_supervisor
+    ///
+    /// Requires root + alpine image.  Verifies that when `compose up` finds a
+    /// project state file with a dead supervisor PID (simulated by SIGKILL-ing
+    /// the supervisor after a successful first run), it calls cleanup_stale_project
+    /// to tear down lingering containers and then starts fresh successfully.
+    ///
+    /// This tests issue #161: a crashed supervisor must not leave state that
+    /// permanently prevents a second `compose up` without a manual `compose down`.
+    ///
+    /// Failure indicates the stale state detection in cmd_compose_up_reml is broken
+    /// or cleanup_stale_project is not properly removing containers.
+    #[test]
+    fn test_compose_up_detects_stale_supervisor() {
+        if !is_root() {
+            eprintln!("SKIP test_compose_up_detects_stale_supervisor: requires root");
+            return;
+        }
+        ensure_alpine();
+
+        let tmp = std::env::temp_dir().join("pelagos-stale-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let compose_file = tmp.join("compose.reml");
+        std::fs::write(
+            &compose_file,
+            r#"
+(define-service svc "stale-svc"
+  :image "docker.io/library/alpine:latest"
+  :command "sh" "-c" "sleep 9999")
+
+(compose-up
+  (compose svc))
+"#,
+        )
+        .unwrap();
+
+        let project = "stale-test-161";
+
+        // Pre-clean any leftover state.
+        let _ = Command::new(bin())
+            .args([
+                "compose",
+                "down",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // First compose up — use .status() (daemonised; .output() would hang).
+        let status1 = Command::new(bin())
+            .args([
+                "compose",
+                "up",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .expect("first compose up");
+        assert!(status1.success(), "first compose up failed");
+
+        // Poll for the project state file to appear with a valid supervisor PID.
+        let state_path = format!("/run/pelagos/compose/{}/state.json", project);
+        let supervisor_pid: i32 = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&state_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        if let Some(pid) = v["supervisor_pid"].as_i64().filter(|&p| p > 0) {
+                            break pid as i32;
+                        }
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "project state never appeared at {}",
+                    state_path
+                );
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        };
+
+        // Simulate a supervisor crash.
+        unsafe { libc::kill(supervisor_pid, libc::SIGKILL) };
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            unsafe { libc::kill(supervisor_pid, 0) } != 0,
+            "supervisor (pid {}) should be dead after SIGKILL",
+            supervisor_pid
+        );
+
+        // Second compose up — must detect the dead supervisor, clean up stale state,
+        // and start fresh without error.  Use .status() for the same reason as above.
+        let status2 = Command::new(bin())
+            .args([
+                "compose",
+                "up",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .expect("second compose up");
+        assert!(
+            status2.success(),
+            "second compose up should succeed after stale supervisor cleanup (issue #161)"
+        );
+
+        // Tear down and clean up temp files.
+        let _ = Command::new(bin())
+            .args([
+                "compose",
+                "down",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "-p",
+                project,
+            ])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+} // mod compose_shutdown_fixes

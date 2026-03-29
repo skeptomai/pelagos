@@ -54,6 +54,8 @@ pub struct ServiceSpec {
     pub apparmor_profile: Option<String>,
     /// SELinux process label to apply at exec time.
     pub selinux_label: Option<String>,
+    /// Seconds to wait for graceful shutdown before SIGKILL (default: 10).
+    pub stop_grace_period: Option<u64>,
 }
 
 /// A volume mount: `name:path` inside the container.
@@ -301,6 +303,7 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
         cap_drop: Vec::new(),
         apparmor_profile: None,
         selinux_label: None,
+        stop_grace_period: None,
     };
 
     for arg in &args[1..] {
@@ -446,6 +449,16 @@ fn parse_service_spec(args: &[SExpr]) -> Result<ServiceSpec, ComposeError> {
                     1,
                     &format!("service '{}' selinux-label", name),
                 )?);
+            }
+            "stop-grace-period" => {
+                let s = require_atom(list, 1, &format!("service '{}' stop-grace-period", name))?;
+                let secs: u64 = s.parse().map_err(|_| {
+                    ComposeError::InvalidValue(format!(
+                        "service '{}': stop-grace-period must be a non-negative integer, got '{}'",
+                        name, s
+                    ))
+                })?;
+                spec.stop_grace_period = Some(secs);
             }
             other => {
                 return Err(ComposeError::SyntaxError(format!(
@@ -1264,5 +1277,34 @@ mod tests {
             app.depends_on[0].health_check,
             Some(HealthCheck::Port(6379))
         );
+    }
+
+    #[test]
+    fn test_compose_parse_stop_grace_period() {
+        // (stop-grace-period N) sets the per-service grace period; absent = None.
+        let input = r#"
+(compose
+  (service slow
+    (image "alpine:latest")
+    (stop-grace-period 30))
+  (service fast
+    (image "alpine:latest")))
+"#;
+        let compose = parse_compose(input).unwrap();
+        let slow = compose.services.iter().find(|s| s.name == "slow").unwrap();
+        let fast = compose.services.iter().find(|s| s.name == "fast").unwrap();
+        assert_eq!(slow.stop_grace_period, Some(30));
+        assert_eq!(fast.stop_grace_period, None);
+    }
+
+    #[test]
+    fn test_compose_parse_stop_grace_period_invalid() {
+        let input = r#"
+(compose
+  (service s
+    (image "alpine:latest")
+    (stop-grace-period notanumber)))
+"#;
+        assert!(parse_compose(input).is_err());
     }
 }

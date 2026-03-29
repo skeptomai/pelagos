@@ -657,6 +657,12 @@ pub(crate) fn parse_image_config(
         })
         .unwrap_or_default();
 
+    let stop_signal = container_config
+        .and_then(|c| c.get("StopSignal"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     // Parse OCI Healthcheck block.
     // OCI format: { "Test": ["CMD", "arg", ...], "Interval": ns, "Timeout": ns,
     //               "StartPeriod": ns, "Retries": n }
@@ -670,6 +676,7 @@ pub(crate) fn parse_image_config(
         working_dir,
         user,
         labels,
+        stop_signal,
         healthcheck,
     })
 }
@@ -1148,5 +1155,34 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some(layer2_digest.as_str())
         );
+    }
+
+    #[test]
+    fn test_parse_image_config_stop_signal() {
+        // StopSignal present → propagated to ImageConfig.stop_signal.
+        let json = r#"{"config":{"Env":["PATH=/usr/bin"],"StopSignal":"SIGQUIT"},"rootfs":{"type":"layers","diff_ids":[]}}"#;
+        let cfg = parse_image_config(json).unwrap();
+        assert_eq!(cfg.stop_signal, "SIGQUIT");
+
+        // StopSignal absent → empty string (caller treats as SIGTERM).
+        let json_no_sig =
+            r#"{"config":{"Env":["PATH=/usr/bin"]},"rootfs":{"type":"layers","diff_ids":[]}}"#;
+        let cfg2 = parse_image_config(json_no_sig).unwrap();
+        assert_eq!(cfg2.stop_signal, "");
+    }
+
+    #[test]
+    fn test_parse_signal() {
+        use super::super::compose::parse_signal;
+        assert_eq!(parse_signal("SIGTERM"), libc::SIGTERM);
+        assert_eq!(parse_signal("sigterm"), libc::SIGTERM);
+        assert_eq!(parse_signal(""), libc::SIGTERM);
+        assert_eq!(parse_signal("SIGQUIT"), libc::SIGQUIT);
+        assert_eq!(parse_signal("SIGINT"), libc::SIGINT);
+        assert_eq!(parse_signal("15"), libc::SIGTERM);
+        assert_eq!(parse_signal("3"), libc::SIGQUIT);
+        assert_eq!(parse_signal("9"), libc::SIGKILL);
+        // Unknown string falls back to SIGTERM.
+        assert_eq!(parse_signal("SIGWEIRD"), libc::SIGTERM);
     }
 }

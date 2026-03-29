@@ -3879,3 +3879,42 @@ Failure indicates the parent returned (printed the container name) before the
 watcher had written state with the real PID — the sync-pipe guarantee is broken.
 A concurrent `pelagos exec` immediately after `pelagos run --detach` would see
 `pid=0` and fail.
+
+### `test_compose_down_kills_shell_entrypoint_descendants`
+**Requires:** root, alpine image
+**Module:** `compose_shutdown_fixes`
+
+Starts a compose stack with a single service whose entrypoint is
+`sh -c 'sleep 9999 & wait'` — a shell that backgrounds a child process and then
+waits, simulating a shell-script wrapper that does not forward signals.  After
+`compose up`, the test locates the backgrounded `sleep` process by scanning
+`/proc` for any process in the container's process group (PGID == container PID).
+It then calls `compose down` and asserts that the sleep process is no longer alive.
+
+Failure indicates that `setpgid(0, 0)` in the container's pre_exec is not
+making the container a process group leader, or that `compose down` is using
+`kill(pid, sig)` instead of `kill(-pid, sig)` — leaving orphaned descendants
+behind after shutdown (issue #169).
+
+### `test_compose_no_pull_fails_immediately`
+**Requires:** root
+**Module:** `compose_shutdown_fixes`
+
+Runs `compose up --no-pull` with a service that references an image tag that is
+not present in the local layer store.  Asserts that the command exits non-zero
+and that the error output contains `"not found locally"`.
+
+Failure indicates that `--no-pull` is not wired up, the pre-fork image presence
+check is not running, or the error message changed shape (issue #160).
+
+### `test_compose_up_detects_stale_supervisor`
+**Requires:** root, alpine image
+**Module:** `compose_shutdown_fixes`
+
+Runs `compose up` to start a sleep service, then SIGKILL-s the supervisor process
+to simulate a crash.  Immediately re-runs `compose up` with the same config and
+asserts it succeeds without requiring a manual `compose down` first.
+
+Failure indicates that `cmd_compose_up_reml` is not detecting the dead supervisor
+PID in the project state file, or that `cleanup_stale_project` is failing to
+remove lingering containers and project state before starting fresh (issue #161).

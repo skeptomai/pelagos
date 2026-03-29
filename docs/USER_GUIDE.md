@@ -631,6 +631,9 @@ sudo pelagos compose up --foreground
 # Use a custom file and project name
 sudo pelagos compose up -f mystack.reml -p myproject
 
+# Skip auto-pull — fail immediately if any image is not cached locally
+sudo pelagos compose up --no-pull
+
 # List services
 pelagos compose ps
 
@@ -737,13 +740,30 @@ Options are passed as Lisp lists with a symbol key:
 
 ```lisp
 (service "db"
-  (list 'image   "postgres:16")
-  (list 'network "backend")
-  (list 'env     "POSTGRES_PASSWORD" "secret")
-  (list 'port    5432 5432)
-  (list 'memory  "512m")
-  (list 'depends-on "cache"))
+  (list 'image             "postgres:16")
+  (list 'network           "backend")
+  (list 'env               "POSTGRES_PASSWORD" "secret")
+  (list 'port              5432 5432)
+  (list 'memory            "512m")
+  (list 'stop-grace-period 30)
+  (list 'depends-on        "cache"))
 ```
+
+#### `stop-grace-period`
+
+Number of seconds to wait for a service to exit after receiving its stop signal
+before sending `SIGKILL`.  Defaults to 10 seconds.
+
+```lisp
+; Give PostgreSQL 30 s to flush WAL before being killed
+(list 'stop-grace-period 30)
+```
+
+`compose down` sends each service the signal from the OCI image's `StopSignal`
+field (e.g. `SIGQUIT` for nginx, `SIGTERM` for most others) and waits up to
+`stop-grace-period` seconds before escalating to `SIGKILL`.  The kill targets
+the service's entire **process group**, so shell-script entrypoints that
+background child processes are fully terminated.
 
 Alternatively, use `quote` shorthand:
 

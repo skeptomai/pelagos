@@ -841,6 +841,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 mnt_ns_inode: None,
+                upper_dir: None,
             }
         }
 
@@ -901,6 +902,7 @@ mod tests {
             spawn_config: None,
             labels,
             mnt_ns_inode: None,
+            upper_dir: None,
         };
 
         let json = serde_json::to_string(&state).unwrap();

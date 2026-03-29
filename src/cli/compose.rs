@@ -34,6 +34,9 @@ pub enum ComposeCmd {
         /// Run in foreground (don't daemonise)
         #[clap(long)]
         foreground: bool,
+        /// Never pull images; fail immediately if an image is not cached locally
+        #[clap(long)]
+        no_pull: bool,
     },
     /// Stop and remove all services
     Down {
@@ -104,7 +107,8 @@ pub fn cmd_compose(cmd: ComposeCmd) -> Result<(), Box<dyn std::error::Error>> {
             file,
             project,
             foreground,
-        } => cmd_compose_up(&file, project.as_deref(), foreground),
+            no_pull,
+        } => cmd_compose_up(&file, project.as_deref(), foreground, no_pull),
         ComposeCmd::Down {
             file,
             project,
@@ -128,14 +132,53 @@ fn cmd_compose_up(
     file: &std::path::Path,
     project_name: Option<&str>,
     foreground: bool,
+    no_pull: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    cmd_compose_up_reml(file, project_name, foreground)
+    cmd_compose_up_reml(file, project_name, foreground, no_pull)
+}
+
+/// Pull any images in `spec` that are not already cached locally.
+///
+/// Deduplicates image references so each distinct image is pulled at most once.
+/// Returns an error (with the image name) on the first pull failure.
+/// When `no_pull` is true, behaves exactly like the old code: fail immediately
+/// if an image is not cached.
+fn pull_missing_images(
+    spec: &pelagos::compose::ComposeFile,
+    no_pull: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Collect unique image refs in service order.
+    let mut seen = std::collections::HashSet::new();
+    let refs: Vec<&str> = spec
+        .services
+        .iter()
+        .map(|s| s.image.as_str())
+        .filter(|r| seen.insert(*r))
+        .collect();
+
+    for image_ref in refs {
+        if resolve_image(image_ref).is_ok() {
+            continue; // already cached
+        }
+        if no_pull {
+            return Err(format!(
+                "image '{}' not found locally (use 'pelagos image pull {}' or omit --no-pull)",
+                image_ref, image_ref
+            )
+            .into());
+        }
+        println!("Pulling {}...", image_ref);
+        super::image::cmd_image_pull(image_ref, None, None, false, false)
+            .map_err(|e| format!("failed to pull '{}': {}", image_ref, e))?;
+    }
+    Ok(())
 }
 
 fn cmd_compose_up_reml(
     file: &std::path::Path,
     project_name: Option<&str>,
     foreground: bool,
+    no_pull: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Derive a preliminary project name from the file path so that
     // imperative `container-start` calls during eval use the right scope.
@@ -175,7 +218,8 @@ fn cmd_compose_up_reml(
     let hooks = interp.take_hooks();
     let order = topo_sort(&spec.services)?;
 
-    // Check for already-running project.
+    // Check for already-running project, or clean up stale state from a
+    // previous failed/crashed run.
     let state_file = pelagos::paths::compose_state_file(&project);
     if state_file.exists() {
         if let Ok(existing) = load_project_state(&project) {
@@ -186,8 +230,17 @@ fn cmd_compose_up_reml(
                 )
                 .into());
             }
+            // Supervisor is dead — stale state from a previous failed/crashed run.
+            // Clean up before starting fresh so networks/containers don't conflict.
+            log::info!("compose: cleaning up stale state for project '{}'", project);
+            cleanup_stale_project(&existing);
         }
     }
+
+    // Pull missing images upfront, before creating networks/volumes or forking.
+    // This keeps pull output in the parent process (visible to the user) and
+    // fails early before any infrastructure is created.
+    pull_missing_images(&spec, no_pull)?;
 
     let mut created_networks = Vec::new();
     for net in &spec.networks {
@@ -294,50 +347,86 @@ pub fn run_compose_with_hooks(
 
     let mut container_pids: HashMap<String, i32> = HashMap::new();
     let mut container_ips: HashMap<String, String> = HashMap::new();
+    // Track (container_name, pid) for already-started services so we can
+    // roll back if a later service fails to start.
+    let mut started: Vec<(String, i32)> = Vec::new();
 
-    for svc_name in order {
-        let svc = svc_map[svc_name.as_str()];
-        let container_name = scoped_container_name(project, svc_name);
+    let startup_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for svc_name in order {
+            let svc = svc_map[svc_name.as_str()];
+            let container_name = scoped_container_name(project, svc_name);
 
-        for dep in &svc.depends_on {
-            wait_for_dependency(project, dep, &container_pids, &container_ips)?;
-        }
-
-        log::info!(
-            "compose: starting service '{}' as '{}'",
-            svc_name,
-            container_name
-        );
-        let pid = spawn_service(project, svc, &container_name, compose, compose_dir)?;
-
-        if let Ok(cstate) = super::read_state(&container_name) {
-            if let Some(ip) = cstate.bridge_ip.as_ref() {
-                container_ips.insert(svc_name.clone(), ip.clone());
+            for dep in &svc.depends_on {
+                wait_for_dependency(project, dep, &container_pids, &container_ips)?;
             }
-            for (net, ip) in &cstate.network_ips {
-                container_ips.insert(svc_name.clone(), ip.clone());
-                let _ = net;
+
+            log::info!(
+                "compose: starting service '{}' as '{}'",
+                svc_name,
+                container_name
+            );
+            let pid = spawn_service(project, svc, &container_name, compose, compose_dir)?;
+            started.push((container_name.clone(), pid));
+
+            if let Ok(cstate) = super::read_state(&container_name) {
+                if let Some(ip) = cstate.bridge_ip.as_ref() {
+                    container_ips.insert(svc_name.clone(), ip.clone());
+                }
+                for (net, ip) in &cstate.network_ips {
+                    container_ips.insert(svc_name.clone(), ip.clone());
+                    let _ = net;
+                }
+            }
+
+            container_pids.insert(svc_name.clone(), pid);
+
+            // Fire on-ready hooks for this service.
+            if let Some(hooks) = on_ready.get(svc_name.as_str()) {
+                for hook in hooks {
+                    hook().map_err(|e| format!("on-ready '{}': {}", svc_name, e))?;
+                }
+            }
+
+            project_state.services.insert(
+                svc_name.clone(),
+                ComposeServiceState {
+                    container_name: container_name.clone(),
+                    status: "running".into(),
+                    pid,
+                },
+            );
+            save_project_state(&project_state)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = startup_result {
+        // Roll back: kill all already-started containers and tear down networks
+        // so the user can re-run compose up without manual cleanup.
+        log::warn!("compose: startup failed ({}); rolling back", e);
+        for (cn, pid) in &started {
+            if *pid > 0 {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            let _ = std::fs::remove_dir_all(container_dir(cn));
+        }
+        for svc_name in project_state.services.keys() {
+            for net in created_networks {
+                let _ = pelagos::dns::dns_remove_entry(net, svc_name);
             }
         }
-
-        container_pids.insert(svc_name.clone(), pid);
-
-        // Fire on-ready hooks for this service.
-        if let Some(hooks) = on_ready.get(svc_name.as_str()) {
-            for hook in hooks {
-                hook().map_err(|e| format!("on-ready '{}': {}", svc_name, e))?;
+        for net in created_networks {
+            if let Err(re) = super::network::cmd_network_rm(net) {
+                log::warn!(
+                    "compose: rollback: failed to remove network '{}': {}",
+                    net,
+                    re
+                );
             }
         }
-
-        project_state.services.insert(
-            svc_name.clone(),
-            ComposeServiceState {
-                container_name: container_name.clone(),
-                status: "running".into(),
-                pid,
-            },
-        );
-        save_project_state(&project_state)?;
+        let project_dir = pelagos::paths::compose_project_dir(project);
+        let _ = std::fs::remove_dir_all(&project_dir);
+        return Err(e);
     }
 
     println!("All services started for project '{}'", project);
@@ -724,6 +813,46 @@ fn normalise_image_reference(reference: &str) -> String {
 // compose down
 // ---------------------------------------------------------------------------
 
+/// Kill and remove all containers listed in a stale project state, then
+/// remove the associated networks and DNS entries.  Called when compose up
+/// detects a dead supervisor with leftover state from a previous failed run.
+fn cleanup_stale_project(state: &ComposeProject) {
+    for svc_state in state.services.values() {
+        if svc_state.pid > 0 && check_liveness(svc_state.pid) {
+            unsafe { libc::kill(-svc_state.pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(container_dir(&svc_state.container_name));
+    }
+    for svc_name in state.services.keys() {
+        for net in &state.networks {
+            let _ = pelagos::dns::dns_remove_entry(net, svc_name);
+        }
+    }
+    for net in &state.networks {
+        if let Err(e) = super::network::cmd_network_rm(net) {
+            log::warn!(
+                "compose: stale cleanup: failed to remove network '{}': {}",
+                net,
+                e
+            );
+        }
+    }
+    let project_dir = pelagos::paths::compose_project_dir(&state.name);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+pub(crate) fn parse_signal(s: &str) -> libc::c_int {
+    match s.trim().to_uppercase().as_str() {
+        "" | "SIGTERM" => libc::SIGTERM,
+        "SIGQUIT" => libc::SIGQUIT,
+        "SIGINT" => libc::SIGINT,
+        "SIGHUP" => libc::SIGHUP,
+        "SIGUSR1" => libc::SIGUSR1,
+        "SIGUSR2" => libc::SIGUSR2,
+        other => other.parse::<libc::c_int>().unwrap_or(libc::SIGTERM),
+    }
+}
+
 fn cmd_compose_down(
     file: &std::path::Path,
     project_name: Option<&str>,
@@ -742,16 +871,42 @@ fn cmd_compose_down(
         }
     }
 
-    // Stop services in reverse order.
-    // Re-read the compose file to get topo order for reverse teardown.
-    let order: Vec<String> = if let Ok(content) = std::fs::read_to_string(file) {
+    // Re-read the compose file to get topo order, per-service grace periods, and
+    // stop signals.  Fall back gracefully if the file is unavailable.
+    let (order, grace_map, stop_signal_map) = if let Ok(content) = std::fs::read_to_string(file) {
         if let Ok(compose) = parse_compose(&content) {
-            topo_sort(&compose.services).unwrap_or_default()
+            let order = topo_sort(&compose.services).unwrap_or_default();
+            let grace: HashMap<String, u64> = compose
+                .services
+                .iter()
+                .map(|s| (s.name.clone(), s.stop_grace_period.unwrap_or(10)))
+                .collect();
+            // Resolve the stop signal: prefer the compose file's image manifest,
+            // fall back to SIGTERM when the manifest is unavailable.
+            let sig: HashMap<String, libc::c_int> = compose
+                .services
+                .iter()
+                .map(|s| {
+                    let raw_sig = resolve_image(&s.image)
+                        .map(|(_, m)| m.config.stop_signal.clone())
+                        .unwrap_or_default();
+                    (s.name.clone(), parse_signal(&raw_sig))
+                })
+                .collect();
+            (order, grace, sig)
         } else {
-            project_state.services.keys().cloned().collect()
+            (
+                project_state.services.keys().cloned().collect(),
+                HashMap::new(),
+                HashMap::new(),
+            )
         }
     } else {
-        project_state.services.keys().cloned().collect()
+        (
+            project_state.services.keys().cloned().collect(),
+            HashMap::new(),
+            HashMap::new(),
+        )
     };
 
     let reverse_order: Vec<String> = order.into_iter().rev().collect();
@@ -759,20 +914,31 @@ fn cmd_compose_down(
     for svc_name in &reverse_order {
         if let Some(svc_state) = project_state.services.get(svc_name) {
             let cn = &svc_state.container_name;
-            // SIGTERM
             if svc_state.pid > 0 && check_liveness(svc_state.pid) {
-                log::info!("compose: stopping service '{}'", svc_name);
-                unsafe { libc::kill(svc_state.pid, libc::SIGTERM) };
-                // Wait up to 10s.
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let stop_sig = stop_signal_map
+                    .get(svc_name)
+                    .copied()
+                    .unwrap_or(libc::SIGTERM);
+                let grace_secs = grace_map.get(svc_name).copied().unwrap_or(10);
+                log::info!(
+                    "compose: stopping service '{}' (signal {}, grace {}s)",
+                    svc_name,
+                    stop_sig,
+                    grace_secs
+                );
+                // Send stop signal to the entire process group so shell-entrypoint
+                // children (e.g. the real prometheus binary) are also terminated.
+                unsafe { libc::kill(-svc_state.pid, stop_sig) };
+                let deadline = Instant::now() + Duration::from_secs(grace_secs);
                 while Instant::now() < deadline && check_liveness(svc_state.pid) {
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                // SIGKILL if still alive.
                 if check_liveness(svc_state.pid) {
-                    log::warn!("compose: SIGKILL service '{}'", svc_name);
-                    unsafe { libc::kill(svc_state.pid, libc::SIGKILL) };
-                    std::thread::sleep(Duration::from_millis(500));
+                    log::warn!("compose: SIGKILL process group for service '{}'", svc_name);
+                    unsafe { libc::kill(-svc_state.pid, libc::SIGKILL) };
+                    // Give the kernel time to fully release file locks before
+                    // the next compose up starts a new instance.
+                    std::thread::sleep(Duration::from_millis(2000));
                 }
             }
             // Remove container state.
@@ -785,7 +951,7 @@ fn cmd_compose_down(
     for (svc_name, svc_state) in &project_state.services {
         if !reverse_order.contains(svc_name) {
             if svc_state.pid > 0 && check_liveness(svc_state.pid) {
-                unsafe { libc::kill(svc_state.pid, libc::SIGKILL) };
+                unsafe { libc::kill(-svc_state.pid, libc::SIGKILL) };
             }
             let dir = container_dir(&svc_state.container_name);
             let _ = std::fs::remove_dir_all(&dir);
