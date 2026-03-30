@@ -219,6 +219,34 @@ Tests for each issue ship in the same commit as the code.
 
 ---
 
+## Session completed: 2026-03-29 (SHA 80a92e6)
+
+### Issues resolved this session
+
+| # | Title | Fixed in |
+|---|-------|---------|
+| parallel test flakiness | fix: eliminate integration test flakiness under parallel execution | 80a92e6 |
+| #126 | feat: `pelagos system prune / system df` | b1517ae |
+| #127 | fix(storage): do not retain blobs after layer unpack | b6529fb |
+
+### Key implementation details
+
+**Parallel integration test flakiness (80a92e6):**
+Three root causes identified and fixed:
+1. **ECR/Docker Hub rate limits**: Multiple `ensure_alpine()` helpers unconditionally called
+   `pelagos image pull` even when image was cached. 20+ concurrent calls hit rate limits.
+   Fix: check `pelagos image ls` first, return early if image already present.
+2. **Serial-key group mismatch**: Basic bridge tests had no `#[serial]` attribute at all —
+   ran in parallel with NAT tests. Compose tests used unnamed `#[serial]` — could run
+   concurrently with `#[serial(nat)]` DNS tests. Fix: all networking-touching tests moved
+   to `#[serial(nat)]` key.
+3. **Watcher cleanup race in `pelagos rm --force`**: `cmd_rm` removed state dir before
+   watcher process finished nftables/veth cleanup. Fix: poll `state.watcher_pid` exit for
+   up to 5s before removing state dir (`src/cli/rm.rs`).
+Integration test baseline is now **306/306** passing in 3 consecutive parallel suite runs (~41s each).
+
+---
+
 ## Session completed: 2026-03-29 (SHA ce8c503, v0.59.0 + #159)
 
 ### Issues closed this session
