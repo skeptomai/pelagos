@@ -7088,6 +7088,71 @@ mod images {
         // Clean up the pulled image metadata (layers stay cached).
         let _ = image::remove_image(reference);
     }
+
+    /// test_pull_does_not_retain_blob
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Pulls a synthetic layer (written to a NamedTempFile to simulate a
+    /// downloaded blob) and asserts that after extract_layer() the blob file
+    /// does NOT exist in the blob store.  Overlays use the unpacked layer
+    /// directory directly; retaining the compressed blob would double disk
+    /// usage (issue #127).
+    ///
+    /// Failure indicates the pull path is saving blobs after extraction,
+    /// which would waste ~50% extra disk space per pulled image.
+    #[test]
+    #[serial]
+    fn test_pull_does_not_retain_blob() {
+        if !is_root() {
+            eprintln!("Skipping test_pull_does_not_retain_blob: requires root");
+            return;
+        }
+
+        use pelagos::image;
+
+        // Build a minimal tar.gz blob.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                std::fs::File::create(tmp.path()).unwrap(),
+                flate2::Compression::default(),
+            );
+            let mut builder = tar::Builder::new(gz);
+            let data = b"blob-test";
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(data.len() as u64);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            builder
+                .append_data(&mut hdr, "blob-test.txt", &data[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let digest = "sha256:test_no_blob_retained_cafebabe";
+        let layer_path = image::layer_dir(digest);
+        let blob_path = image::blob_path(digest);
+
+        // Pre-clean.
+        let _ = std::fs::remove_dir_all(&layer_path);
+        let _ = std::fs::remove_file(&blob_path);
+
+        image::extract_layer(digest, tmp.path()).expect("extract_layer");
+
+        assert!(
+            layer_path.exists(),
+            "layer dir should exist after extraction"
+        );
+        assert!(
+            !blob_path.exists(),
+            "blob file should NOT be retained after extraction (issue #127): {}",
+            blob_path.display()
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&layer_path);
+    }
 }
 
 mod exec {

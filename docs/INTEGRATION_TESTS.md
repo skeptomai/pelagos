@@ -3932,3 +3932,15 @@ generic "failed to bind" error.
 Failure indicates that EADDRNOTAVAIL on bind is not triggering the stale-config
 cleanup path, meaning the daemon will spam "failed to bind" on every SIGHUP for
 the lifetime of any unrelated compose stack (issue #168).
+
+### `test_pull_does_not_retain_blob`
+**Requires:** root (writes to `/var/lib/pelagos/`)
+**Module:** `images`
+
+Extracts a synthetic layer tarball via `image::extract_layer()` and asserts
+that the blob file does NOT exist in the blob store afterward.  Overlay mounts
+use the unpacked layer directory directly; retaining the compressed blob would
+double the on-disk cost of every pulled image.
+
+Failure indicates the pull path is persisting the compressed tarball after
+extraction, which would waste ~50% extra disk space per image (issue #127).

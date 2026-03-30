@@ -239,10 +239,7 @@ async fn pull_image(
     // must always fetch the manifest to detect upstream changes.
     if !is_mutable_tag(reference) {
         if let Ok(existing) = load_image(reference) {
-            let all_cached = existing
-                .layers
-                .iter()
-                .all(|d| layer_exists(d) && blob_exists(d));
+            let all_cached = existing.layers.iter().all(|d| layer_exists(d));
             if all_cached {
                 println!("Already present: {}", reference);
                 return Ok(());
@@ -282,7 +279,7 @@ async fn pull_image(
         let media_type = layer_desc.media_type.as_str();
         let is_wasm = pelagos::wasm::is_wasm_media_type(media_type);
 
-        if layer_exists(layer_digest) && blob_exists(layer_digest) {
+        if layer_exists(layer_digest) {
             cached += 1;
             println!(
                 "  Layer {}/{}: {} (cached{})",
@@ -310,10 +307,9 @@ async fn pull_image(
             .await
             .map_err(|e| format!("failed to pull layer {}: {}", layer_digest, e))?;
 
-        // Persist the raw blob for future push operations.
-        image::save_blob(layer_digest, &blob_data)?;
-
         // Extract the layer for container use, branching on mediaType.
+        // Write to a temp file first; the blob is not persisted — overlay mounts
+        // use the unpacked layer directory directly, halving on-disk image cost.
         if !layer_exists(layer_digest) {
             let mut tmp = tempfile::NamedTempFile::new()?;
             tmp.write_all(&blob_data)?;
@@ -374,13 +370,17 @@ async fn push_image(
         .map_err(|_| format!("OCI config not found for '{}' — re-pull or rebuild the image to populate the blob cache", src_ref))?;
 
     // Build ImageLayer list from the blob store.
+    // Blobs are not retained after pull (freed immediately after layer unpack).
+    // Only locally-built images keep their blobs for push.
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for digest in &manifest.layers {
         if !blob_exists(digest) {
             return Err(format!(
-                "blob not found for layer {} — re-pull or rebuild the image to populate the blob cache",
+                "blob not found for layer {} — pulled images do not retain blobs; \
+                 re-pull the image to export it, or use `pelagos image push` for built images",
                 &digest[..19.min(digest.len())]
-            ).into());
+            )
+            .into());
         }
         let data = image::load_blob(digest)?;
         println!(
@@ -741,7 +741,8 @@ pub fn cmd_image_save(
     for digest in &manifest.layers {
         if !blob_exists(digest) {
             return Err(format!(
-                "blob not found for layer {} — re-pull or rebuild to populate the blob cache",
+                "blob not found for layer {} — pulled images do not retain blobs; \
+                 re-pull the image before pushing",
                 &digest[..19.min(digest.len())]
             )
             .into());
@@ -975,9 +976,6 @@ pub fn cmd_image_load(
                 .get(&layer_key)
                 .ok_or_else(|| format!("missing blob: {}", layer_key))?;
 
-            if !blob_exists(layer_digest) {
-                image::save_blob(layer_digest, layer_data)?;
-            }
             if !layer_exists(layer_digest) {
                 let mut tmp = tempfile::NamedTempFile::new()?;
                 tmp.write_all(layer_data)?;
