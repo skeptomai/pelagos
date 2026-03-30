@@ -36,6 +36,7 @@ pub mod run;
 pub mod start;
 pub mod stop;
 pub mod subscribe;
+pub mod system;
 pub mod volume;
 
 // ---------------------------------------------------------------------------

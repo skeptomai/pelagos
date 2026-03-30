@@ -164,6 +164,13 @@ pub(crate) enum CliCommand {
         cmd: ContainerCmd,
     },
 
+    // ── System maintenance ────────────────────────────────────────────────
+    /// System-wide maintenance commands (disk usage, pruning)
+    System {
+        #[clap(subcommand)]
+        cmd: cli::system::SystemCmd,
+    },
+
     // ── Subscribe ─────────────────────────────────────────────────────────
     /// Stream container state events as NDJSON (for TUI clients)
     Subscribe,
@@ -555,6 +562,9 @@ fn main() {
 
         // Compose
         CliCommand::Compose { cmd } => cli::compose::cmd_compose(cmd),
+
+        // System
+        CliCommand::System { cmd } => cli::system::cmd_system(cmd),
 
         // Subscribe
         CliCommand::Subscribe => cli::subscribe::cmd_subscribe(),

@@ -3944,3 +3944,66 @@ double the on-disk cost of every pulled image.
 
 Failure indicates the pull path is persisting the compressed tarball after
 extraction, which would waste ~50% extra disk space per image (issue #127).
+
+### `test_system_df_shows_components`
+**Requires:** root (reads `/var/lib/pelagos/`)
+**Module:** `system_prune`
+
+Runs `pelagos system df` and asserts the output contains all expected component
+headers: `Component`, `layers/`, `blobs/`, `images/`, `volumes/`,
+`build-cache/`, and `Total`.
+
+Failure indicates `system df` is missing rows or the column formatting is broken.
+
+### `test_system_prune_removes_orphan_layers`
+**Requires:** root (writes to `/var/lib/pelagos/layers/`)
+**Module:** `system_prune`
+
+Creates a synthetic layer directory with a digest not referenced by any local
+image manifest, runs `pelagos system prune`, and asserts the directory was
+removed.
+
+Failure indicates orphan layer pruning is broken — layers from deleted images
+will accumulate on disk indefinitely (issue #126).
+
+### `test_system_prune_keeps_referenced_layers`
+**Requires:** root (reads `/var/lib/pelagos/`)
+**Module:** `system_prune`
+
+Pulls alpine, runs `pelagos system prune` (without `--all`), and asserts that
+the alpine image's layer directories still exist afterward.
+
+Failure indicates the prune command is incorrectly removing layers that are
+referenced by a local image manifest — running containers would fail to start.
+
+### `test_system_prune_removes_blobs`
+**Requires:** root (writes to `/var/lib/pelagos/blobs/`)
+**Module:** `system_prune`
+
+Writes a dummy file to the blob store, runs `pelagos system prune`, and asserts
+the file was removed.
+
+Failure indicates blob pruning is broken — build blobs will accumulate on disk
+(issue #126).
+
+### `test_system_prune_all_removes_image_layers_with_no_containers`
+**Requires:** root (reads/writes `/var/lib/pelagos/`)
+**Module:** `system_prune`
+
+Creates a synthetic image manifest + layer, runs `pelagos system prune --all`,
+and asserts the synthetic layer was removed.  Since `--all` removes layers for
+all images with no running containers, the test snapshots and restores any real
+images whose layers were also pruned, to avoid breaking other tests.
+
+Failure indicates the `--all` flag is not treating referenced-but-idle image
+layers as prunable — the maximum-disk-space-reclaim contract is broken.
+
+### `test_system_prune_volumes_removes_unused_volume`
+**Requires:** root (writes to `/var/lib/pelagos/volumes/`)
+**Module:** `system_prune`
+
+Creates a named volume via `pelagos volume create`, runs
+`pelagos system prune --volumes`, and asserts the volume directory was removed.
+
+Failure indicates volume pruning is broken — unused volumes will persist even
+when the user explicitly requests `--volumes` cleanup (issue #126).

@@ -369,23 +369,19 @@ async fn push_image(
     let config_json = image::load_oci_config(src_ref)
         .map_err(|_| format!("OCI config not found for '{}' — re-pull or rebuild the image to populate the blob cache", src_ref))?;
 
-    // Build ImageLayer list from the blob store.
-    // Blobs are not retained after pull (freed immediately after layer unpack).
-    // Only locally-built images keep their blobs for push.
+    // Build ImageLayer list. Re-synthesize blobs from layer dirs when needed
+    // (pulled images do not retain blobs after layer unpack — issue #127).
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for digest in &manifest.layers {
-        if !blob_exists(digest) {
-            return Err(format!(
-                "blob not found for layer {} — pulled images do not retain blobs; \
-                 re-pull the image to export it, or use `pelagos image push` for built images",
-                &digest[..19.min(digest.len())]
-            )
-            .into());
-        }
-        let data = image::load_blob(digest)?;
+        let data = ensure_blob(digest)?;
+        // Recompute digest from actual bytes (re-synthesized blobs may differ).
+        let actual_digest = format!("sha256:{:x}", {
+            use sha2::{Digest as _, Sha256};
+            Sha256::digest(&data)
+        });
         println!(
             "  Layer {}: {} bytes",
-            &digest[7..19.min(digest.len())],
+            &actual_digest[7..19.min(actual_digest.len())],
             data.len()
         );
         layers.push(ImageLayer::oci_v1_gzip(data, None));
@@ -716,6 +712,44 @@ pub fn cmd_image_tag(source: &str, target: &str) -> Result<(), Box<dyn std::erro
 // image save
 // ---------------------------------------------------------------------------
 
+/// Ensure a blob exists for `digest`.
+///
+/// Pulled images do not retain blobs after layer unpack (issue #127).  When
+/// `save` or `push` needs raw compressed bytes for a layer, we re-synthesize
+/// the blob on the fly from the unpacked layer directory and store it in the
+/// blob cache so subsequent operations are fast.
+///
+/// Returns the blob bytes, or an error if the layer directory is also missing.
+fn ensure_blob(digest: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if blob_exists(digest) {
+        return Ok(image::load_blob(digest)?);
+    }
+    let layer_dir = image::layer_dir(digest);
+    if !layer_dir.exists() {
+        return Err(format!(
+            "layer {} not found locally — re-pull or rebuild the image",
+            &digest[..19.min(digest.len())]
+        )
+        .into());
+    }
+    // Re-create blob from the unpacked layer directory.
+    log::info!(
+        "blob missing for layer {}; re-synthesizing from layer dir",
+        &digest[7..19.min(digest.len())]
+    );
+    let new_digest = pelagos::build::create_layer_from_dir(&layer_dir).map_err(|e| {
+        format!(
+            "failed to re-create blob for layer {}: {}",
+            &digest[7..19.min(digest.len())],
+            e
+        )
+    })?;
+    // `create_layer_from_dir` stores the blob under the digest it computes,
+    // which may differ if the original blob was compressed differently.
+    // Load whichever digest was produced.
+    Ok(image::load_blob(&new_digest)?)
+}
+
 /// Save a locally stored image to an OCI Image Layout tar archive.
 ///
 /// Output goes to `output` (a file path) or stdout if `None`.
@@ -736,18 +770,10 @@ pub fn cmd_image_save(
     })?;
     let config_bytes = config_json.into_bytes();
 
-    // Collect layer blobs.
+    // Collect layer blobs (re-synthesize from layer dir if blob was not retained).
     let mut layer_blobs: Vec<(String, Vec<u8>)> = Vec::new();
     for digest in &manifest.layers {
-        if !blob_exists(digest) {
-            return Err(format!(
-                "blob not found for layer {} — pulled images do not retain blobs; \
-                 re-pull the image before pushing",
-                &digest[..19.min(digest.len())]
-            )
-            .into());
-        }
-        layer_blobs.push((digest.clone(), image::load_blob(digest)?));
+        layer_blobs.push((digest.clone(), ensure_blob(digest)?));
     }
 
     let tar_bytes = build_oci_tar(&src_ref, &config_bytes, &layer_blobs)?;
@@ -783,9 +809,17 @@ pub(crate) fn build_oci_tar(
     let config_hex = config_digest.strip_prefix("sha256:").unwrap();
 
     // Build OCI manifest JSON.
-    let layer_descriptors: Vec<serde_json::Value> = layer_blobs
+    // Always compute the digest from the actual blob bytes so the archive is
+    // self-consistent regardless of whether the digest stored in the local
+    // manifest matches the re-synthesized blob.
+    let layer_digests: Vec<String> = layer_blobs
         .iter()
-        .map(|(digest, data)| {
+        .map(|(_orig, data)| format!("sha256:{:x}", Sha256::digest(data)))
+        .collect();
+    let layer_descriptors: Vec<serde_json::Value> = layer_digests
+        .iter()
+        .zip(layer_blobs.iter())
+        .map(|(digest, (_orig, data))| {
             serde_json::json!({
                 "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
                 "digest": digest,
@@ -851,7 +885,7 @@ pub(crate) fn build_oci_tar(
             &format!("blobs/sha256/{}", config_hex),
             config_bytes,
         )?;
-        for (digest, data) in layer_blobs {
+        for (digest, (_orig, data)) in layer_digests.iter().zip(layer_blobs.iter()) {
             let hex = digest.strip_prefix("sha256:").unwrap_or(digest.as_str());
             add(&mut ar, &format!("blobs/sha256/{}", hex), data)?;
         }

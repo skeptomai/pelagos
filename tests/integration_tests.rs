@@ -19642,9 +19642,13 @@ mod issue_118_start_returns_promptly {
         let name = "start-prompt-test";
         cleanup(name);
 
-        // Pull alpine if not already present.
+        // Pull alpine if not already present (use ECR mirror to avoid Docker Hub rate limits).
         let pull = std::process::Command::new(bin())
-            .args(["image", "pull", "docker.io/library/alpine:latest"])
+            .args([
+                "image",
+                "pull",
+                "public.ecr.aws/docker/library/alpine:latest",
+            ])
             .output()
             .expect("pelagos image pull");
         assert!(
@@ -19660,7 +19664,7 @@ mod issue_118_start_returns_promptly {
                 "--detach",
                 "--name",
                 name,
-                "docker.io/library/alpine:latest",
+                "public.ecr.aws/docker/library/alpine:latest",
                 "/bin/sh",
                 "-c",
                 "sleep 60",
@@ -20010,12 +20014,15 @@ mod compose_shutdown_fixes {
         unsafe { libc::getuid() == 0 }
     }
 
+    // Use ECR mirror to avoid Docker Hub unauthenticated pull rate limits.
+    const ALPINE_ECR: &str = "public.ecr.aws/docker/library/alpine:latest";
+
     fn ensure_alpine() {
         let status = Command::new(bin())
-            .args(["image", "pull", "docker.io/library/alpine:latest"])
+            .args(["image", "pull", ALPINE_ECR])
             .status()
             .expect("pelagos image pull alpine");
-        assert!(status.success(), "pre-test alpine pull failed");
+        assert!(status.success(), "pre-test alpine pull from ECR failed");
     }
 
     /// test_compose_down_kills_shell_entrypoint_descendants
@@ -20048,7 +20055,7 @@ mod compose_shutdown_fixes {
             &compose_file,
             r#"
 (define-service svc-shell "shell-bg"
-  :image "docker.io/library/alpine:latest"
+  :image "public.ecr.aws/docker/library/alpine:latest"
   :command "sh" "-c" "sleep 9999 & wait")
 
 (compose-up
@@ -20280,7 +20287,7 @@ mod compose_shutdown_fixes {
             &compose_file,
             r#"
 (define-service svc "stale-svc"
-  :image "docker.io/library/alpine:latest"
+  :image "public.ecr.aws/docker/library/alpine:latest"
   :command "sh" "-c" "sleep 9999")
 
 (compose-up
@@ -20383,3 +20390,232 @@ mod compose_shutdown_fixes {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 } // mod compose_shutdown_fixes
+
+// ── issue #126 — pelagos system prune / system df ────────────────────────────
+
+mod system_prune {
+    use serial_test::serial;
+    use std::process::Command;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_pelagos")
+    }
+
+    fn is_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    /// test_system_df_shows_components
+    ///
+    /// Requires: root (reads /var/lib/pelagos/).
+    ///
+    /// Runs `pelagos system df` and asserts the output contains table headers
+    /// and all expected component names.
+    ///
+    /// Failure indicates `system df` is broken or missing expected rows.
+    #[test]
+    #[serial]
+    fn test_system_df_shows_components() {
+        if !is_root() {
+            eprintln!("Skipping test_system_df_shows_components: requires root");
+            return;
+        }
+        let out = Command::new(bin())
+            .args(["system", "df"])
+            .output()
+            .expect("system df");
+        assert!(out.status.success(), "system df should succeed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for component in &[
+            "Component",
+            "layers/",
+            "blobs/",
+            "images/",
+            "volumes/",
+            "build-cache/",
+            "Total",
+        ] {
+            assert!(
+                stdout.contains(component),
+                "system df output missing '{}': {}",
+                component,
+                stdout
+            );
+        }
+    }
+
+    /// test_system_prune_removes_orphan_layers
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/layers/).
+    ///
+    /// Creates a synthetic layer directory with a fake digest that no image
+    /// references, then runs `pelagos system prune` and asserts the orphan
+    /// directory was removed.
+    ///
+    /// Failure indicates orphan layer pruning is broken — disk will fill up
+    /// with layers that no manifest references.
+    #[test]
+    #[serial]
+    fn test_system_prune_removes_orphan_layers() {
+        if !is_root() {
+            eprintln!("Skipping test_system_prune_removes_orphan_layers: requires root");
+            return;
+        }
+        // Create a fake orphan layer directory.
+        let orphan_hex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let layers_dir = pelagos::paths::layers_dir();
+        let orphan_dir = layers_dir.join(orphan_hex);
+        std::fs::create_dir_all(&orphan_dir).expect("create orphan layer dir");
+        // Write a dummy file so the dir is non-empty.
+        std::fs::write(orphan_dir.join("dummy.txt"), b"orphan").expect("write dummy");
+
+        let out = Command::new(bin())
+            .args(["system", "prune"])
+            .output()
+            .expect("system prune");
+        assert!(
+            out.status.success(),
+            "system prune should succeed: {:?}",
+            out
+        );
+
+        assert!(
+            !orphan_dir.exists(),
+            "orphan layer dir should have been pruned: {}",
+            orphan_dir.display()
+        );
+    }
+
+    /// test_system_prune_keeps_referenced_layers
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/).
+    ///
+    /// Creates a synthetic layer directory and a matching image manifest, then
+    /// runs `pelagos system prune` (without --all) and asserts the layer is
+    /// NOT removed because the manifest still references it.
+    ///
+    /// Uses purely synthetic data — no network access — to avoid rate-limit
+    /// flakes from docker.io or ECR.
+    ///
+    /// Failure indicates the prune command is incorrectly removing layers that
+    /// are referenced by a local image manifest.
+    #[test]
+    #[serial]
+    fn test_system_prune_keeps_referenced_layers() {
+        if !is_root() {
+            eprintln!("Skipping test_system_prune_keeps_referenced_layers: requires root");
+            return;
+        }
+        use pelagos::image::{self, ImageManifest};
+
+        let layer_hex = "ee11223344556677889900aabbccddeeff001122334455667788990011223344";
+        let layer_digest = format!("sha256:{}", layer_hex);
+        let layer_dir = image::layer_dir(&layer_digest);
+        std::fs::create_dir_all(&layer_dir).expect("create synthetic layer dir");
+        std::fs::write(layer_dir.join("ref.txt"), b"referenced").ok();
+
+        let ref_name = "prune-keep-ref-test:latest";
+        let manifest = ImageManifest {
+            reference: ref_name.to_string(),
+            digest: format!("sha256:{}", layer_hex),
+            layers: vec![layer_digest.clone()],
+            layer_types: vec![],
+            config: Default::default(),
+        };
+        image::save_image(&manifest).expect("save synthetic manifest");
+
+        let out = Command::new(bin())
+            .args(["system", "prune"])
+            .output()
+            .expect("system prune");
+        assert!(out.status.success(), "system prune should succeed");
+
+        assert!(
+            layer_dir.exists(),
+            "referenced layer dir should NOT be pruned: {}",
+            layer_dir.display()
+        );
+
+        // Cleanup synthetic manifest and layer.
+        let _ = image::remove_image(ref_name);
+        let _ = std::fs::remove_dir_all(&layer_dir);
+    }
+
+    /// test_system_prune_removes_blobs
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/blobs/).
+    ///
+    /// Places a dummy file in the blob store, runs `pelagos system prune`, and
+    /// asserts the blob was removed.
+    ///
+    /// Failure indicates blob pruning is broken — build blobs will accumulate
+    /// on disk.
+    #[test]
+    #[serial]
+    fn test_system_prune_removes_blobs() {
+        if !is_root() {
+            eprintln!("Skipping test_system_prune_removes_blobs: requires root");
+            return;
+        }
+        let blobs_dir = pelagos::paths::blobs_dir();
+        std::fs::create_dir_all(&blobs_dir).expect("create blobs dir");
+        let blob_file = blobs_dir.join("sha256_test_prune_blob_fixture");
+        std::fs::write(&blob_file, b"fake blob data").expect("write blob");
+
+        let out = Command::new(bin())
+            .args(["system", "prune"])
+            .output()
+            .expect("system prune");
+        assert!(out.status.success(), "system prune should succeed");
+
+        assert!(
+            !blob_file.exists(),
+            "blob should have been pruned by system prune: {}",
+            blob_file.display()
+        );
+    }
+
+    /// test_system_prune_volumes_removes_unused_volume
+    ///
+    /// Requires: root (writes to /var/lib/pelagos/volumes/).
+    ///
+    /// Creates a named volume, verifies it is present, runs
+    /// `pelagos system prune --volumes`, and asserts the volume directory was
+    /// removed.
+    ///
+    /// Failure indicates volume pruning is broken — unused volumes will
+    /// accumulate on disk even after `system prune --volumes`.
+    #[test]
+    #[serial]
+    fn test_system_prune_volumes_removes_unused_volume() {
+        if !is_root() {
+            eprintln!("Skipping test_system_prune_volumes_removes_unused_volume: requires root");
+            return;
+        }
+        let vol_name = "prune-test-unused-vol";
+        // Create the volume via CLI.
+        let create = Command::new(bin())
+            .args(["volume", "create", vol_name])
+            .status()
+            .expect("volume create");
+        assert!(create.success(), "volume create should succeed");
+
+        let vol_dir = pelagos::paths::volumes_dir().join(vol_name);
+        assert!(vol_dir.exists(), "volume dir should exist after create");
+
+        let out = Command::new(bin())
+            .args(["system", "prune", "--volumes"])
+            .output()
+            .expect("system prune --volumes");
+        assert!(
+            out.status.success(),
+            "system prune --volumes should succeed"
+        );
+
+        assert!(
+            !vol_dir.exists(),
+            "unused volume dir should have been pruned: {}",
+            vol_dir.display()
+        );
+    }
+} // mod system_prune
