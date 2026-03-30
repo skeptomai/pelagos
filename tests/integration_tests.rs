@@ -11182,6 +11182,7 @@ mod dns {
     /// removal, meaning the daemon will spam "failed to bind" on every SIGHUP for
     /// the lifetime of any unrelated compose stack (issue #168).
     #[test]
+    #[serial(nat)]
     fn test_dns_stale_config_removed_on_bind_failure() {
         if !is_root() {
             eprintln!("Skipping test_dns_stale_config_removed_on_bind_failure (requires root)");
@@ -15023,9 +15024,16 @@ mod tutorial_e2e_p1 {
     }
 
     /// Pull the alpine OCI image if it is not already cached locally.
-    /// Idempotent: fast no-op when alpine is already in the image store.
-    /// Ensures tests are self-contained when run in isolation.
+    /// Checks local image store first to avoid registry rate limits when
+    /// many tests run concurrently.
     fn ensure_alpine() {
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            return;
+        }
         let status = std::process::Command::new(bin())
             .args(["image", "pull", "alpine:3.21"])
             .status()
@@ -15680,6 +15688,13 @@ mod tutorial_e2e_p2 {
     }
 
     fn ensure_alpine() {
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            return;
+        }
         let status = std::process::Command::new(bin())
             .args(["image", "pull", "alpine:3.21"])
             .status()
@@ -15913,6 +15928,13 @@ mod tutorial_e2e_p3 {
     }
 
     fn ensure_alpine() {
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            return;
+        }
         let status = std::process::Command::new(bin())
             .args(["image", "pull", "alpine:3.21"])
             .status()
@@ -16110,7 +16132,7 @@ mod tutorial_e2e_p3 {
     /// Failure indicates bridge setup, NAT (nftables MASQUERADE), or TCP DNAT port
     /// forwarding is broken.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(nat)]
     fn test_tut_p3_network_bridge_nat_port() {
         if !is_root() {
             eprintln!("SKIP test_tut_p3_network_bridge_nat_port: requires root");
@@ -16194,6 +16216,13 @@ mod tutorial_e2e_p4 {
     }
 
     fn ensure_alpine() {
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
+            return;
+        }
         let status = std::process::Command::new(bin())
             .args(["image", "pull", "alpine:3.21"])
             .status()
@@ -19643,19 +19672,28 @@ mod issue_118_start_returns_promptly {
         cleanup(name);
 
         // Pull alpine if not already present (use ECR mirror to avoid Docker Hub rate limits).
-        let pull = std::process::Command::new(bin())
-            .args([
-                "image",
-                "pull",
-                "public.ecr.aws/docker/library/alpine:latest",
-            ])
+        // Check locally first to avoid hitting ECR rate limits when tests run concurrently.
+        let ls = std::process::Command::new(bin())
+            .args(["image", "ls"])
             .output()
-            .expect("pelagos image pull");
-        assert!(
-            pull.status.success(),
-            "image pull failed: {}",
-            String::from_utf8_lossy(&pull.stderr)
-        );
+            .expect("pelagos image ls");
+        if !String::from_utf8_lossy(&ls.stdout)
+            .contains("public.ecr.aws/docker/library/alpine:latest")
+        {
+            let pull = std::process::Command::new(bin())
+                .args([
+                    "image",
+                    "pull",
+                    "public.ecr.aws/docker/library/alpine:latest",
+                ])
+                .output()
+                .expect("pelagos image pull");
+            assert!(
+                pull.status.success(),
+                "image pull failed: {}",
+                String::from_utf8_lossy(&pull.stderr)
+            );
+        }
 
         // 1. Start a long-running container detached.
         let out = std::process::Command::new(bin())
@@ -20018,6 +20056,13 @@ mod compose_shutdown_fixes {
     const ALPINE_ECR: &str = "public.ecr.aws/docker/library/alpine:latest";
 
     fn ensure_alpine() {
+        let ls = Command::new(bin())
+            .args(["image", "ls"])
+            .output()
+            .expect("pelagos image ls");
+        if String::from_utf8_lossy(&ls.stdout).contains(ALPINE_ECR) {
+            return;
+        }
         let status = Command::new(bin())
             .args(["image", "pull", ALPINE_ECR])
             .status()
