@@ -10442,13 +10442,38 @@ mod dns {
             net_def.gateway
         );
 
-        // Sanity-check that the daemon can reach upstream DNS from the host
-        // before spinning up a container.  If upstream is unreachable the test
-        // is skipped rather than hanging for 30 s.
-        let upstream_ok = wait_for_dns("8.8.8.8".parse().unwrap(), 53, 1000);
+        // Sanity-check that the daemon can reach upstream DNS via TCP from the
+        // host before spinning up a container.  pelagos-dns uses DNS-over-TCP
+        // (RFC 7766) for forwarding.  We do a full DNS-over-TCP round-trip here
+        // (not just a TCP connect) because some virtualised networks complete
+        // the TCP handshake locally but silently drop data to port 53.
+        let upstream_ok = {
+            use std::io::{Read as _, Write as _};
+            use std::net::TcpStream;
+            use std::time::Duration;
+            // Minimal DNS query for "." A record.
+            let query: &[u8] = &[
+                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header
+                0x00,       // QNAME: root label
+                0x00, 0x01, // QTYPE A
+                0x00, 0x01, // QCLASS IN
+            ];
+            let addr: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+            (|| -> std::io::Result<bool> {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+                s.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let len = (query.len() as u16).to_be_bytes();
+                s.write_all(&len)?;
+                s.write_all(query)?;
+                let mut lbuf = [0u8; 2];
+                s.read_exact(&mut lbuf)?;
+                Ok(true)
+            })()
+            .unwrap_or(false)
+        };
         if !upstream_ok {
             eprintln!(
-                "Skipping test_dns_upstream_forward: upstream 8.8.8.8:53 not reachable from host"
+                "Skipping test_dns_upstream_forward: upstream 8.8.8.8:53 not reachable via TCP from host"
             );
             pelagos::dns::dns_remove_entry(net_name, "dummy").ok();
             unsafe { libc::kill(holder.pid(), libc::SIGTERM) };

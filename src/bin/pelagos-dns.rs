@@ -7,8 +7,8 @@
 //! Reloads configuration on SIGHUP. Auto-exits when all config files are empty.
 
 use std::collections::HashMap;
-use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::{self, Read as _, Write as _};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -395,34 +395,64 @@ impl ServerState {
 
 // ── Upstream forwarding ──────────────────────────────────────────────────────
 
-/// Forward a raw DNS packet to upstream servers. Returns the response or None.
+/// Forward a raw DNS packet to upstream servers via TCP (RFC 7766).
+///
+/// DNS-over-TCP uses a 2-byte big-endian length prefix before each message.
+/// TCP is used instead of UDP because some network environments (e.g. virtualised
+/// NAT networks) silently drop outbound UDP/53 while allowing TCP/53.
 fn forward_upstream(raw: &[u8], upstream: &[Ipv4Addr]) -> Option<Vec<u8>> {
     for &server in upstream {
         let addr = SocketAddr::new(std::net::IpAddr::V4(server), 53);
-        let sock = match UdpSocket::bind("0.0.0.0:0") {
+        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
 
-        if sock.send_to(raw, addr).is_err() {
+        // DNS-over-TCP: 2-byte length prefix followed by the query.
+        let len = raw.len() as u16;
+        let prefix = len.to_be_bytes();
+        if stream.write_all(&prefix).is_err() || stream.write_all(raw).is_err() {
             continue;
         }
 
-        let mut buf = [0u8; 4096];
-        // Retry on EINTR (e.g. SIGHUP delivered during the blocking recv).
-        let result = loop {
-            match sock.recv_from(&mut buf) {
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                other => break other,
-            }
-        };
-        match result {
-            Ok((n, _)) => return Some(buf[..n].to_vec()),
-            Err(_) => continue,
+        // Read the 2-byte response length prefix.
+        let mut len_buf = [0u8; 2];
+        if read_exact_retry(&mut stream, &mut len_buf).is_err() {
+            continue;
         }
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        if resp_len == 0 || resp_len > 4096 {
+            continue;
+        }
+
+        // Read the response body.
+        let mut resp = vec![0u8; resp_len];
+        if read_exact_retry(&mut stream, &mut resp).is_err() {
+            continue;
+        }
+        return Some(resp);
     }
     None
+}
+
+/// `read_exact` that retries on `Interrupted`.
+fn read_exact_retry(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 // ── SIGHUP handling ──────────────────────────────────────────────────────────
