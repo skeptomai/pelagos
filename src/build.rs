@@ -708,24 +708,22 @@ fn execute_stage(
                 local_ref,
                 normalised
             );
-            let base_manifest = match image::load_image(&local_ref)
-                .or_else(|_| image::load_image(&normalised))
-            {
-                Ok(m) => m,
-                Err(_) => {
-                    if let Some(pull) = pull_fn {
-                        eprintln!("Unable to find image '{}' locally, pulling...", base_ref);
-                        pull(&normalised).map_err(|e| {
-                            BuildError::PullFailed(base_ref.clone(), e)
-                        })?;
-                        image::load_image(&local_ref)
-                            .or_else(|_| image::load_image(&normalised))
-                            .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?
-                    } else {
-                        return Err(BuildError::ImageNotFound(base_ref.clone()));
+            let base_manifest =
+                match image::load_image(&local_ref).or_else(|_| image::load_image(&normalised)) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        if let Some(pull) = pull_fn {
+                            eprintln!("Unable to find image '{}' locally, pulling...", base_ref);
+                            pull(&normalised)
+                                .map_err(|e| BuildError::PullFailed(base_ref.clone(), e))?;
+                            image::load_image(&local_ref)
+                                .or_else(|_| image::load_image(&normalised))
+                                .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?
+                        } else {
+                            return Err(BuildError::ImageNotFound(base_ref.clone()));
+                        }
                     }
-                }
-            };
+                };
             (base_manifest.layers.clone(), base_manifest.config.clone())
         }
     } else {
