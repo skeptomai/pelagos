@@ -176,28 +176,39 @@ pub fn apply_landlock(rules: &[LandlockRule]) -> io::Result<()> {
         return Ok(()); // Kernel < 5.13 or Landlock not compiled in.
     }
 
-    // handled_access_fs: the set of rights this ruleset controls (deny by default).
-    // We restrict all rights the running ABI version knows about.
-    let handled_access = fs_access_mask_for_abi(abi);
-
-    let attr = LandlockRulesetAttr {
-        handled_access_fs: handled_access,
-    };
-    let ruleset_fd = unsafe {
-        let ret = libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            &attr as *const LandlockRulesetAttr,
-            std::mem::size_of::<LandlockRulesetAttr>() as libc::size_t,
-            0i64,
-        );
-        if ret < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::ENOSYS) {
-                return Ok(()); // Race: ABI check passed but create failed.
+    // Create the ruleset, probing downward through ABI versions on EINVAL.
+    //
+    // Some vendor-patched kernels (e.g. Ubuntu 6.8.0 HWE) report ABI=4 via the
+    // version query but return EINVAL when LANDLOCK_ACCESS_FS_IOCTL_DEV (bit 15)
+    // is included in handled_access_fs.  We fall back to successively lower ABI
+    // masks until landlock_create_ruleset accepts the request.
+    let (ruleset_fd, handled_access) = {
+        let mut abi_try = abi;
+        loop {
+            let mask = fs_access_mask_for_abi(abi_try);
+            let attr = LandlockRulesetAttr {
+                handled_access_fs: mask,
+            };
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_landlock_create_ruleset,
+                    &attr as *const LandlockRulesetAttr,
+                    std::mem::size_of::<LandlockRulesetAttr>() as libc::size_t,
+                    0i64,
+                )
+            };
+            if ret >= 0 {
+                break (ret as i32, mask);
             }
-            return Err(e);
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::ENOSYS) => return Ok(()), // Race: ABI check passed but create failed.
+                Some(libc::EINVAL) if abi_try > 1 => {
+                    abi_try -= 1; // Retry with next lower ABI mask.
+                }
+                _ => return Err(e),
+            }
         }
-        ret as i32
     };
 
     for rule in rules {
