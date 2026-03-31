@@ -15713,6 +15713,8 @@ mod tutorial_e2e_p1 {
 // ============================================================================
 
 mod tutorial_e2e_p2 {
+    use serial_test::serial;
+
     fn bin() -> &'static str {
         env!("CARGO_BIN_EXE_pelagos")
     }
@@ -15886,10 +15888,21 @@ mod tutorial_e2e_p2 {
     /// a container, or static binary execution in the final Alpine stage is broken.
     #[test]
     #[ignore]
+    #[serial]
     fn test_tut_p2_multistage_go_build() {
         let ctx = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/tutorial-e2e/p2-go");
         let tag = "tut-p2-go:latest";
         cleanup_image(tag);
+
+        // Pre-pull base images: golang:1.22-alpine (builder) and alpine (final stage).
+        // pelagos build does not auto-pull base images.
+        for img in &["golang:1.22-alpine", "alpine:latest"] {
+            let pull = std::process::Command::new(bin())
+                .args(["image", "pull", img])
+                .status()
+                .expect("pelagos image pull");
+            assert!(pull.success(), "failed to pull {}", img);
+        }
 
         let build_out = std::process::Command::new(bin())
             .args(["build", "-t", tag, ctx])

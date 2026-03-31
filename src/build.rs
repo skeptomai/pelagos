@@ -1308,6 +1308,18 @@ fn execute_run(
         );
     }
 
+    // Guarantee HOME is always set — some tools (go, pip, npm, …) need it to
+    // locate their cache directories and will abort with an error if it is
+    // absent.  Docker injects HOME=/root for root-run containers when the image
+    // config omits it; we match that behaviour here.
+    if !config
+        .env
+        .iter()
+        .any(|e| e == "HOME" || e.starts_with("HOME="))
+    {
+        cmd = cmd.env("HOME", "/root");
+    }
+
     // Apply accumulated workdir.
     if !config.working_dir.is_empty() {
         cmd = cmd.with_cwd(&config.working_dir);
