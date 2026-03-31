@@ -10453,8 +10453,9 @@ mod dns {
             use std::time::Duration;
             // Minimal DNS query for "." A record.
             let query: &[u8] = &[
-                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header
-                0x00,       // QNAME: root label
+                0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, // header
+                0x00, // QNAME: root label
                 0x00, 0x01, // QTYPE A
                 0x00, 0x01, // QCLASS IN
             ];
@@ -12528,7 +12529,7 @@ mod registry_auth {
     /// ```
     #[test]
     #[ignore]
-    #[serial]
+    #[serial(nat)]
     fn test_local_registry_push_pull_roundtrip() {
         if !is_root() {
             eprintln!("Skipping: requires root");
@@ -12667,7 +12668,7 @@ mod registry_auth {
     /// ```
     #[test]
     #[ignore]
-    #[serial]
+    #[serial(nat)]
     fn test_local_registry_auth_roundtrip() {
         if !is_root() {
             eprintln!("Skipping: requires root");
@@ -14093,6 +14094,7 @@ mod wasm_build_tests {
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build should succeed for FROM scratch + COPY .wasm");
 
@@ -14137,6 +14139,7 @@ mod wasm_build_tests {
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build should succeed");
 
@@ -14176,6 +14179,7 @@ mod wasm_build_tests {
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build should succeed");
 
@@ -14211,6 +14215,7 @@ mod wasm_build_tests {
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build should succeed");
 
@@ -14424,6 +14429,7 @@ CMD [\"/usr/local/bin/script.sh\"]\n";
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build with COPY + RUN chmod should succeed");
 
@@ -14521,6 +14527,7 @@ CMD [\"/usr/local/bin/script.sh\"]\n";
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build should succeed");
 
@@ -14601,6 +14608,7 @@ CMD [\"cat\", \"/tmp/ctx/sentinelfile\"]\n";
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build with COPY . /dest/ should succeed (issue #103)");
 
@@ -14682,6 +14690,7 @@ COPY marker /marker\n";
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("base image build should succeed");
 
@@ -14697,6 +14706,7 @@ CMD [\"cat\", \"/marker\"]\n";
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("derived image build FROM local tag should succeed (issue #104)");
 
@@ -14788,6 +14798,7 @@ CMD [\"cat\", \"/marker\"]\n";
             NetworkMode::None,
             false,
             &build_args,
+            None,
         )
         .expect(
             "execute_build with FROM ${VAR} stage alias (--build-arg) should succeed (issue #105)",
@@ -14866,6 +14877,7 @@ CMD [\"cat\", \"/marker2\"]\n";
             NetworkMode::None,
             false,
             &HashMap::new(), // no --build-arg
+            None,
         )
         .expect(
             "execute_build with FROM ${VAR} stage alias (ARG default) should succeed (issue #105)",
@@ -14944,6 +14956,7 @@ CMD [\"cat\", \"/chown-marker\"]\n";
             NetworkMode::None,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build with COPY --chown= --from= should succeed (issue #106)");
 
@@ -15876,7 +15889,7 @@ mod tutorial_e2e_p2 {
 
     /// test_tut_p2_multistage_go_build
     ///
-    /// Rootless. Marked #[ignore] because it pulls golang:1.22-alpine and compiles
+    /// Rootless. Marked #[ignore] because it auto-pulls golang:1.22-alpine and compiles
     /// Go source, making it slow and network-dependent.
     ///
     /// Builds `scripts/tutorial-e2e/p2-go/` (two-stage: golang builder → alpine final),
@@ -18347,6 +18360,7 @@ mod issue_109_run_finds_built_image {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build");
 
@@ -18449,6 +18463,7 @@ mod issue_110_pasta_stdin_isolation {
             pelagos::network::NetworkMode::Pasta,
             false,
             &HashMap::new(),
+            None,
         );
 
         // Restore RUST_LOG regardless of success/failure.
@@ -18532,6 +18547,7 @@ mod issue_110_pasta_stdin_isolation {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         );
 
         // Restore PATH regardless of outcome.
@@ -18648,6 +18664,7 @@ mod issue_110_path_fallback {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         );
 
         let _ = image::remove_image(test_tag);
@@ -18744,6 +18761,7 @@ mod issue_110_env_path_substitution {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         );
 
         let manifest = result.expect(
@@ -18839,6 +18857,7 @@ mod issue_111_tmp_writable {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         );
 
         let manifest = result.expect(
@@ -18935,6 +18954,7 @@ mod issue_111_tmp_writable {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         );
 
         result.expect(
@@ -19012,6 +19032,7 @@ mod issue_111_tmp_writable {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         );
 
         let manifest = result.expect(
@@ -19101,6 +19122,7 @@ mod issue_111_tmp_writable {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         );
 
         let manifest = result.expect(
@@ -19187,6 +19209,7 @@ mod issue_112_ca_cert_bind_mount {
             pelagos::network::NetworkMode::Pasta,
             false,
             &HashMap::new(),
+            None,
         );
 
         result.expect(
@@ -19257,6 +19280,7 @@ mod issue_114_image_env_applied_on_run {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build");
 
@@ -19405,6 +19429,7 @@ mod issue_115_exec_applies_image_env {
             pelagos::network::NetworkMode::Loopback,
             false,
             &HashMap::new(),
+            None,
         )
         .expect("execute_build");
 

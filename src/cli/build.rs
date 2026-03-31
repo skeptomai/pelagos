@@ -118,6 +118,10 @@ pub fn cmd_build(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         network_mode,
         !args.no_cache,
         &build_args_map,
+        Some(&|reference| {
+            super::image::cmd_image_pull(reference, None, None, false, false)
+                .map_err(|e| e.to_string())
+        }),
     )
     .map_err(|e| {
         // Propagate as-is, but add a setup hint when the layer store is not writable.

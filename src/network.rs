@@ -767,6 +767,12 @@ pub fn teardown_network(mut setup: NetworkSetup) {
     }
     if let Err(e) = run("ip", &["netns", "del", &setup.ns_name]) {
         log::warn!("network teardown netns (non-fatal): {}", e);
+        // Fallback: directly remove the bind-mount file so that netns_exists()
+        // returns false for this ns_name on subsequent calls.  Without this,
+        // stale /run/netns/ entries inflate the NAT/port-forward refcount and
+        // prevent nftables table deletion after the last container exits.
+        let netns_file = format!("/run/netns/{}", setup.ns_name);
+        let _ = std::fs::remove_file(&netns_file);
     }
     let net_def = match load_network_def(&setup.network_name) {
         Ok(n) => n,

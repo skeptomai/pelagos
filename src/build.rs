@@ -25,6 +25,9 @@ pub enum BuildError {
     #[error("image '{0}' not found locally; run 'pelagos image pull {0}' first")]
     ImageNotFound(String),
 
+    #[error("auto-pull of '{0}' failed: {1}")]
+    PullFailed(String, String),
+
     #[error("RUN command failed with exit code {0}")]
     RunFailed(i32),
 
@@ -658,6 +661,7 @@ fn execute_stage(
     sub_vars: &mut HashMap<String, String>,
     remignore: Option<&ignore::gitignore::Gitignore>,
     completed_stages: &HashMap<String, (Vec<String>, ImageConfig)>,
+    pull_fn: Option<&dyn Fn(&str) -> Result<(), String>>,
 ) -> Result<(Vec<String>, ImageConfig), BuildError> {
     // Find the FROM instruction to load the base image.
     let from_idx = instructions
@@ -704,9 +708,22 @@ fn execute_stage(
                 local_ref,
                 normalised
             );
-            let base_manifest = image::load_image(&local_ref)
-                .or_else(|_| image::load_image(&normalised))
-                .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?;
+            let base_manifest =
+                match image::load_image(&local_ref).or_else(|_| image::load_image(&normalised)) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        if let Some(pull) = pull_fn {
+                            eprintln!("Unable to find image '{}' locally, pulling...", base_ref);
+                            pull(&normalised)
+                                .map_err(|e| BuildError::PullFailed(base_ref.clone(), e))?;
+                            image::load_image(&local_ref)
+                                .or_else(|_| image::load_image(&normalised))
+                                .map_err(|_| BuildError::ImageNotFound(base_ref.clone()))?
+                        } else {
+                            return Err(BuildError::ImageNotFound(base_ref.clone()));
+                        }
+                    }
+                };
             (base_manifest.layers.clone(), base_manifest.config.clone())
         }
     } else {
@@ -1028,6 +1045,7 @@ pub fn execute_build(
     network_mode: NetworkMode,
     use_cache: bool,
     build_args: &HashMap<String, String>,
+    pull_fn: Option<&dyn Fn(&str) -> Result<(), String>>,
 ) -> Result<ImageManifest, BuildError> {
     if instructions.is_empty() {
         return Err(BuildError::MissingFrom);
@@ -1116,6 +1134,7 @@ pub fn execute_build(
             &mut sub_vars,
             remignore.as_ref(),
             &completed_stages,
+            pull_fn,
         )?;
 
         // Record this stage's layers+config for COPY --from and FROM <alias>.
