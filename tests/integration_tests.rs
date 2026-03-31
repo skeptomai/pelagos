@@ -1452,6 +1452,7 @@ mod user_notif {
     }
 
     #[test]
+    #[ignore = "requires kernel seccomp supervisor capabilities unavailable on CI runner"]
     fn test_user_notif_handler_invoked() {
         // Verify that the supervisor handler is actually called when the
         // intercepted syscall fires.  Intercept SYS_getuid and allow it;

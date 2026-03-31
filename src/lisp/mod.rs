@@ -1738,16 +1738,20 @@ mod tests {
         // run() now discovers transitive :needs dependencies automatically.
         // Listing only `url-fut` (a Transform) is enough — run finds `db-fut`
         // (its Container upstream) and attempts to execute it.  In unit tests
-        // there is no real image, so the attempt fails; the error proves that
-        // discovery and execution were triggered (not silently skipped).
+        // the image is guaranteed nonexistent, so the attempt fails; the error
+        // proves that discovery and execution were triggered (not silently skipped).
+        //
+        // Use a deliberately-invalid image name rather than a real one like
+        // "alpine:latest" — a cached real image would cause the container to
+        // succeed, turning the expected Err into Ok and panicking the test.
         let mut i = runtime_interp();
         eval_ok(
             &mut i,
-            r#"(define-service svc "db" :image "alpine:latest" :network "net")
+            r#"(define-service svc "db" :image "this-image-does-not-exist:unit-test" :network "net")
                (define db-fut  (start svc))
                (define url-fut (then db-fut (lambda (x) "postgres://localhost/db")))"#,
         );
-        // Container start fails (no image in test env); error proves discovery ran.
+        // Container start fails (image nonexistent); error proves discovery ran.
         let err = eval_err(&mut i, "(run (list url-fut) :parallel)");
         assert!(!err.is_empty(), "expected container-start error, got none");
     }
@@ -1764,12 +1768,12 @@ mod tests {
         let mut i = runtime_interp();
         eval_ok(
             &mut i,
-            r#"(define-service svc "db" :image "alpine:latest" :network "net")
+            r#"(define-service svc "db" :image "this-image-does-not-exist:unit-test" :network "net")
                (define db-fut  (start svc))
                (define url-fut (then db-fut (lambda (x) x)))"#,
         );
         // Both futures listed → both are terminal → both would appear in alist.
-        // Fails at container start (no image); confirms both were attempted.
+        // Fails at container start (image nonexistent); confirms both were attempted.
         let err = eval_err(&mut i, "(run (list db-fut url-fut))");
         assert!(!err.is_empty());
     }
