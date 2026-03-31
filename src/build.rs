@@ -10,6 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+/// Callback for auto-pulling a base image by reference.
+/// Returns `Ok(())` on success, `Err(message)` on failure.
+pub type PullFn<'a> = &'a dyn Fn(&str) -> Result<(), String>;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -661,7 +665,7 @@ fn execute_stage(
     sub_vars: &mut HashMap<String, String>,
     remignore: Option<&ignore::gitignore::Gitignore>,
     completed_stages: &HashMap<String, (Vec<String>, ImageConfig)>,
-    pull_fn: Option<&dyn Fn(&str) -> Result<(), String>>,
+    pull_fn: Option<PullFn<'_>>,
 ) -> Result<(Vec<String>, ImageConfig), BuildError> {
     // Find the FROM instruction to load the base image.
     let from_idx = instructions
@@ -1045,7 +1049,7 @@ pub fn execute_build(
     network_mode: NetworkMode,
     use_cache: bool,
     build_args: &HashMap<String, String>,
-    pull_fn: Option<&dyn Fn(&str) -> Result<(), String>>,
+    pull_fn: Option<PullFn<'_>>,
 ) -> Result<ImageManifest, BuildError> {
     if instructions.is_empty() {
         return Err(BuildError::MissingFrom);
