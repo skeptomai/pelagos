@@ -44,7 +44,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::Command as SysCmd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -183,6 +183,40 @@ impl NetworkDef {
     /// nftables table name for this network (e.g. `"pelagos-frontend"`).
     pub fn nft_table_name(&self) -> String {
         format!("pelagos-{}", self.name)
+    }
+
+    /// Derive a stable ULA /64 prefix base address for this network.
+    ///
+    /// Uses FNV-1a of the network name to produce a deterministic address in
+    /// the `fd00::/8` range. No stored state is needed — the prefix is always
+    /// re-derived from the name, so existing `config.json` files are
+    /// unaffected.
+    ///
+    /// Format: `fd{b0}{b1}:{b2}{b3}:{b0|1}01::/64`
+    /// where `b0..b3` are the big-endian bytes of `fnv1a(name)`.
+    pub fn ipv6_prefix_addr(&self) -> Ipv6Addr {
+        let h = fnv1a(self.name.as_bytes()).to_be_bytes(); // [b0, b1, b2, b3]
+        Ipv6Addr::new(
+            0xfd00 | h[0] as u16,
+            (h[1] as u16) << 8 | h[2] as u16,
+            (h[3] as u16) << 8 | 0x01,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    /// Gateway IPv6 address for this network: `prefix::1`.
+    pub fn ipv6_gateway(&self) -> Ipv6Addr {
+        let p = self.ipv6_prefix_addr().segments();
+        Ipv6Addr::new(p[0], p[1], p[2], p[3], 0, 0, 0, 1)
+    }
+
+    /// CIDR string for the IPv6 /64 prefix (e.g. `"fd19:a1b2:0c01::/64"`).
+    pub fn ipv6_prefix_cidr(&self) -> String {
+        format!("{}/64", self.ipv6_prefix_addr())
     }
 }
 
@@ -401,8 +435,10 @@ pub struct NetworkSetup {
     pub veth_host: String,
     /// Name of the named network namespace (e.g. `rem-12345-0`).
     pub ns_name: String,
-    /// IP assigned to the container inside the bridge subnet.
+    /// IPv4 address assigned to the container inside the bridge subnet.
     pub container_ip: Ipv4Addr,
+    /// IPv6 ULA address assigned to the container (`None` if host lacks IPv6).
+    pub ipv6_container_ip: Option<Ipv6Addr>,
     /// Whether NAT (MASQUERADE) was enabled for this container.
     pub nat_enabled: bool,
     /// Port forwards configured for this container: `(host_port, container_port)`.
@@ -424,6 +460,7 @@ impl std::fmt::Debug for NetworkSetup {
             .field("veth_host", &self.veth_host)
             .field("ns_name", &self.ns_name)
             .field("container_ip", &self.container_ip)
+            .field("ipv6_container_ip", &self.ipv6_container_ip)
             .field("nat_enabled", &self.nat_enabled)
             .field("port_forwards", &self.port_forwards)
             .field("proxy_tcp_active", &self.proxy_tcp_runtime.is_some())
@@ -540,7 +577,17 @@ fn ensure_bridge(net: &NetworkDef) -> io::Result<()> {
         .status();
 
     // Bring up (idempotent)
-    run("ip", &["link", "set", &net.bridge_name, "up"])
+    run("ip", &["link", "set", &net.bridge_name, "up"])?;
+
+    // Assign IPv6 ULA gateway to bridge (idempotent; errors suppressed — host
+    // may not have IPv6 support, which is fine).
+    let gw6_cidr = format!("{}/64", net.ipv6_gateway());
+    let _ = SysCmd::new("ip")
+        .args(["-6", "addr", "add", &gw6_cidr, "dev", &net.bridge_name])
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    Ok(())
 }
 
 /// Allocate the next IP from the network's subnet pool.
@@ -597,6 +644,41 @@ fn allocate_ip(net: &NetworkDef) -> io::Result<Ipv4Addr> {
     // flock released when `file` is dropped here
 
     Ok(ip)
+}
+
+/// Allocate the next IPv6 host address from the network's ULA /64 prefix pool.
+///
+/// Uses `flock(LOCK_EX)` on `next_ipv6` (stores a u64 counter).
+/// Returns `prefix::N` where N starts at 2 (::1 is the gateway).
+fn allocate_ipv6(net: &NetworkDef) -> io::Result<Ipv6Addr> {
+    let ipam_path = crate::paths::network_ipv6_ipam_file(&net.name);
+    if let Some(parent) = ipam_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&ipam_path)?;
+
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+
+    // Counter starts at 2 (::1 reserved for gateway).
+    let n: u64 = content.trim().parse().unwrap_or(2);
+    let n = n.max(2);
+
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    write!(file, "{}", n + 1)?;
+    // flock released when `file` is dropped.
+
+    let p = net.ipv6_prefix_addr().segments();
+    Ok(Ipv6Addr::new(p[0], p[1], p[2], p[3], 0, 0, 0, n as u16))
 }
 
 /// FNV-1a hash of a byte string, returning a u32.
@@ -706,6 +788,10 @@ pub fn setup_bridge_network(
     )?;
     run("ip", &["link", "set", &veth_host, "up"])?;
 
+    // 6b. Configure IPv6 dual-stack on the container's eth0.
+    //     Errors are non-fatal — container falls back to IPv4-only.
+    let ipv6_container_ip = setup_ipv6_container(&net_def, ns_name);
+
     // 7. Optionally enable NAT (MASQUERADE) for internet access.
     if nat {
         enable_nat(ns_name, &net_def)?;
@@ -713,14 +799,20 @@ pub fn setup_bridge_network(
 
     // 8. Optionally install port-forward (DNAT) rules.
     if !port_forwards.is_empty() {
-        enable_port_forwards(ns_name, &net_def, container_ip, &port_forwards)?;
+        enable_port_forwards(
+            ns_name,
+            &net_def,
+            container_ip,
+            ipv6_container_ip,
+            &port_forwards,
+        )?;
     }
 
     // 9. Start userspace port proxies (handles localhost traffic that nftables
     //    DNAT in PREROUTING cannot intercept).  TCP uses an async tokio runtime;
     //    UDP uses std threads unchanged.
     let (proxy_tcp_runtime, proxy_udp_stop, proxy_udp_threads) = if !port_forwards.is_empty() {
-        start_port_proxies(container_ip, &port_forwards)
+        start_port_proxies(container_ip, ipv6_container_ip, &port_forwards)
     } else {
         (None, None, Vec::new())
     };
@@ -729,6 +821,7 @@ pub fn setup_bridge_network(
         veth_host,
         ns_name: ns_name.to_string(),
         container_ip,
+        ipv6_container_ip,
         nat_enabled: nat,
         port_forwards,
         proxy_tcp_runtime,
@@ -911,10 +1004,14 @@ pub fn attach_network_to_netns(
     )?;
     run("ip", &["link", "set", &veth_host, "up"])?;
 
+    // Secondary interfaces get IPv6 too (subnet route only, no default route).
+    let ipv6_container_ip = setup_ipv6_secondary(&net_def, ns_name, iface_name);
+
     Ok(NetworkSetup {
         veth_host,
         ns_name: ns_name.to_string(),
         container_ip,
+        ipv6_container_ip,
         nat_enabled: false,
         port_forwards: Vec::new(),
         proxy_tcp_runtime: None,
@@ -933,6 +1030,94 @@ pub fn teardown_secondary_network(setup: &NetworkSetup) {
     if let Err(e) = run("ip", &["link", "del", &setup.veth_host]) {
         log::warn!("secondary network teardown veth (non-fatal): {}", e);
     }
+}
+
+// ── IPv6 dual-stack helpers ───────────────────────────────────────────────────
+
+/// Configure IPv6 on the primary container interface (eth0) inside `ns_name`.
+///
+/// Allocates a ULA host address from the network's /64 prefix, assigns it to
+/// `eth0`, and adds an IPv6 default route via the gateway.  Also enables IPv6
+/// forwarding and `accept_ra=2` on the host so that:
+///
+/// - Containers can reach the internet via NAT66 (when `--nat` is used).
+/// - The host does not lose its SLAAC-learned IPv6 default route when
+///   forwarding is turned on (Linux clears `accept_ra` to 0 when forwarding
+///   is enabled; `=2` overrides that behaviour).
+///
+/// All errors are non-fatal — returns `None` and logs a warning if IPv6 is
+/// unavailable on this host.
+fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
+    let ip6 = match allocate_ipv6(net) {
+        Ok(a) => a,
+        Err(e) => {
+            log::warn!("IPv6 IPAM failed for {} — IPv4-only: {}", ns_name, e);
+            return None;
+        }
+    };
+    let gw6 = net.ipv6_gateway().to_string();
+    let ip6_cidr = format!("{}/64", ip6);
+
+    // Assign IPv6 address to eth0 inside the named netns.
+    if let Err(e) = run(
+        "ip",
+        &["-n", ns_name, "addr", "add", &ip6_cidr, "dev", "eth0"],
+    ) {
+        log::warn!("IPv6 addr add failed for {} — IPv4-only: {}", ns_name, e);
+        return None;
+    }
+    // Add default IPv6 route via the bridge gateway.
+    if let Err(e) = run(
+        "ip",
+        &[
+            "-n", ns_name, "-6", "route", "add", "default", "via", &gw6, "dev", "eth0",
+        ],
+    ) {
+        log::warn!("IPv6 route add failed for {} — IPv4-only: {}", ns_name, e);
+        return None;
+    }
+
+    // Enable IPv6 forwarding on the host.  accept_ra=2 keeps any SLAAC-learned
+    // default route intact even while forwarding is active.
+    let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/accept_ra", "2\n");
+    let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1\n");
+
+    log::debug!("IPv6: {} assigned {} (gw {})", ns_name, ip6, gw6);
+    Some(ip6)
+}
+
+/// Configure IPv6 on a secondary container interface (eth1, eth2, …).
+///
+/// Unlike the primary, secondary interfaces get a ULA address but no default
+/// route — the kernel installs a subnet route automatically when the address
+/// is assigned.
+fn setup_ipv6_secondary(net: &NetworkDef, ns_name: &str, iface: &str) -> Option<Ipv6Addr> {
+    let ip6 = match allocate_ipv6(net) {
+        Ok(a) => a,
+        Err(e) => {
+            log::warn!(
+                "IPv6 IPAM failed for {} ({}) — IPv4-only: {}",
+                ns_name,
+                iface,
+                e
+            );
+            return None;
+        }
+    };
+    let ip6_cidr = format!("{}/64", ip6);
+    if let Err(e) = run(
+        "ip",
+        &["-n", ns_name, "addr", "add", &ip6_cidr, "dev", iface],
+    ) {
+        log::warn!(
+            "IPv6 addr add failed for {} ({}) — IPv4-only: {}",
+            ns_name,
+            iface,
+            e
+        );
+        return None;
+    }
+    Some(ip6)
 }
 
 // ── N3: NAT / MASQUERADE ─────────────────────────────────────────────────────
@@ -956,6 +1141,25 @@ fn build_nat_script(net: &NetworkDef) -> String {
          add chain ip {table} forward {{ type filter hook forward priority 0; }}\n\
          add rule ip {table} forward ip saddr {cidr} accept\n\
          add rule ip {table} forward ip daddr {cidr} accept\n"
+    )
+}
+
+/// Build the nftables script that installs NAT66 MASQUERADE + FORWARD rules.
+///
+/// Uses the `ip6` address family table so it coexists cleanly with the `ip`
+/// (IPv4) table of the same name.  The masquerade rule applies only to ULA
+/// traffic leaving the bridge — traffic within the bridge is unaffected.
+fn build_nat6_script(net: &NetworkDef) -> String {
+    let table = net.nft_table_name();
+    let prefix = net.ipv6_prefix_addr().to_string();
+    let bridge = &net.bridge_name;
+    format!(
+        "add table ip6 {table}\n\
+         add chain ip6 {table} postrouting {{ type nat hook postrouting priority 100; }}\n\
+         add rule ip6 {table} postrouting ip6 saddr {prefix}/64 oifname != \"{bridge}\" masquerade\n\
+         add chain ip6 {table} forward {{ type filter hook forward priority 0; }}\n\
+         add rule ip6 {table} forward ip6 saddr {prefix}/64 accept\n\
+         add rule ip6 {table} forward ip6 daddr {prefix}/64 accept\n"
     )
 }
 
@@ -1124,6 +1328,36 @@ fn enable_nat(ns_name: &str, net: &NetworkDef) -> io::Result<()> {
         while run_quiet("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]).is_ok() {}
         let _ = run("iptables", &["-I", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
         let _ = run("iptables", &["-I", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
+
+        // Install NAT66 (IPv6 masquerade) rules.  Non-fatal: host may lack
+        // IPv6 NAT support (kernel module nf_nat_ipv6 absent).
+        let nat6_script = build_nat6_script(net);
+        if let Err(e) = run_nft(&nat6_script) {
+            log::warn!("NAT66 setup failed (IPv6 NAT unavailable): {}", e);
+        } else {
+            // Mirror ip6tables FORWARD rules (for legacy ip6tables firewalls).
+            let cidr6 = format!("{}/64", net.ipv6_prefix_addr());
+            while run_quiet(
+                "ip6tables",
+                &["-D", "FORWARD", "-s", &cidr6, "-j", "ACCEPT"],
+            )
+            .is_ok()
+            {}
+            while run_quiet(
+                "ip6tables",
+                &["-D", "FORWARD", "-d", &cidr6, "-j", "ACCEPT"],
+            )
+            .is_ok()
+            {}
+            let _ = run(
+                "ip6tables",
+                &["-I", "FORWARD", "-s", &cidr6, "-j", "ACCEPT"],
+            );
+            let _ = run(
+                "ip6tables",
+                &["-I", "FORWARD", "-d", &cidr6, "-j", "ACCEPT"],
+            );
+        }
     }
 
     active.push(ns_name.to_string());
@@ -1206,15 +1440,27 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
         let _ = run("iptables", &["-D", "FORWARD", "-s", &cidr, "-j", "ACCEPT"]);
         let _ = run("iptables", &["-D", "FORWARD", "-d", &cidr, "-j", "ACCEPT"]);
 
+        // Remove ip6tables FORWARD rules and the ip6 NAT table.
+        let cidr6 = format!("{}/64", net.ipv6_prefix_addr());
+        let _ = run(
+            "ip6tables",
+            &["-D", "FORWARD", "-s", &cidr6, "-j", "ACCEPT"],
+        );
+        let _ = run(
+            "ip6tables",
+            &["-D", "FORWARD", "-d", &cidr6, "-j", "ACCEPT"],
+        );
+        let _ = run_nft_quiet(&format!("delete table ip6 {}\n", table));
+
         if read_port_forwards_count(&net.name) == 0 {
-            // No active port forwards either — remove the entire table.
+            // No active port forwards either — remove the entire ip table.
             // Use run_nft_quiet: deletion is non-fatal and the table may have
             // already been removed by a concurrent disable_port_forwards().
             if let Err(e) = run_nft_quiet(&format!("delete table ip {}\n", table)) {
                 log::warn!("nft delete table {} (non-fatal): {}", table, e);
             }
         } else {
-            // Port forwards still active — remove MASQUERADE but keep the table.
+            // Port forwards still active — remove MASQUERADE but keep the ip table.
             let _ = run_nft(&format!("flush chain ip {} postrouting\n", table));
         }
     }
@@ -1222,45 +1468,54 @@ fn disable_nat(ns_name: &str, net: &NetworkDef) {
 
 // ── N4: Port mapping (DNAT) ───────────────────────────────────────────────────
 
-/// A port-forward state file entry: `(ns_name, container_ip, host_port, container_port, proto)`.
-type PortForwardEntry = (String, Ipv4Addr, u16, u16, PortProto);
+/// A port-forward state file entry.
+///
+/// Fields: `(ns_name, container_ipv4, host_port, container_port, proto, container_ipv6)`.
+/// The IPv6 field is `None` for containers that have no IPv6 (host lacks IPv6 support)
+/// and for entries read from old-format state files (5-field lines).
+type PortForwardEntry = (String, Ipv4Addr, u16, u16, PortProto, Option<Ipv6Addr>);
 
 /// Parse one line from the port-forwards state file.
 ///
-/// Format: `{ip}:{host_port}:{container_port}[:{proto}]`
-/// The proto field defaults to `tcp` when absent (backwards compat).
-/// Parse one line from the port-forwards state file.
+/// Supports three formats (all backward-compatible):
 ///
-/// New format (since crash-safe eviction was added):
-///   `ns_name:ip:host_port:container_port:proto`   (5 colon-separated fields)
+/// - Old (3-4 fields, first token is IPv4): `ip:hp:cp[:proto]`
+///   → `ns_name = ""`, `ipv6 = None`
+/// - New 5-field: `ns_name:ip:hp:cp:proto`
+///   → `ipv6 = None`
+/// - New 6-field (dual-stack): `ns_name:ip:hp:cp:proto:ipv6`
+///   → `ipv6 = Some(addr)`
 ///
-/// Old format (backward-compat; treated as if ns_name = ""):
-///   `ip:host_port:container_port[:proto]`          (3-4 fields; first parses as IPv4)
-///
-/// Returns `(ns_name, ip, host_port, container_port, proto)`.
-/// Old-format entries have an empty `ns_name` and are treated as stale by liveness checks.
-fn parse_port_forward_line(line: &str) -> Option<(String, Ipv4Addr, u16, u16, PortProto)> {
-    // Detect format: if the first colon-delimited token is a valid IPv4 address, it's
-    // the old format.  Otherwise the first token is a netns name.
+/// Old-format entries (empty `ns_name`) are treated as stale by liveness checks.
+fn parse_port_forward_line(
+    line: &str,
+) -> Option<(String, Ipv4Addr, u16, u16, PortProto, Option<Ipv6Addr>)> {
+    // Detect format: if the first colon-delimited token is a valid IPv4 address,
+    // it's the old (3-4 field) format.  Otherwise the first token is a netns name.
     let first_colon = line.find(':')?;
     let first = &line[..first_colon];
     if let Ok(ip) = first.parse::<Ipv4Addr>() {
         // Old format: ip:hp:cp[:proto]
         let mut parts = line.splitn(4, ':');
-        let _ip_str = parts.next()?; // already parsed above
+        let _ip_str = parts.next()?;
         let host_port: u16 = parts.next()?.parse().ok()?;
         let container_port: u16 = parts.next()?.parse().ok()?;
         let proto = parts.next().map(PortProto::parse).unwrap_or(PortProto::Tcp);
-        Some((String::new(), ip, host_port, container_port, proto))
+        Some((String::new(), ip, host_port, container_port, proto, None))
     } else {
-        // New format: ns_name:ip:hp:cp:proto
-        let mut parts = line.splitn(5, ':');
+        // New format: ns_name:ip:hp:cp:proto[:ipv6]
+        // IPv6 addresses contain ':', so split carefully: take at most 6 tokens
+        // where the 6th is the remainder (the IPv6 address).
+        let mut parts = line.splitn(6, ':');
         let ns_name = parts.next()?.to_string();
         let ip: Ipv4Addr = parts.next()?.parse().ok()?;
         let host_port: u16 = parts.next()?.parse().ok()?;
         let container_port: u16 = parts.next()?.parse().ok()?;
-        let proto = parts.next().map(PortProto::parse).unwrap_or(PortProto::Tcp);
-        Some((ns_name, ip, host_port, container_port, proto))
+        let proto_str = parts.next()?;
+        let proto = PortProto::parse(proto_str);
+        // 6th field (optional) is the IPv6 address — may itself contain ':'.
+        let ipv6 = parts.next().and_then(|s| s.parse::<Ipv6Addr>().ok());
+        Some((ns_name, ip, host_port, container_port, proto, ipv6))
     }
 }
 
@@ -1293,7 +1548,7 @@ fn read_port_forwards_count(network_name: &str) -> usize {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(parse_port_forward_line)
-        .filter(|(ns_name, _, _, _, _)| !ns_name.is_empty() && netns_exists(ns_name))
+        .filter(|(ns_name, _, _, _, _, _)| !ns_name.is_empty() && netns_exists(ns_name))
         .count()
 }
 
@@ -1346,6 +1601,37 @@ fn build_prerouting_script(
     s
 }
 
+/// Build the nftables script that (re)installs all current IPv6 DNAT rules.
+///
+/// Mirrors [`build_prerouting_script`] but uses the `ip6` address family.
+/// The nftables `ip6 table` coexists with the `ip` table of the same name.
+fn build_prerouting6_script(
+    net: &NetworkDef,
+    entries6: &[(Ipv6Addr, u16, u16, PortProto)],
+) -> String {
+    let table = net.nft_table_name();
+    let mut s = format!(
+        "add table ip6 {table}\n\
+         add chain ip6 {table} prerouting {{ type nat hook prerouting priority -100; }}\n\
+         flush chain ip6 {table} prerouting\n",
+    );
+    for (ip6, host_port, container_port, proto) in entries6 {
+        if matches!(proto, PortProto::Tcp | PortProto::Both) {
+            s.push_str(&format!(
+                "add rule ip6 {} prerouting tcp dport {} dnat to [{}]:{}\n",
+                table, host_port, ip6, container_port
+            ));
+        }
+        if matches!(proto, PortProto::Udp | PortProto::Both) {
+            s.push_str(&format!(
+                "add rule ip6 {} prerouting udp dport {} dnat to [{}]:{}\n",
+                table, host_port, ip6, container_port
+            ));
+        }
+    }
+    s
+}
+
 /// Add port-forward entries to the state file and install nftables DNAT rules.
 ///
 /// Uses `flock(LOCK_EX)` on the per-network port-forwards file to serialise
@@ -1360,6 +1646,7 @@ fn enable_port_forwards(
     ns_name: &str,
     net: &NetworkDef,
     container_ip: Ipv4Addr,
+    ipv6_container_ip: Option<Ipv6Addr>,
     forwards: &[(u16, u16, PortProto)],
 ) -> io::Result<()> {
     let pf_path = crate::paths::network_port_forwards_file(&net.name);
@@ -1389,7 +1676,7 @@ fn enable_port_forwards(
     let existing = read_port_forwards_locked(&mut file)?;
     let mut live: Vec<PortForwardEntry> = existing
         .into_iter()
-        .filter(|(n, _, _, _, _)| !n.is_empty() && netns_exists(n))
+        .filter(|(n, _, _, _, _, _)| !n.is_empty() && netns_exists(n))
         .collect();
 
     for &(host_port, container_port, proto) in forwards {
@@ -1399,23 +1686,50 @@ fn enable_port_forwards(
             host_port,
             container_port,
             proto,
+            ipv6_container_ip,
         ));
     }
 
-    // Overwrite file with live + new entries in new format.
+    // Overwrite file with live + new entries.
+    // Format: ns:ipv4:hp:cp:proto[:ipv6]  (6th field present iff IPv6 is set)
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-    for (ns, ip, hp, cp, proto) in &live {
-        writeln!(file, "{}:{}:{}:{}:{}", ns, ip, hp, cp, proto.as_str())?;
+    for (ns, ip, hp, cp, proto, ip6) in &live {
+        if let Some(ip6) = ip6 {
+            writeln!(
+                file,
+                "{}:{}:{}:{}:{}:{}",
+                ns,
+                ip,
+                hp,
+                cp,
+                proto.as_str(),
+                ip6
+            )?;
+        } else {
+            writeln!(file, "{}:{}:{}:{}:{}", ns, ip, hp, cp, proto.as_str())?;
+        }
     }
 
-    // Install nftables DNAT rules (build_prerouting_script needs ip/hp/cp/proto only).
+    // Install IPv4 nftables DNAT rules.
     let nft_entries: Vec<(Ipv4Addr, u16, u16, PortProto)> = live
         .iter()
-        .map(|(_, ip, hp, cp, proto)| (*ip, *hp, *cp, *proto))
+        .map(|(_, ip, hp, cp, proto, _)| (*ip, *hp, *cp, *proto))
         .collect();
     let script = build_prerouting_script(net, &nft_entries);
     run_nft(&script)?;
+
+    // Install IPv6 nftables DNAT rules (non-fatal — host may lack IPv6 NAT).
+    let nft6_entries: Vec<(Ipv6Addr, u16, u16, PortProto)> = live
+        .iter()
+        .filter_map(|(_, _, hp, cp, proto, ip6)| ip6.map(|a| (a, *hp, *cp, *proto)))
+        .collect();
+    if !nft6_entries.is_empty() {
+        let script6 = build_prerouting6_script(net, &nft6_entries);
+        if let Err(e) = run_nft(&script6) {
+            log::warn!("IPv6 port-forward DNAT setup failed (non-fatal): {}", e);
+        }
+    }
 
     // flock released when `file` is dropped.
     Ok(())
@@ -1463,46 +1777,71 @@ fn disable_port_forwards(ns_name: &str, net: &NetworkDef) {
     // Old-format entries (empty ns_name) are treated as stale and evicted.
     let remaining: Vec<PortForwardEntry> = entries
         .into_iter()
-        .filter(|(n, _, _, _, _)| !n.is_empty() && n != ns_name && netns_exists(n))
+        .filter(|(n, _, _, _, _, _)| !n.is_empty() && n != ns_name && netns_exists(n))
         .collect();
 
-    // Write remaining entries back in new format.
+    // Write remaining entries back.
     if let Err(e) = file.seek(SeekFrom::Start(0)).and_then(|_| file.set_len(0)) {
         log::warn!("port forwards file truncate (non-fatal): {}", e);
         return;
     }
-    for (ns, ip, hp, cp, proto) in &remaining {
-        let _ = writeln!(file, "{}:{}:{}:{}:{}", ns, ip, hp, cp, proto.as_str());
+    for (ns, ip, hp, cp, proto, ip6) in &remaining {
+        if let Some(ip6) = ip6 {
+            let _ = writeln!(
+                file,
+                "{}:{}:{}:{}:{}:{}",
+                ns,
+                ip,
+                hp,
+                cp,
+                proto.as_str(),
+                ip6
+            );
+        } else {
+            let _ = writeln!(file, "{}:{}:{}:{}:{}", ns, ip, hp, cp, proto.as_str());
+        }
     }
 
     // flock released; now update nftables.
     drop(file);
 
-    // Build nft entries without ns_name.
     let nft_remaining: Vec<(Ipv4Addr, u16, u16, PortProto)> = remaining
         .iter()
-        .map(|(_, ip, hp, cp, proto)| (*ip, *hp, *cp, *proto))
+        .map(|(_, ip, hp, cp, proto, _)| (*ip, *hp, *cp, *proto))
+        .collect();
+    let nft6_remaining: Vec<(Ipv6Addr, u16, u16, PortProto)> = remaining
+        .iter()
+        .filter_map(|(_, _, hp, cp, proto, ip6)| ip6.map(|a| (a, *hp, *cp, *proto)))
         .collect();
 
     let table = net.nft_table_name();
     if nft_remaining.is_empty() {
-        // No more port forwards — check if NAT is also gone.
+        // No more IPv4 port forwards — check if NAT is also gone.
         if read_nat_refcount(&net.name) == 0 {
-            // Nothing using the table — remove it entirely.
-            // Use run_nft_quiet: deletion is non-fatal and the table may have
-            // already been removed by a concurrent disable_nat().
+            // Nothing using the tables — remove both ip and ip6 tables entirely.
             if let Err(e) = run_nft_quiet(&format!("delete table ip {}\n", table)) {
-                log::warn!("nft delete table {} (non-fatal): {}", table, e);
+                log::warn!("nft delete table ip {} (non-fatal): {}", table, e);
             }
+            let _ = run_nft_quiet(&format!("delete table ip6 {}\n", table));
         } else {
-            // NAT still active — flush prerouting chain only.
+            // NAT still active — flush prerouting chains only.
             let _ = run_nft(&format!("flush chain ip {} prerouting\n", table));
+            let _ = run_nft_quiet(&format!("flush chain ip6 {} prerouting\n", table));
         }
     } else {
-        // Rebuild prerouting chain from the surviving entries.
+        // Rebuild IPv4 prerouting chain from the surviving entries.
         let script = build_prerouting_script(net, &nft_remaining);
         if let Err(e) = run_nft(&script) {
             log::warn!("nft rebuild prerouting (non-fatal): {}", e);
+        }
+        // Rebuild or flush the IPv6 prerouting chain.
+        if !nft6_remaining.is_empty() {
+            let script6 = build_prerouting6_script(net, &nft6_remaining);
+            if let Err(e) = run_nft(&script6) {
+                log::warn!("nft rebuild ip6 prerouting (non-fatal): {}", e);
+            }
+        } else {
+            let _ = run_nft_quiet(&format!("flush chain ip6 {} prerouting\n", table));
         }
     }
 }
@@ -1528,6 +1867,7 @@ fn disable_port_forwards(ns_name: &str, net: &NetworkDef) {
 /// stop flag for UDP, and joins the per-port UDP threads.
 fn start_port_proxies(
     container_ip: Ipv4Addr,
+    ipv6_container_ip: Option<Ipv6Addr>,
     forwards: &[(u16, u16, PortProto)],
 ) -> (
     Option<tokio::runtime::Runtime>,
@@ -1547,7 +1887,11 @@ fn start_port_proxies(
         .collect();
 
     let tcp_runtime = if !tcp_forwards.is_empty() {
-        Some(start_tcp_proxies_async(container_ip, &tcp_forwards))
+        Some(start_tcp_proxies_async(
+            container_ip,
+            ipv6_container_ip,
+            &tcp_forwards,
+        ))
     } else {
         None
     };
@@ -1555,11 +1899,22 @@ fn start_port_proxies(
     let (udp_stop, udp_threads) = if !udp_forwards.is_empty() {
         let stop = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
-        for (host_port, container_port) in udp_forwards {
+        for (host_port, container_port) in &udp_forwards {
+            let (hp, cp) = (*host_port, *container_port);
             let stop_clone = Arc::clone(&stop);
             handles.push(std::thread::spawn(move || {
-                start_udp_proxy(host_port, container_ip, container_port, stop_clone);
+                start_udp_proxy(hp, container_ip, cp, stop_clone);
             }));
+        }
+        // Also start IPv6 UDP proxies on [::1] (localhost only; external IPv6 via DNAT).
+        if let Some(ip6) = ipv6_container_ip {
+            for (host_port, container_port) in &udp_forwards {
+                let (hp, cp) = (*host_port, *container_port);
+                let stop_clone = Arc::clone(&stop);
+                handles.push(std::thread::spawn(move || {
+                    start_udp_proxy_v6(hp, ip6, cp, stop_clone);
+                }));
+            }
         }
         (Some(stop), handles)
     } else {
@@ -1577,6 +1932,7 @@ fn start_port_proxies(
 /// and terminates the worker threads.
 fn start_tcp_proxies_async(
     container_ip: Ipv4Addr,
+    ipv6_container_ip: Option<Ipv6Addr>,
     tcp_forwards: &[(u16, u16)],
 ) -> tokio::runtime::Runtime {
     let workers = std::thread::available_parallelism()
@@ -1593,8 +1949,15 @@ fn start_tcp_proxies_async(
         .expect("tokio tcp proxy runtime");
 
     for &(host_port, container_port) in tcp_forwards {
-        let target = SocketAddr::from((container_ip, container_port));
-        rt.spawn(tcp_accept_loop(host_port, target));
+        let target4 = SocketAddr::from((container_ip, container_port));
+        rt.spawn(tcp_accept_loop(host_port, target4));
+
+        // IPv6 localhost proxy: [::1]:host_port → [container_ip6]:container_port
+        // External IPv6 traffic is handled by the ip6 nftables DNAT rules.
+        if let Some(ip6) = ipv6_container_ip {
+            let target6 = SocketAddr::from(SocketAddrV6::new(ip6, container_port, 0, 0));
+            rt.spawn(tcp_accept_loop_v6(host_port, target6));
+        }
     }
 
     rt
@@ -1657,6 +2020,40 @@ async fn tcp_relay(mut client: tokio::net::TcpStream, target: SocketAddr) {
 
     if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
         log::debug!("tcp proxy relay error: {}", e);
+    }
+}
+
+/// Async IPv6 accept loop for a single TCP port mapping.
+///
+/// Binds a `TcpListener` on `[::1]:{host_port}` (IPv6 loopback only) and
+/// spawns a `tcp_relay` task for each accepted connection.
+/// External IPv6 traffic is handled by the `ip6 prerouting` DNAT rule.
+async fn tcp_accept_loop_v6(host_port: u16, target: SocketAddr) {
+    let bind_addr = SocketAddr::from(SocketAddrV6::new(Ipv6Addr::LOCALHOST, host_port, 0, 0));
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!(
+                "tcp proxy: cannot bind [::1]:{}: {} (ip6 DNAT still active)",
+                host_port,
+                e
+            );
+            return;
+        }
+    };
+
+    log::debug!("tcp proxy: [::1]:{} -> {}", host_port, target);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                tokio::spawn(tcp_relay(stream, target));
+            }
+            Err(e) => {
+                log::warn!("tcp proxy v6 accept error on port {}: {}", host_port, e);
+                break;
+            }
+        }
     }
 }
 
@@ -1778,6 +2175,119 @@ fn start_udp_proxy(
 
     // Join all remaining reply threads.  They observe the same stop flag and
     // exit within one read timeout (100 ms) of it being set.
+    for handle in reply_handles {
+        let _ = handle.join();
+    }
+}
+
+/// UDP relay for a single port mapping — IPv6 side.
+///
+/// Binds `[::1]:{host_port}`. For each unique client, creates a dedicated
+/// outbound socket connected to `[container_ip6]:{container_port}`.
+/// Sessions idle for more than 30 s are evicted.
+fn start_udp_proxy_v6(
+    host_port: u16,
+    container_ip6: Ipv6Addr,
+    container_port: u16,
+    stop: Arc<AtomicBool>,
+) {
+    let bind_addr = SocketAddr::from(SocketAddrV6::new(Ipv6Addr::LOCALHOST, host_port, 0, 0));
+    let inbound = match UdpSocket::bind(bind_addr) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            log::warn!(
+                "udp proxy v6: cannot bind [::1]:{}: {} (ip6 DNAT still active)",
+                host_port,
+                e
+            );
+            return;
+        }
+    };
+    inbound
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set_read_timeout v6");
+
+    let target = SocketAddr::from(SocketAddrV6::new(container_ip6, container_port, 0, 0));
+    log::debug!("udp proxy v6: [::1]:{} -> {}", host_port, target);
+
+    type SessionMap = HashMap<SocketAddr, (Arc<UdpSocket>, Instant)>;
+    let sessions: Arc<Mutex<SessionMap>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let mut buf = [0u8; 65535];
+    let mut reply_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+    while !stop.load(Ordering::Relaxed) {
+        match inbound.recv_from(&mut buf) {
+            Ok((n, client_addr)) => {
+                let data = buf[..n].to_vec();
+
+                let (outbound, spawned) = {
+                    let mut map = sessions.lock().unwrap();
+                    map.retain(|_, (_, last)| last.elapsed() < Duration::from_secs(30));
+
+                    if let Some((sock, last)) = map.get_mut(&client_addr) {
+                        *last = Instant::now();
+                        (Arc::clone(sock), None)
+                    } else {
+                        let sock = match UdpSocket::bind("[::1]:0") {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                log::warn!("udp proxy v6: outbound bind failed: {}", e);
+                                continue;
+                            }
+                        };
+                        if let Err(e) = sock.connect(target) {
+                            log::warn!("udp proxy v6: connect to {} failed: {}", target, e);
+                            continue;
+                        }
+                        map.insert(client_addr, (Arc::clone(&sock), Instant::now()));
+
+                        let reply_sock = Arc::clone(&sock);
+                        let inbound_ref = Arc::clone(&inbound);
+                        let stop2 = Arc::clone(&stop);
+                        let handle = std::thread::spawn(move || {
+                            let mut rbuf = [0u8; 65535];
+                            reply_sock
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .ok();
+                            while !stop2.load(Ordering::Relaxed) {
+                                match reply_sock.recv(&mut rbuf) {
+                                    Ok(m) => {
+                                        let _ = inbound_ref.send_to(&rbuf[..m], client_addr);
+                                    }
+                                    Err(ref e)
+                                        if e.kind() == io::ErrorKind::WouldBlock
+                                            || e.kind() == io::ErrorKind::TimedOut => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+
+                        (sock, Some(handle))
+                    }
+                };
+
+                if let Some(h) = spawned {
+                    reply_handles.push(h);
+                    reply_handles.retain(|h| !h.is_finished());
+                }
+
+                if let Err(e) = outbound.send(&data) {
+                    log::debug!("udp proxy v6: forward to {} failed: {}", target, e);
+                }
+            }
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
+            Err(e) => {
+                if !stop.load(Ordering::Relaxed) {
+                    log::warn!("udp proxy v6 recv_from error on port {}: {}", host_port, e);
+                }
+                break;
+            }
+        }
+    }
+
     for handle in reply_handles {
         let _ = handle.join();
     }
@@ -2589,7 +3099,7 @@ mod tests {
         let container_ip: Ipv4Addr = server_addr.ip().to_string().parse().unwrap();
         let container_port = server_addr.port();
 
-        let rt = start_tcp_proxies_async(container_ip, &[(0, container_port)]);
+        let rt = start_tcp_proxies_async(container_ip, None, &[(0, container_port)]);
         // Give the accept loop a moment to bind.
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -2605,7 +3115,7 @@ mod tests {
         let container_ip2: Ipv4Addr = server_addr2.ip().to_string().parse().unwrap();
         let container_port2 = server_addr2.port();
 
-        let rt2 = start_tcp_proxies_async(container_ip2, &[(proxy_port, container_port2)]);
+        let rt2 = start_tcp_proxies_async(container_ip2, None, &[(proxy_port, container_port2)]);
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let payload = b"hello-from-client";
@@ -2643,7 +3153,7 @@ mod tests {
         let container_ip: Ipv4Addr = server_addr.ip().to_string().parse().unwrap();
         let container_port = server_addr.port();
 
-        let rt = start_tcp_proxies_async(container_ip, &[(proxy_port, container_port)]);
+        let rt = start_tcp_proxies_async(container_ip, None, &[(proxy_port, container_port)]);
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         const N: usize = 8;
@@ -2702,7 +3212,7 @@ mod tests {
         let container_ip: Ipv4Addr = server_addr.ip().to_string().parse().unwrap();
         let container_port = server_addr.port();
 
-        let rt = start_tcp_proxies_async(container_ip, &[(proxy_port, container_port)]);
+        let rt = start_tcp_proxies_async(container_ip, None, &[(proxy_port, container_port)]);
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Port should be occupied.

@@ -793,6 +793,44 @@ nftables/iptables rules exist. Follows the same skip-if-no-internet pattern as
 
 ---
 
+## IPv6 Dual-Stack Tests (`mod ipv6`)
+
+### `test_ipv6_container_gets_address`
+**Requires:** root, rootfs
+
+Spawns a bridge-networked container and runs `ip -6 addr show eth0 | grep -q 'fd'` inside
+it. Asserts the output contains `IPV6_OK`. Failure means the container did not receive a
+ULA IPv6 address (fd-prefix) from `setup_ipv6_container`, indicating the IPv6 bridge
+configuration, IPAM counter, or `ip -6 addr add` failed.
+
+Does **not** require host IPv6 internet connectivity — purely tests local bridge
+configuration.
+
+### `test_ipv6_outbound_nat`
+**Requires:** root, rootfs, host IPv6 internet connectivity
+
+Spawns a container with `with_network(Bridge)` + `with_nat()` and runs `ping6` to
+`2606:4700:4700::1111` (Cloudflare's public IPv6 resolver). Asserts `NAT6_OK` appears
+in output. Skipped if the host cannot reach that address (`ping6 -c1 -W2`).
+
+Failure means NAT66 (nftables `ip6 table` MASQUERADE rule) is not routing outbound IPv6
+packets from ULA space to the internet, or the container's IPv6 default route is missing.
+
+### `test_ipv6_port_forward_localhost`
+**Requires:** root, rootfs
+
+Spawns a container with a port forward (`host 19093 → container 9080`) that runs an nc
+server echoing `HELLO_IPV6`. Connects to `[::1]:19093` from the host using `TcpStream`
+and asserts the response contains `HELLO_IPV6`.
+
+Failure means the IPv6 localhost proxy (`tcp_accept_loop_v6` binding `[::1]:host_port`)
+is not running, the IPv6 DNAT prerouting rule is missing, or the `[::1]` loopback TCP
+relay is not correctly forwarding to the container's IPv4 address.
+
+Does **not** require host IPv6 internet connectivity — tests the localhost proxy only.
+
+---
+
 ## Overlay Filesystem Tests
 
 ### `test_overlay_writes_to_upper`

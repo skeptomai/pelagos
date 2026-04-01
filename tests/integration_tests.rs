@@ -4139,6 +4139,182 @@ mod networking {
     }
 }
 
+// ── IPv6 dual-stack networking tests ─────────────────────────────────────────
+
+mod ipv6 {
+    use super::*;
+
+    /// Return true if the host has IPv6 connectivity to the internet.
+    /// Uses `ping6` to Cloudflare's public resolver; skips if unavailable.
+    fn host_has_ipv6() -> bool {
+        std::process::Command::new("ping6")
+            .args(["-c", "1", "-W", "2", "2606:4700:4700::1111"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// N2+IPv6: A bridge-networked container should receive a ULA IPv6 address
+    /// (fd-prefix) on eth0 in addition to its IPv4 address.
+    ///
+    /// Requires root and alpine rootfs.  Does NOT require host IPv6 connectivity.
+    #[test]
+    #[serial(nat)]
+    fn test_ipv6_container_gets_address() {
+        if !is_root() {
+            eprintln!("Skipping test_ipv6_container_gets_address: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_ipv6_container_gets_address: alpine-rootfs not found");
+            return;
+        };
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "ip -6 addr show eth0 2>/dev/null | grep -q 'fd' && echo IPV6_OK",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .with_proc_mount()
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn IPv6 container");
+
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("IPV6_OK"),
+            "eth0 should have a ULA (fd-prefix) IPv6 address in bridge mode, got: {}",
+            out
+        );
+        assert!(status.success(), "Container exited with failure");
+    }
+
+    /// N3+IPv6: A container with NAT enabled should be able to reach an
+    /// IPv6 address on the internet (NAT66 masquerade via ip6 nftables table).
+    ///
+    /// Skipped when host has no IPv6 connectivity.
+    #[test]
+    #[serial(nat)]
+    fn test_ipv6_outbound_nat() {
+        if !is_root() {
+            eprintln!("Skipping test_ipv6_outbound_nat: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_ipv6_outbound_nat: alpine-rootfs not found");
+            return;
+        };
+        if !host_has_ipv6() {
+            eprintln!("Skipping test_ipv6_outbound_nat: host has no IPv6 connectivity");
+            return;
+        }
+
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && echo NAT6_OK",
+            ])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_dns(&["2606:4700:4700::1111"])
+            .with_chroot(&rootfs)
+            .with_proc_mount()
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn NAT6 container");
+
+        let (status, stdout, _) = child.wait_with_output().expect("wait");
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(
+            out.contains("NAT6_OK"),
+            "Container should reach IPv6 internet via NAT66, got: {}",
+            out
+        );
+        assert!(status.success(), "Container exited with failure");
+    }
+
+    /// N4+IPv6: A port-forwarded container should be reachable via the localhost
+    /// IPv6 proxy (`[::1]:host_port`).
+    ///
+    /// Starts an nc echo server inside the container on container port 9080,
+    /// forwarded from host port 19093.  Connects via `[::1]:19093` from the
+    /// host and asserts the response is received.
+    ///
+    /// Requires root and alpine rootfs.  Does NOT require host IPv6 connectivity.
+    #[test]
+    #[serial(nat)]
+    fn test_ipv6_port_forward_localhost() {
+        if !is_root() {
+            eprintln!("Skipping test_ipv6_port_forward_localhost: requires root");
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping test_ipv6_port_forward_localhost: alpine-rootfs not found");
+            return;
+        };
+
+        // Check that nc is available inside the container (Alpine busybox nc).
+        let host_port: u16 = 19093;
+        let container_port: u16 = 9080;
+
+        let mut child = Command::new("/bin/ash")
+            .args(["-c", "echo HELLO_IPV6 | nc -l -p 9080"])
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .with_network(NetworkMode::Bridge)
+            .with_nat()
+            .with_port_forward(host_port, container_port)
+            .with_chroot(&rootfs)
+            .env("PATH", ALPINE_PATH)
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .spawn()
+            .expect("Failed to spawn port-forward v6 container");
+
+        // Wait for nc to start listening.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Connect to [::1]:19093 from host.
+        let result = std::net::TcpStream::connect(format!("[::1]:{}", host_port));
+        match result {
+            Ok(mut stream) => {
+                use std::io::Read;
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                let response = String::from_utf8_lossy(&buf);
+                unsafe { libc::kill(child.pid(), libc::SIGTERM) };
+                let _ = child.wait();
+                assert!(
+                    response.contains("HELLO_IPV6"),
+                    "IPv6 localhost proxy should relay container response, got: {:?}",
+                    response
+                );
+            }
+            Err(e) => {
+                unsafe { libc::kill(child.pid(), libc::SIGTERM) };
+                let _ = child.wait();
+                panic!("Failed to connect to [::1]:{}: {}", host_port, e);
+            }
+        }
+    }
+}
+
 mod oci_lifecycle {
     use super::*;
 

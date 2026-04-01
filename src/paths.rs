@@ -250,6 +250,11 @@ pub fn network_port_forwards_file(name: &str) -> PathBuf {
     network_runtime_dir(name).join("port_forwards")
 }
 
+/// Per-network IPv6 IPAM counter file: `<runtime>/networks/<name>/next_ipv6`.
+pub fn network_ipv6_ipam_file(name: &str) -> PathBuf {
+    network_runtime_dir(name).join("next_ipv6")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
