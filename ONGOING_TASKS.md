@@ -1,5 +1,36 @@
 # Ongoing Tasks
 
+## Session completed: 2026-04-01 (SHA 088646d)
+
+### Issues resolved this session
+
+| # | Title | Fixed in |
+|---|-------|---------|
+| #185 | feat(network): IPv6 dual-stack for bridge networks | PR #186 |
+
+### Key implementation details
+
+**#185 — IPv6 dual-stack (PR #186):**
+- ULA /64 prefix derived deterministically from FNV-1a hash of network name — no new stored
+  fields in `NetworkDef` JSON (fully backward-compatible)
+- `network_ipv6_ipam_file(name)` added to `paths.rs`; `allocate_ipv6()` in `network.rs`
+  uses flock-serialized counter in `next_ipv6` per-network runtime file
+- `ensure_bridge()`: assigns `{gw6}/64` to bridge device after IPv4 setup (idempotent)
+- `setup_ipv6_container()`: allocates addr, `ip -6 addr add`, `ip -6 route add default`,
+  `accept_ra=2` + `forwarding=1` sysctls (prevents host losing SLAAC default route)
+- `setup_ipv6_secondary()`: same but no default route (for secondary interfaces)
+- NAT66: `build_nat6_script()` generates nftables `ip6` table + MASQUERADE; added in
+  `enable_nat()`; `disable_nat()` tears down `ip6` table and ip6tables FORWARD rules
+- `PortForwardEntry` is now a 6-tuple `(ns, ip4, hp, cp, proto, Option<Ipv6Addr>)`;
+  parser uses `splitn(6, ':')` with optional 6th field (old 5-field files parse as `None`)
+- `build_prerouting6_script()`: IPv6 DNAT in `ip6` table (prerouting hook)
+- `tcp_accept_loop_v6()`: tokio task binding `[::1]:host_port`; reuses `tcp_relay()`
+- `start_udp_proxy_v6()`: std-thread UDP relay binding `[::1]:host_port`; mirrors IPv4 proxy
+- 3 integration tests in `mod ipv6`: address assignment, outbound NAT66 (guarded), localhost proxy
+- 308/308 integration tests pass; 321/321 unit tests pass
+
+---
+
 ## Session completed: 2026-03-31 (SHA 023ef35)
 
 ### Issues resolved this session
