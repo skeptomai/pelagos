@@ -7054,7 +7054,7 @@ mod images {
 
         use pelagos::image;
 
-        let reference = "docker.io/library/alpine:latest";
+        let reference = "docker.io/library/alpine:3.21";
 
         // Pull the image using the pelagos binary (true E2E).
         let pull_status = std::process::Command::new(env!("CARGO_BIN_EXE_pelagos"))
@@ -12585,11 +12585,18 @@ mod registry_auth {
             .args(["image", "pull", "alpine:3.21"])
             .status();
 
-        let dest_ref = format!("{}/library/alpine:latest", registry_addr);
+        let dest_ref = format!("{}/library/alpine:3.21", registry_addr);
 
         // Push alpine to the local registry.
         let push_out = std::process::Command::new(bin)
-            .args(["image", "push", "alpine", "--dest", &dest_ref, "--insecure"])
+            .args([
+                "image",
+                "push",
+                "alpine:3.21",
+                "--dest",
+                &dest_ref,
+                "--insecure",
+            ])
             .output()
             .expect("pelagos image push");
         assert!(
@@ -12636,7 +12643,7 @@ mod registry_auth {
             .args(["image", "rm", &dest_ref])
             .output();
         let _ = std::process::Command::new(bin)
-            .args(["image", "rm", "alpine"])
+            .args(["image", "rm", "alpine:3.21"])
             .output();
         let _ = std::process::Command::new(bin)
             .args(["image", "rm", "registry:2"])
@@ -12742,11 +12749,18 @@ mod registry_auth {
             .args(["image", "pull", "alpine:3.21"])
             .status();
 
-        let dest_ref = format!("{}/library/alpine:latest", registry_addr);
+        let dest_ref = format!("{}/library/alpine:3.21", registry_addr);
 
         // ── 3. Push WITHOUT credentials — must fail ────────────────────────────
         let push_anon = std::process::Command::new(bin)
-            .args(["image", "push", "alpine", "--dest", &dest_ref, "--insecure"])
+            .args([
+                "image",
+                "push",
+                "alpine:3.21",
+                "--dest",
+                &dest_ref,
+                "--insecure",
+            ])
             .output()
             .expect("push without creds");
         assert!(
@@ -12760,7 +12774,7 @@ mod registry_auth {
             .args([
                 "image",
                 "push",
-                "alpine",
+                "alpine:3.21",
                 "--dest",
                 &dest_ref,
                 "--insecure",
@@ -12839,7 +12853,14 @@ mod registry_auth {
 
         // Push via docker config (no explicit --username/--password).
         let push_auth = std::process::Command::new(bin)
-            .args(["image", "push", "alpine", "--dest", &dest_ref, "--insecure"])
+            .args([
+                "image",
+                "push",
+                "alpine:3.21",
+                "--dest",
+                &dest_ref,
+                "--insecure",
+            ])
             .env("HOME", &home_path)
             .output()
             .expect("push via docker config");
@@ -12903,7 +12924,7 @@ mod registry_auth {
             .args(["image", "rm", &dest_ref])
             .output();
         let _ = std::process::Command::new(bin)
-            .args(["image", "rm", "alpine"])
+            .args(["image", "rm", "alpine:3.21"])
             .output();
         let _ = std::process::Command::new(bin)
             .args(["image", "rm", "registry:2"])
@@ -15726,6 +15747,8 @@ mod tutorial_e2e_p1 {
 // ============================================================================
 
 mod tutorial_e2e_p2 {
+    use serial_test::serial;
+
     fn bin() -> &'static str {
         env!("CARGO_BIN_EXE_pelagos")
     }
@@ -15899,10 +15922,21 @@ mod tutorial_e2e_p2 {
     /// a container, or static binary execution in the final Alpine stage is broken.
     #[test]
     #[ignore]
+    #[serial]
     fn test_tut_p2_multistage_go_build() {
         let ctx = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/tutorial-e2e/p2-go");
         let tag = "tut-p2-go:latest";
         cleanup_image(tag);
+
+        // Pre-pull base images: golang:1.22-alpine (builder) and alpine (final stage).
+        // pelagos build does not auto-pull base images.
+        for img in &["golang:1.22-alpine", "alpine:latest"] {
+            let pull = std::process::Command::new(bin())
+                .args(["image", "pull", img])
+                .status()
+                .expect("pelagos image pull");
+            assert!(pull.success(), "failed to pull {}", img);
+        }
 
         let build_out = std::process::Command::new(bin())
             .args(["build", "-t", tag, ctx])
