@@ -47,4 +47,3 @@ contents:
 
 scripts:
   postinstall: pkg/nfpm/postinstall.sh
-  postupgrade: pkg/nfpm/postinstall.sh
