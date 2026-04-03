@@ -12795,7 +12795,14 @@ mod registry_auth {
             .unwrap_or(false);
         if !pull_ok {
             // Check if it's already in the local store from a prior run.
-            let ls = std::process::Command::new(bin).args(["image", "ls"]).output().unwrap_or_else(|_| std::process::Output { status: std::process::ExitStatus::default(), stdout: vec![], stderr: vec![] });
+            let ls = std::process::Command::new(bin)
+                .args(["image", "ls"])
+                .output()
+                .unwrap_or_else(|_| std::process::Output {
+                    status: std::process::ExitStatus::default(),
+                    stdout: vec![],
+                    stderr: vec![],
+                });
             if !String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
                 eprintln!("SKIP test_local_registry_push_pull_roundtrip: alpine:3.21 pull failed and not cached");
                 return;
@@ -12968,9 +12975,18 @@ mod registry_auth {
             .map(|s| s.success())
             .unwrap_or(false);
         if !pull_ok {
-            let ls = std::process::Command::new(bin).args(["image", "ls"]).output().unwrap_or_else(|_| std::process::Output { status: std::process::ExitStatus::default(), stdout: vec![], stderr: vec![] });
+            let ls = std::process::Command::new(bin)
+                .args(["image", "ls"])
+                .output()
+                .unwrap_or_else(|_| std::process::Output {
+                    status: std::process::ExitStatus::default(),
+                    stdout: vec![],
+                    stderr: vec![],
+                });
             if !String::from_utf8_lossy(&ls.stdout).contains("alpine:3.21") {
-                eprintln!("SKIP test_registry_auth_push_pull: alpine:3.21 pull failed and not cached");
+                eprintln!(
+                    "SKIP test_registry_auth_push_pull: alpine:3.21 pull failed and not cached"
+                );
                 return;
             }
         }
