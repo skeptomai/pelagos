@@ -142,7 +142,7 @@ jobs:
         run: |
           BASE_URL="https://api.buildkite.com/v2/packages/organizations/christopher-brown/registries/pelagos/packages"
           upload() {
-            curl -sf -X POST "$BASE_URL" \
+            curl -sS --fail-with-body -X POST "$BASE_URL" \
               -H "Authorization: Bearer $PACKAGECLOUD_TOKEN" \
               -F "file=@$1"
           }
