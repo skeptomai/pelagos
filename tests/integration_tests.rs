@@ -4145,24 +4145,25 @@ mod ipv6 {
     use super::*;
 
     /// Return true if the host has IPv6 connectivity to the internet.
-    /// Tries `ping6` first (older distros), then `ping -6` (newer distros that
-    /// merged ping6 into ping).  Uses Cloudflare's public resolver as the probe target.
+    /// Uses Cloudflare's public resolver as the probe target.
+    /// `ping -6` is the modern invocation; `ping6` is the legacy separate binary
+    /// still found on some older distros (Alpine, Debian ≤ 11, etc.).
     fn host_has_ipv6() -> bool {
         let target = "2606:4700:4700::1111";
-        // Try `ping6` (Arch, Alpine, older Debian/Ubuntu have a separate binary).
-        let ok6 = std::process::Command::new("ping6")
-            .args(["-c", "1", "-W", "2", target])
+        // Modern: `ping -6` (Arch, Fedora, Ubuntu 22+, …).
+        let ok = std::process::Command::new("ping")
+            .args(["-6", "-c", "1", "-W", "2", target])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if ok6 {
+        if ok {
             return true;
         }
-        // Fall back to `ping -6` (newer Arch/Fedora/RHEL where ping6 is a symlink or absent).
-        std::process::Command::new("ping")
-            .args(["-6", "-c", "1", "-W", "2", target])
+        // Legacy fallback: standalone `ping6` binary (older distros).
+        std::process::Command::new("ping6")
+            .args(["-c", "1", "-W", "2", target])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
