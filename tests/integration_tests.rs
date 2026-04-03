@@ -4145,10 +4145,24 @@ mod ipv6 {
     use super::*;
 
     /// Return true if the host has IPv6 connectivity to the internet.
-    /// Uses `ping6` to Cloudflare's public resolver; skips if unavailable.
+    /// Tries `ping6` first (older distros), then `ping -6` (newer distros that
+    /// merged ping6 into ping).  Uses Cloudflare's public resolver as the probe target.
     fn host_has_ipv6() -> bool {
-        std::process::Command::new("ping6")
-            .args(["-c", "1", "-W", "2", "2606:4700:4700::1111"])
+        let target = "2606:4700:4700::1111";
+        // Try `ping6` (Arch, Alpine, older Debian/Ubuntu have a separate binary).
+        let ok6 = std::process::Command::new("ping6")
+            .args(["-c", "1", "-W", "2", target])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok6 {
+            return true;
+        }
+        // Fall back to `ping -6` (newer Arch/Fedora/RHEL where ping6 is a symlink or absent).
+        std::process::Command::new("ping")
+            .args(["-6", "-c", "1", "-W", "2", target])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -4218,10 +4232,14 @@ mod ipv6 {
             return;
         }
 
+        // Wait for DAD (Duplicate Address Detection) before pinging: while an
+        // address is in the 'tentative' state the kernel silently drops outbound
+        // packets, causing the ping to fail spuriously.
         let mut child = Command::new("/bin/ash")
             .args([
                 "-c",
-                "ping6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1 && echo NAT6_OK",
+                "while ip -6 addr show eth0 | grep -q tentative; do sleep 0.1; done; \
+                 ping6 -c 2 -W 5 2606:4700:4700::1111 >/dev/null 2>&1 && echo NAT6_OK",
             ])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)
             .with_network(NetworkMode::Bridge)
