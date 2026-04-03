@@ -157,7 +157,7 @@ if has_cmd nft; then
     for i in 1 2 3; do
         NAME="stress-nat-$i"
         CONTAINERS_TO_CLEAN+=("$NAME")
-        run_detach run --name "$NAME" --detach --network bridge --nat alpine /bin/sleep 120 >/dev/null
+        run_detach run --name "$NAME" --detach --network bridge alpine /bin/sleep 120 >/dev/null
     done
     sleep 2
 

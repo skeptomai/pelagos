@@ -200,6 +200,10 @@ pub struct SpawnConfig {
     /// Whether NAT (MASQUERADE) was enabled.
     #[serde(default)]
     pub nat: bool,
+    /// Whether NAT was explicitly suppressed via --no-nat.
+    /// Persisted so that `pelagos start` does not re-enable implied NAT on restart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_nat: bool,
     /// Container labels as KEY=VALUE strings (e.g. "env=staging").
     #[serde(default)]
     pub labels: Vec<String>,

@@ -1,5 +1,100 @@
 # Ongoing Tasks
 
+## Active: smart network default for `pelagos run`
+
+### Context
+
+`pelagos build` already has an `--network auto` default that selects bridge
+(root) or pasta (rootless) automatically.  `pelagos run` still defaults to
+loopback, forcing users to write `--network bridge --nat` for internet access.
+
+Goal: `pelagos run alpine ping -6 -c 10 google.com` should just work with no
+flags, matching Docker ergonomics while respecting the rootless-first design.
+
+### Design
+
+**New default for `pelagos run` (no `--network` flag):**
+- Running as root → `NetworkMode::Bridge` + NAT implied
+- Running rootless + pasta available → `NetworkMode::Pasta`
+- Running rootless + no pasta → `NetworkMode::Loopback` (with a warning)
+
+**Implied NAT with bridge:**
+- Whenever bridge is selected (by default or explicitly), `--nat` is on unless
+  `--no-nat` is passed.
+- `--nat` flag kept for backwards compat (explicit no-op when bridge is default).
+- New `--no-nat` flag to opt out (use case: routed IPv6 prefix, no masquerade needed).
+
+**Explicit override to restore old behaviour:**
+- `--network loopback` → isolated container, no internet, no bridge
+- `--network none` → share host network namespace (add this as a new parse target
+  mapping to `NetworkMode::None` / no NET unshare)
+
+**`pelagos build`:** already correct; no change.
+
+**OCI lifecycle:** no change (honours config.json explicitly).
+
+**Compose:** no change to service network assignment logic; services that declare
+networks continue to use them; services with no networks get their compose-file
+default. The auto logic only applies to the `pelagos run` CLI path.
+
+### File changes
+
+**`src/cli/run.rs`:**
+- `RunArgs`: add `#[clap(long)] pub no_nat: bool`
+- Replace the `if args.network.is_empty()` block with the auto logic from
+  `build.rs`: `if is_rootless() { Pasta } else { Bridge }`
+- After resolving `network_mode`, set `nat = !args.no_nat` whenever the mode is
+  `Bridge` or `BridgeNamed(_)` and `nat` was not already forced true by `--nat`
+- Parse `"none"` in `parse_network_mode()` → `NetworkMode::None`
+- Keep `--nat` flag; it becomes a no-op when bridge is the default (NAT already
+  on) but still works as an explicit override for named networks that don't imply NAT
+
+**`src/cli/run.rs` (port-forward special case):**
+- The existing `-p` → bridge fallback is subsumed by the new auto default; remove
+  the separate `-p` check (root auto → bridge anyway; rootless pasta supports -p
+  via the userspace proxy already).
+
+**`tests/integration_tests.rs`:**
+- Search for CLI-invoked tests that test default-loopback behaviour and update
+  expectations.
+- Add `test_run_default_network_root` (root → bridge+nat, container reaches internet)
+- Add `test_run_default_network_rootless_pasta` (rootless → pasta, container reaches internet)
+- Both gated on `is_root()` / pasta availability respectively.
+
+**Documentation (all in same commit):**
+- `docs/USER_GUIDE.md`: document new defaults; add `--no-nat` and `--network none`;
+  add upgrade note for users relying on default-loopback behaviour
+- `CLAUDE.md`: update rootless-first section to reflect new run default
+- `README.md`: update network table and `pelagos run` examples
+
+### Verification steps
+
+```bash
+# As root — should print 0% packet loss with no flags:
+sudo pelagos run alpine ping -6 -c 5 google.com
+
+# Rootless — same (via pasta):
+pelagos run alpine ping -6 -c 5 google.com
+
+# Explicit loopback opt-out — container should have no internet:
+sudo pelagos run --network loopback alpine ping -c 1 8.8.8.8  # expect failure
+
+# --no-nat — bridge without masquerade (container has bridge IP but no internet):
+sudo pelagos run --no-nat alpine ping -c 1 8.8.8.8  # expect failure
+
+# Full integration suite still green:
+sudo scripts/reset-test-env.sh && sudo -E cargo test --test integration_tests
+```
+
+### Notes / risks
+
+- The change is a **breaking default** for scripts relying on loopback isolation.
+  Document clearly; `--network loopback` is the explicit escape hatch.
+- pasta must be available for rootless auto to work; fallback to loopback + warn.
+- `test_dns_multi_network` is a pre-existing parallel flake (unrelated to this work).
+
+---
+
 ## Session completed: 2026-04-01 (SHA 088646d)
 
 ### Issues resolved this session

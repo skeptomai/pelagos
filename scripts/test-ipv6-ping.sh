@@ -19,7 +19,7 @@ if [[ -z "$BRIDGE_MAC" ]]; then
     exit 1
 fi
 
-exec sudo -E cargo run --bin pelagos -- run --network bridge --nat --rm alpine /bin/ash -c "
+exec sudo -E cargo run --bin pelagos -- run --network bridge --rm alpine /bin/ash -c "
     # Wait for DAD (Duplicate Address Detection) to complete.
     # While an address is 'tentative' the kernel silently drops outbound packets.
     echo 'Waiting for DAD to complete...'

@@ -16426,7 +16426,6 @@ mod tutorial_e2e_p3 {
                 name,
                 "--network",
                 "bridge",
-                "--nat",
                 "--publish",
                 "18080:80",
                 "alpine:3.21",

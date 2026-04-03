@@ -67,9 +67,13 @@ pub struct RunArgs {
     #[clap(long = "publish", short = 'p')]
     pub publish: Vec<String>,
 
-    /// Enable MASQUERADE NAT (requires bridge)
+    /// Enable MASQUERADE NAT (implied when bridge is selected; kept for explicit use)
     #[clap(long)]
     pub nat: bool,
+
+    /// Suppress the NAT masquerade rule when bridge is selected (e.g. for routed prefixes)
+    #[clap(long = "no-nat")]
+    pub no_nat: bool,
 
     /// DNS server (repeatable; requires bridge/pasta)
     #[clap(long)]
@@ -240,13 +244,22 @@ pub fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // before we touch the state directory.
     let port_forwards = parse_port_forwards(&args.publish)?;
     let network_mode = if args.network.is_empty() {
-        // No explicit --network: choose a safe, isolated default.
-        // -p requires per-container IP (bridge); otherwise loopback gives
-        // isolation without requiring the bridge to be pre-configured.
-        if !port_forwards.is_empty() {
-            NetworkMode::Bridge
+        // No explicit --network: auto-select based on privilege level.
+        // Root gets bridge (internet access via NAT, same default as Docker).
+        // Rootless gets pasta (full internet, no kernel privileges required).
+        // If pasta is not installed, fall back to loopback with a warning.
+        if pelagos::paths::is_rootless() {
+            if pelagos::network::is_pasta_available() {
+                NetworkMode::Pasta
+            } else {
+                eprintln!(
+                    "pelagos: pasta not found — using loopback (no internet). \
+                     Install pasta for rootless networking."
+                );
+                NetworkMode::Loopback
+            }
         } else {
-            NetworkMode::Loopback
+            NetworkMode::Bridge
         }
     } else {
         parse_network_mode(args.network.first().unwrap())?
@@ -418,6 +431,7 @@ fn build_spawn_config(args: &RunArgs, rootfs_label: &str, exe_and_args: &[String
         read_only: args.read_only,
         rm: args.rm,
         nat: args.nat,
+        no_nat: args.no_nat,
         labels: args.label.clone(),
         tmpfs: args.tmpfs.clone(),
     }
@@ -631,6 +645,13 @@ fn apply_cli_options(
     container_name: &str,
 ) -> Result<Command, Box<dyn std::error::Error>> {
     // Network
+    // NAT is implied whenever a bridge network is selected (default or explicit),
+    // matching Docker's behaviour.  --no-nat suppresses it (e.g. routed IPv6 prefix).
+    // --nat is kept as an explicit override for completeness and named-network use.
+    let is_bridge = matches!(
+        network_mode,
+        NetworkMode::Bridge | NetworkMode::BridgeNamed(_)
+    );
     if network_mode != NetworkMode::None {
         cmd = cmd.with_network(network_mode);
     }
@@ -645,7 +666,7 @@ fn apply_cli_options(
             PortProto::Both => cmd.with_port_forward_both(host, container),
         };
     }
-    if args.nat {
+    if (is_bridge && !args.no_nat) || args.nat {
         cmd = cmd.with_nat();
     }
     if !args.dns.is_empty() {

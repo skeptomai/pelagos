@@ -375,7 +375,7 @@ check_contains "$OUT" "172.19" "bridge IP"
 
 echo "--- Test: bridge + NAT ---"
 if has_cmd nft; then
-    $BINARY run --network bridge --nat alpine /bin/true 2>/dev/null || true
+    $BINARY run --network bridge alpine /bin/true 2>/dev/null || true
     OUT=$(nft list ruleset 2>/dev/null || true)
     # NAT rule may already be cleaned up, but if it's still there check for masquerade
     # This is a best-effort check

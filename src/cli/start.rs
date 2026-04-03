@@ -113,6 +113,7 @@ fn spawn_config_to_run_args(
         network: sc.network,
         publish: sc.publish,
         nat: sc.nat,
+        no_nat: sc.no_nat,
         dns: sc.dns,
         volume: sc.volume,
         bind: sc.bind,
