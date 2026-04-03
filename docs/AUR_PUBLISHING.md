@@ -38,18 +38,24 @@ Pushing to a package name that does not yet exist **creates it** and makes you t
 
 ## Updating at release time
 
-1. Bump `pkgver` (and reset `pkgrel=1`) in both `PKGBUILD` files.
-2. Replace `sha256sums=('SKIP')` with real hashes from the release artifacts:
+**Wait for the release CI workflow to complete successfully before updating the AUR.**
+The sha256sums are derived from the final release artifacts, which are only produced
+after all CI gates pass.
+
+1. Bump `pkgver` (and reset `pkgrel=1`) in both `PKGBUILD` files and `Cargo.toml`.
+2. Push the version bump commit and tag — CI builds the release and uploads artifacts.
+3. Once CI is green, fetch the real sha256sums from the release:
    ```bash
-   sha256sum pelagos-x86_64-linux
-   sha256sum pelagos-aarch64-linux
-   sha256sum v<VERSION>.tar.gz
+   curl -sL https://github.com/pelagos-containers/pelagos/releases/download/v<VERSION>/pelagos-x86_64-linux.sha256
+   curl -sL https://github.com/pelagos-containers/pelagos/releases/download/v<VERSION>/pelagos-aarch64-linux.sha256
+   curl -sL https://github.com/pelagos-containers/pelagos/archive/refs/tags/v<VERSION>.tar.gz | sha256sum
    ```
-3. Regenerate `.SRCINFO` in each directory:
+4. Update `sha256sums` in both `PKGBUILD` files.
+5. Regenerate `.SRCINFO` in each directory:
    ```bash
    makepkg --printsrcinfo > .SRCINFO
    ```
-4. Commit the changes to this repo, then push to each AUR remote:
+6. Commit the changes to this repo, then push to each AUR remote:
    ```bash
    git push aur master
    ```
