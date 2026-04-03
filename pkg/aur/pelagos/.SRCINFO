@@ -15,6 +15,6 @@ pkgbase = pelagos
 	optdepends = fuse-overlayfs: rootless overlay filesystem on kernels < 5.11
 	optdepends = dnsmasq: production-grade DNS backend for container name resolution
 	source = pelagos-0.60.2.tar.gz::https://github.com/pelagos-containers/pelagos/archive/refs/tags/v0.60.2.tar.gz
-	sha256sums = 42d9998f1151a8554d8187557b4453bdd1933b2aff130dcc2ae4667289c5ba98
+	sha256sums = 17c1a6449edbc96595e947f3cc7da9f290354882b6469e0dd5857a1c198ec4c6
 
 pkgname = pelagos
