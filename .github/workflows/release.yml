@@ -80,3 +80,91 @@ jobs:
             ${{ matrix.artifact }}
             ${{ matrix.artifact }}.sha256
           generate_release_notes: true
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  package:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pelagos-x86_64-linux
+          path: dist/amd64
+      - name: Download aarch64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pelagos-aarch64-linux
+          path: dist/arm64
+      - name: Install nfpm
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
+            | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update -q
+          sudo apt-get install -y nfpm
+      - name: Build packages
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p dist/packages
+
+          for row in "amd64 pelagos-x86_64-linux" "arm64 pelagos-aarch64-linux"; do
+            ARCH=$(echo $row | cut -d' ' -f1)
+            BINARY_NAME=$(echo $row | cut -d' ' -f2)
+            BINARY="dist/$ARCH/$BINARY_NAME"
+            chmod +x "$BINARY"
+
+            ARCH=$ARCH VERSION=$VERSION BINARY=$BINARY \
+              nfpm package --config pkg/nfpm/nfpm.yaml --packager deb \
+              --target "dist/packages/pelagos_${VERSION}_${ARCH}.deb"
+
+            ARCH=$ARCH VERSION=$VERSION BINARY=$BINARY \
+              nfpm package --config pkg/nfpm/nfpm.yaml --packager rpm \
+              --target "dist/packages/pelagos_${VERSION}_${ARCH}.rpm"
+          done
+      - name: Upload packages to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/packages/*
+      - name: Upload packages as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/packages/
+
+  package-test:
+    needs: [package]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Download packages artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: packages
+      - name: Install system dependencies
+        run: sudo apt-get install -y nftables iproute2
+      - name: Install .deb
+        run: sudo dpkg -i pelagos_*_${{ matrix.arch }}.deb
+      - name: Verify installation
+        run: |
+          test "$(which pelagos)" = "/usr/bin/pelagos"
+          pelagos --version
+          test -d /var/lib/pelagos
+          test -f /usr/share/pelagos/setup.sh
+          test -f /usr/lib/tmpfiles.d/pelagos.conf
+      - name: Simulate tmpfiles.d boot
+        run: sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/pelagos.conf
+      - name: Verify /run/pelagos created
+        run: test -d /run/pelagos
+      - name: Smoke test — run a container
+        run: sudo pelagos run --rm alpine echo pelagos-deb-ok
