@@ -1507,7 +1507,7 @@ mod user_notif {
     #[ignore = "requires kernel seccomp supervisor capabilities unavailable on CI runner"]
     fn test_user_notif_deny_syscall() {
         // Verify that Deny(EPERM) causes the intercepted syscall to fail.
-        // Intercept SYS_fchmodat (what Alpine's chmod uses) and deny it.
+        // Intercept SYS_chmod (what Alpine's busybox chmod uses directly) and deny it.
         // The container creates a file then tries to chmod it; chmod should fail.
         if !is_root() {
             eprintln!("Skipping test_user_notif_deny_syscall: requires root");
@@ -1528,7 +1528,7 @@ mod user_notif {
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_proc_mount()
             .with_tmpfs("/tmp", "")
-            .with_seccomp_user_notif(vec![libc::SYS_fchmodat], DenyAll)
+            .with_seccomp_user_notif(vec![libc::SYS_chmod], DenyAll)
             .spawn()
             .expect("spawn failed");
 
@@ -1537,7 +1537,7 @@ mod user_notif {
 
         assert!(
             stdout.contains("exit=1"),
-            "chmod should fail (EPERM) when fchmodat is denied by supervisor: stdout={}",
+            "chmod should fail (EPERM) when SYS_chmod is denied by supervisor: stdout={}",
             stdout
         );
     }
@@ -1546,7 +1546,7 @@ mod user_notif {
     #[ignore = "requires kernel seccomp supervisor capabilities unavailable on CI runner"]
     fn test_user_notif_allow_passthrough() {
         // Verify that Allow lets the syscall proceed normally.
-        // Intercept SYS_fchmodat and allow it; chmod should succeed.
+        // Intercept SYS_chmod and allow it; chmod should succeed.
         if !is_root() {
             eprintln!("Skipping test_user_notif_allow_passthrough: requires root");
             return;
@@ -1571,7 +1571,7 @@ mod user_notif {
             .with_namespaces(Namespace::UTS | Namespace::MOUNT)
             .with_proc_mount()
             .with_tmpfs("/tmp", "")
-            .with_seccomp_user_notif(vec![libc::SYS_fchmodat], handler)
+            .with_seccomp_user_notif(vec![libc::SYS_chmod], handler)
             .spawn()
             .expect("spawn failed");
 
@@ -1580,12 +1580,12 @@ mod user_notif {
 
         assert!(
             stdout.contains("exit=0"),
-            "chmod should succeed when fchmodat is allowed by supervisor: stdout={}",
+            "chmod should succeed when SYS_chmod is allowed by supervisor: stdout={}",
             stdout
         );
         assert!(
             count.load(Ordering::Relaxed) >= 1,
-            "handler should have been called at least once for fchmodat"
+            "handler should have been called at least once for SYS_chmod"
         );
     }
 }
