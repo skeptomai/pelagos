@@ -125,17 +125,21 @@ impl NetworkConfig {
     /// environment variable override if set.  Returns an empty vec if the env
     /// var is set to an empty string (opt-out).
     pub fn effective_default_dns(&self) -> Vec<String> {
-        if let Ok(val) = std::env::var("PELAGOS_DEFAULT_DNS") {
-            if val.is_empty() {
-                return vec![];
-            }
-            return val
+        self.effective_default_dns_with_env(std::env::var("PELAGOS_DEFAULT_DNS").ok().as_deref())
+    }
+
+    /// Inner implementation — accepts the env value explicitly so tests can
+    /// exercise it without mutating the process environment.
+    fn effective_default_dns_with_env(&self, env_val: Option<&str>) -> Vec<String> {
+        match env_val {
+            Some("") => vec![],
+            Some(val) => val
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect();
+                .collect(),
+            None => self.default_dns.clone(),
         }
-        self.default_dns.clone()
     }
 
     /// Parse `default_subnet` as an [`Ipv4Net`], falling back to the
@@ -257,21 +261,23 @@ default_dns = ["9.9.9.9", "2620:fe::fe"]
 
     #[test]
     fn test_effective_default_dns_env_override() {
-        // Temporarily set the env var; restore on exit.
-        std::env::set_var("PELAGOS_DEFAULT_DNS", "8.8.8.8,8.8.4.4");
         let cfg = NetworkConfig::default();
-        let dns = cfg.effective_default_dns();
-        std::env::remove_var("PELAGOS_DEFAULT_DNS");
+        let dns = cfg.effective_default_dns_with_env(Some("8.8.8.8,8.8.4.4"));
         assert_eq!(dns, vec!["8.8.8.8", "8.8.4.4"]);
     }
 
     #[test]
     fn test_effective_default_dns_env_empty_opt_out() {
-        std::env::set_var("PELAGOS_DEFAULT_DNS", "");
         let cfg = NetworkConfig::default();
-        let dns = cfg.effective_default_dns();
-        std::env::remove_var("PELAGOS_DEFAULT_DNS");
+        let dns = cfg.effective_default_dns_with_env(Some(""));
         assert!(dns.is_empty());
+    }
+
+    #[test]
+    fn test_effective_default_dns_no_env_uses_config() {
+        let cfg = NetworkConfig::default();
+        let dns = cfg.effective_default_dns_with_env(None);
+        assert_eq!(dns, vec!["1.1.1.1", "2606:4700:4700::1111"]);
     }
 
     #[test]

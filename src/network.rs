@@ -1077,9 +1077,18 @@ fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
     let ip6_cidr = format!("{}/64", ip6);
 
     // Assign IPv6 address to eth0 inside the named netns.
+    //
+    // `nodad` skips Duplicate Address Detection.  DAD puts the address in
+    // `tentative` state for ~1 second while the kernel solicits for conflicts;
+    // packets sourced from a tentative address are silently dropped, causing
+    // consistent first-packet loss.  Pelagos ULA addresses are derived
+    // deterministically (FNV-1a of the network name + sequential counter), so
+    // the collision probability is negligible and DAD adds no safety value.
     if let Err(e) = run(
         "ip",
-        &["-n", ns_name, "addr", "add", &ip6_cidr, "dev", "eth0"],
+        &[
+            "-n", ns_name, "addr", "add", &ip6_cidr, "dev", "eth0", "nodad",
+        ],
     ) {
         log::warn!("IPv6 addr add failed for {} — IPv4-only: {}", ns_name, e);
         return None;
@@ -1093,6 +1102,34 @@ fn setup_ipv6_container(net: &NetworkDef, ns_name: &str) -> Option<Ipv6Addr> {
     ) {
         log::warn!("IPv6 route add failed for {} — IPv4-only: {}", ns_name, e);
         return None;
+    }
+
+    // Pre-seed the NDP neighbor entry for the gateway with state `stale`.
+    //
+    // Each container namespace starts with an empty NDP cache.  Without this,
+    // the first outbound packet triggers an NDP solicitation and is dropped
+    // if the bridge hasn't responded before the kernel's neighbor queue
+    // drains — causing consistent first-packet loss on every container spawn.
+    //
+    // `stale` means "use this entry immediately, but verify it in the
+    // background via a real NDP exchange".  The bridge MAC is stable across
+    // container spawns (it changes only if the bridge is destroyed and
+    // recreated), so the entry is virtually always correct.  If it is ever
+    // wrong the kernel self-corrects after the first NDP response.
+    let bridge_mac_path = format!("/sys/class/net/{}/address", net.bridge_name);
+    if let Ok(mac) = std::fs::read_to_string(&bridge_mac_path) {
+        let mac = mac.trim();
+        if let Err(e) = run(
+            "ip",
+            &[
+                "-n", ns_name, "-6", "neigh", "add", &gw6, "lladdr", mac, "dev", "eth0", "nud",
+                "stale",
+            ],
+        ) {
+            log::debug!("IPv6 NDP pre-seed failed (non-fatal): {}", e);
+        } else {
+            log::debug!("IPv6: pre-seeded NDP for {} lladdr {} (stale)", gw6, mac);
+        }
     }
 
     // Enable IPv6 forwarding on the host.  accept_ra=2 keeps any SLAAC-learned
