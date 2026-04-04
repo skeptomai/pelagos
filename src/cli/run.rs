@@ -693,7 +693,9 @@ fn apply_cli_options(
     let effective_dns: Vec<String> = if !args.dns.is_empty() {
         args.dns.clone()
     } else if is_bridge {
-        pelagos::config::PelagosConfig::load().network.effective_default_dns()
+        pelagos::config::PelagosConfig::load()
+            .network
+            .effective_default_dns()
     } else {
         vec![]
     };

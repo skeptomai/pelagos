@@ -129,7 +129,11 @@ impl NetworkConfig {
             if val.is_empty() {
                 return vec![];
             }
-            return val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            return val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         self.default_dns.clone()
     }
@@ -172,7 +176,10 @@ mod tests {
         let cfg = PelagosConfig::default();
         assert_eq!(cfg.network.default_subnet, "172.19.0.0/24");
         assert_eq!(cfg.network.auto_alloc_pool, "10.99.0.0/16");
-        assert_eq!(cfg.network.default_dns, vec!["1.1.1.1", "2606:4700:4700::1111"]);
+        assert_eq!(
+            cfg.network.default_dns,
+            vec!["1.1.1.1", "2606:4700:4700::1111"]
+        );
     }
 
     #[test]
