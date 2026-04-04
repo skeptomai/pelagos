@@ -13,10 +13,10 @@ license: Apache-2.0
 depends:
   - nftables
   - iproute2
+  - fuse-overlayfs
+  - passt
 
 suggests:
-  - passt
-  - fuse-overlayfs
   - dnsmasq
 
 contents:

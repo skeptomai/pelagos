@@ -172,10 +172,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: packages
-      - name: Install system dependencies
-        run: sudo apt-get install -y nftables iproute2
-      - name: Install .deb
-        run: sudo dpkg -i pelagos_*_${{ matrix.arch }}.deb
+      - name: Install .deb (with dependencies)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ./pelagos_*_${{ matrix.arch }}.deb
       - name: Verify installation
         run: |
           test "$(which pelagos)" = "/usr/bin/pelagos"

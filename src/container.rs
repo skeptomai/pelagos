@@ -365,6 +365,13 @@ fn kernel_supports_overlayfs() -> bool {
 
 /// Spawn a `fuse-overlayfs` subprocess to mount an overlay filesystem.
 ///
+/// `rootless`: when true, squash all lower-layer uid/gid ownership to the
+/// current host uid/gid.  Required for rootless containers where a user
+/// namespace maps the host uid to container uid 0 — without squashing,
+/// root-owned lower-layer files appear as "other" to the FUSE process and
+/// writes fail EPERM.  When false (root mode), no squashing is applied so
+/// files retain their real ownership inside the container.
+///
 /// Returns the child process handle. The caller must unmount (via `fusermount3 -u`)
 /// and reap this child after the container exits.
 fn spawn_fuse_overlayfs(
@@ -372,33 +379,47 @@ fn spawn_fuse_overlayfs(
     upper: &std::path::Path,
     work: &std::path::Path,
     merged: &std::path::Path,
+    rootless: bool,
 ) -> io::Result<std::process::Child> {
-    // Squash all lower-layer uid/gid ownership to the host user's own uid/gid.
-    //
-    // Why not squash_to_root (uid 0)?
-    //   fuse-overlayfs runs as HOST_UID (e.g. 1000) in rootless mode.  FUSE kernel
-    //   delivers access requests with the caller's host uid, which is also HOST_UID
-    //   (because the user namespace maps container uid 0 → HOST_UID on the host).
-    //   If files are presented as uid 0 (squash_to_root), the caller appears as
-    //   "other" relative to uid-0-owned files with mode 755, so writes fail EPERM.
-    //
-    // With squash_to_uid=HOST_UID / squash_to_gid=HOST_GID:
-    //   - All lower-layer files appear to be owned by HOST_UID:HOST_GID.
-    //   - The calling process IS HOST_UID, so it is the owner → rwx permission.
-    //   - Inside the user namespace, HOST_UID maps to uid 0, so the container
-    //     still perceives all files as owned by root.
-    //   - New files created in the upper layer are stored as HOST_UID:HOST_GID,
-    //     which fuse-overlayfs can write without CAP_CHOWN.
-    let host_uid = unsafe { libc::getuid() };
-    let host_gid = unsafe { libc::getgid() };
-    let opts = format!(
-        "lowerdir={},upperdir={},workdir={},squash_to_uid={},squash_to_gid={},allow_other",
-        lower,
-        upper.display(),
-        work.display(),
-        host_uid,
-        host_gid,
-    );
+    let opts = if rootless {
+        // Squash all lower-layer uid/gid ownership to the host user's own uid/gid.
+        //
+        // Why not squash_to_root (uid 0)?
+        //   fuse-overlayfs runs as HOST_UID (e.g. 1000) in rootless mode.  FUSE kernel
+        //   delivers access requests with the caller's host uid, which is also HOST_UID
+        //   (because the user namespace maps container uid 0 → HOST_UID on the host).
+        //   If files are presented as uid 0 (squash_to_root), the caller appears as
+        //   "other" relative to uid-0-owned files with mode 755, so writes fail EPERM.
+        //
+        // With squash_to_uid=HOST_UID / squash_to_gid=HOST_GID:
+        //   - All lower-layer files appear to be owned by HOST_UID:HOST_GID.
+        //   - The calling process IS HOST_UID, so it is the owner → rwx permission.
+        //   - Inside the user namespace, HOST_UID maps to uid 0, so the container
+        //     still perceives all files as owned by root.
+        //   - New files created in the upper layer are stored as HOST_UID:HOST_GID,
+        //     which fuse-overlayfs can write without CAP_CHOWN.
+        let host_uid = unsafe { libc::getuid() };
+        let host_gid = unsafe { libc::getgid() };
+        format!(
+            "lowerdir={},upperdir={},workdir={},squash_to_uid={},squash_to_gid={},allow_other",
+            lower,
+            upper.display(),
+            work.display(),
+            host_uid,
+            host_gid,
+        )
+    } else {
+        // Root mode: preserve real file ownership; root can read/write everything.
+        // allow_other lets container processes that change uid (e.g. su, setuid
+        // binaries) access the FUSE mount.  Root-owned FUSE mounts are exempt from
+        // the user_allow_other restriction in /etc/fuse.conf.
+        format!(
+            "lowerdir={},upperdir={},workdir={},allow_other",
+            lower,
+            upper.display(),
+            work.display(),
+        )
+    };
     std::process::Command::new("fuse-overlayfs")
         .args(["-o", &opts])
         .arg(merged)
@@ -2909,7 +2930,7 @@ impl Command {
                             .into_owned()
                     };
                     let child =
-                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged)
+                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged, true)
                             .map_err(Error::Io)?;
                     fuse_overlay_merged = Some(merged.clone());
                     fuse_overlay_child = Some(child);
@@ -2924,26 +2945,55 @@ impl Command {
                 )));
             }
         } else {
-            // Root (privileged) mode with overlay: the overlay mount runs inside
-            // pre_exec using the kernel's native overlayfs.  Probe before forking
-            // so we can surface a clear error when CONFIG_OVERLAY_FS is missing
-            // rather than a cryptic EINVAL from inside the child.
-            //
-            // Background: Rust's pre_exec error pipe sends only the raw OS errno
-            // back to the parent.  io::Error::other("message") has no raw_os_error,
-            // so the kernel falls back to EINVAL (22) for every custom error string
-            // — the actual error text is silently discarded.
+            // Root (privileged) mode with overlay: prefer native kernel overlayfs.
+            // Fall back to fuse-overlayfs when CONFIG_OVERLAY_FS is not compiled in
+            // (common on generic/cloud/VM kernels).  Probe before forking so we can
+            // surface a clear error rather than a cryptic EINVAL from inside the child.
             if self.overlay.is_some() && !kernel_supports_overlayfs() {
-                return Err(Error::Io(io::Error::other(
-                    "kernel does not support overlayfs (CONFIG_OVERLAY_FS not compiled in); \
-                     container images require overlayfs — use a kernel with overlay support \
-                     or run as a rootless user with fuse-overlayfs installed",
-                )));
+                if is_fuse_overlayfs_available() {
+                    log::info!(
+                        "overlay: kernel overlayfs unavailable (root) — falling back to fuse-overlayfs"
+                    );
+                    if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
+                        let lower_str = if !ov.lower_dirs.is_empty() {
+                            ov.lower_dirs
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect::<Vec<_>>()
+                                .join(":")
+                        } else {
+                            self.chroot_dir
+                                .as_ref()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned()
+                        };
+                        let child = spawn_fuse_overlayfs(
+                            &lower_str,
+                            &ov.upper_dir,
+                            &ov.work_dir,
+                            merged,
+                            false,
+                        )
+                        .map_err(Error::Io)?;
+                        fuse_overlay_merged = Some(merged.clone());
+                        fuse_overlay_child = Some(child);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    use_fuse_overlay = true;
+                } else {
+                    return Err(Error::Io(io::Error::other(
+                        "kernel does not support overlayfs (CONFIG_OVERLAY_FS not compiled in) \
+                         and fuse-overlayfs is not installed; \
+                         install fuse-overlayfs: sudo apt-get install fuse-overlayfs",
+                    )));
+                }
+            } else {
+                if self.overlay.is_some() {
+                    log::debug!("overlay: root mode — using native kernel overlayfs");
+                }
+                use_fuse_overlay = false;
             }
-            if self.overlay.is_some() {
-                log::debug!("overlay: root mode — using native kernel overlayfs");
-            }
-            use_fuse_overlay = false;
         }
 
         // Collect OCI sync fds (captured by value — i32 is Copy).
@@ -5268,7 +5318,7 @@ impl Command {
                             .into_owned()
                     };
                     let child =
-                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged)
+                        spawn_fuse_overlayfs(&lower_str, &ov.upper_dir, &ov.work_dir, merged, true)
                             .map_err(Error::Io)?;
                     fuse_overlay_merged = Some(merged.clone());
                     fuse_overlay_child = Some(child);
@@ -5287,19 +5337,54 @@ impl Command {
                 libc::fcntl(slave_raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
             }
         } else {
-            // Root mode with overlay: probe for kernel overlay support before forking
-            // (see spawn() for the explanation of why EINVAL is always the symptom).
+            // Root mode with overlay: prefer native kernel overlayfs.
+            // Fall back to fuse-overlayfs when CONFIG_OVERLAY_FS is not compiled in
+            // (common on generic/cloud/VM kernels).
             if self.overlay.is_some() && !kernel_supports_overlayfs() {
-                return Err(Error::Io(io::Error::other(
-                    "kernel does not support overlayfs (CONFIG_OVERLAY_FS not compiled in); \
-                     container images require overlayfs — use a kernel with overlay support \
-                     or run as a rootless user with fuse-overlayfs installed",
-                )));
+                if is_fuse_overlayfs_available() {
+                    log::info!(
+                        "overlay: kernel overlayfs unavailable (root) — falling back to fuse-overlayfs"
+                    );
+                    if let (Some(ov), Some(merged)) = (&self.overlay, &overlay_merged_dir) {
+                        let lower_str = if !ov.lower_dirs.is_empty() {
+                            ov.lower_dirs
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect::<Vec<_>>()
+                                .join(":")
+                        } else {
+                            self.chroot_dir
+                                .as_ref()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned()
+                        };
+                        let child = spawn_fuse_overlayfs(
+                            &lower_str,
+                            &ov.upper_dir,
+                            &ov.work_dir,
+                            merged,
+                            false,
+                        )
+                        .map_err(Error::Io)?;
+                        fuse_overlay_merged = Some(merged.clone());
+                        fuse_overlay_child = Some(child);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    use_fuse_overlay = true;
+                } else {
+                    return Err(Error::Io(io::Error::other(
+                        "kernel does not support overlayfs (CONFIG_OVERLAY_FS not compiled in) \
+                         and fuse-overlayfs is not installed; \
+                         install fuse-overlayfs: sudo apt-get install fuse-overlayfs",
+                    )));
+                }
+            } else {
+                if self.overlay.is_some() {
+                    log::debug!("overlay: root mode — using native kernel overlayfs");
+                }
+                use_fuse_overlay = false;
             }
-            if self.overlay.is_some() {
-                log::debug!("overlay: root mode — using native kernel overlayfs");
-            }
-            use_fuse_overlay = false;
         }
 
         // Collect OCI sync fds.
