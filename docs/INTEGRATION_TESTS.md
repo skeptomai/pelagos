@@ -1699,6 +1699,38 @@ auto-config). Runs `id -u` and asserts it prints `0`.
 Failure indicates the single-UID fallback path (existing behavior) is
 broken, which would be a regression from the multi-UID changes.
 
+### `test_rootless_overlay_mode0_mkdir_succeeds`
+**Requires:** non-root + alpine image in local store
+**Status:** `#[ignore]` — issue #195 not yet implemented
+
+Runs a rootless container with `with_image_layers()` and executes `mkdir -m 000
+/tmp/mode0test`. Asserts the container exits 0 and prints `ok`.
+
+This is the regression test for the dpkg/Debian image build failure: dpkg
+creates staging directories with mode=0 as a security measure. The current
+fuse-overlayfs approach uses `squash_to_uid=HOST_UID`; HOST_UID running outside
+a user namespace has no `CAP_DAC_OVERRIDE` on mode=0 directories, so `setxattr`
+fails with EACCES.
+
+The intended fix (issue #195) is to spawn fuse-overlayfs inside a user+mount
+namespace (where uid=0 has `CAP_DAC_OVERRIDE`) using `squash_to_uid=0`. The
+user-namespace-only approach (no `CLONE_NEWNS`) fails with EPERM because a
+user-namespace process cannot create a FUSE mount in the host mount namespace.
+This test will pass once the full user+mount namespace approach is implemented
+and the FUSE mount is shared back to the container.
+
+### `test_rootless_multi_gid_chown_succeeds`
+**Requires:** non-root + rootfs + newuidmap/newgidmap + subgid range
+
+Creates a file inside a rootless container and runs `chown 0:4 /tmp/testfile`
+(GID 4 = `adm` in Debian/Ubuntu). Asserts the chown succeeds.
+
+This is the regression test for issue #194: rootless builds with Debian/Ubuntu
+fail when dpkg postinst scripts call `chown root:adm` because GID 4 is not
+mapped in the user namespace when multi-range GID mapping silently fails.
+Failure indicates multi-range GID maps are not being applied, meaning
+Debian/Ubuntu builds will fail with EINVAL on any `chown` to GID > 0.
+
 ---
 
 ## JSON Output Tests

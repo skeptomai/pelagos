@@ -8973,6 +8973,135 @@ mod rootless_idmap {
         );
     }
 
+    /// test_rootless_multi_gid_chown_succeeds
+    ///
+    /// Rootless (non-root), requires newuidmap/newgidmap and subgid range.
+    ///
+    /// Verifies that a container with multi-range GID mapping can successfully
+    /// `chown` a file to a GID other than 0 (specifically GID 4, which is `adm`
+    /// in Debian/Ubuntu and exercises the dpkg postinst code path that was broken).
+    /// With multi-range mapping, GID 4 inside the container maps to the 5th entry
+    /// in the host's subordinate GID range.
+    ///
+    /// Failure indicates the multi-range GID map is not being applied correctly,
+    /// which would cause `dpkg` postinst scripts to fail with EINVAL on
+    /// `chown root:adm`.
+    #[test]
+    fn test_rootless_multi_gid_chown_succeeds() {
+        if is_root() {
+            eprintln!("Skipping: must run as non-root");
+            return;
+        }
+        if !skip_unless_idmap_helpers() {
+            return;
+        }
+        let Some(rootfs) = get_test_rootfs() else {
+            eprintln!("Skipping: alpine-rootfs not found");
+            return;
+        };
+
+        // Create a file and chown it to GID 4 (adm in Debian; first 65536 GIDs are
+        // mapped via the subordinate range so GID 4 is always in-range).
+        let mut child = Command::new("/bin/ash")
+            .args([
+                "-c",
+                "touch /tmp/testfile && chown 0:4 /tmp/testfile && echo ok",
+            ])
+            .env("PATH", ALPINE_PATH)
+            .with_chroot(&rootfs)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "chown to GID 4 failed with multi-range mapping; stdout={}, stderr={}",
+            out,
+            err
+        );
+        assert!(
+            out.trim() == "ok",
+            "expected 'ok' from chown test, got: {}",
+            out.trim()
+        );
+    }
+
+    /// test_rootless_overlay_mode0_mkdir_succeeds
+    ///
+    /// Rootless (non-root), requires alpine image in the local store.
+    ///
+    /// Runs a rootless container using `with_image_layers()` and verifies that
+    /// `mkdir` with mode 0 (octal 000) succeeds inside the container.
+    ///
+    /// This is the regression test for the dpkg/Debian build failure: dpkg creates
+    /// staging directories with mode=0 as a security measure; if the overlay backend
+    /// cannot handle mode=0 mkdir, all Debian/Ubuntu image builds fail with EACCES.
+    ///
+    /// The fix will spawn fuse-overlayfs inside a user+mount namespace (uid=0 with
+    /// CAP_DAC_OVERRIDE), using squash_to_uid=0,squash_to_gid=0.  The current
+    /// implementation uses squash_to_uid=HOST_UID (no user namespace), which does NOT
+    /// have CAP_DAC_OVERRIDE on mode=0 upper-layer directories — this test will fail
+    /// until issue #195 is fully implemented.
+    ///
+    /// Marked #[ignore] because the underlying fix is not yet implemented.
+    #[test]
+    #[ignore = "issue #195: fuse-overlayfs user+mount namespace fix not yet implemented"]
+    fn test_rootless_overlay_mode0_mkdir_succeeds() {
+        if is_root() {
+            eprintln!("Skipping: must run as non-root");
+            return;
+        }
+
+        // Load the alpine image from the local store; skip if not present.
+        let reference = "docker.io/library/alpine:3.21";
+        let manifest = match pelagos::image::load_image(reference) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!("Skipping: alpine:3.21 not in local image store (run pelagos image pull alpine:3.21)");
+                return;
+            }
+        };
+        let layers = pelagos::image::layer_dirs(&manifest);
+        if layers.is_empty() {
+            eprintln!("Skipping: alpine image has no layers");
+            return;
+        }
+
+        // mkdir with mode=0 (octal 000) — dpkg uses this as a security staging
+        // pattern.  Native overlayfs handles it; fuse-overlayfs with
+        // squash_to_uid returns EACCES.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "mkdir -m 000 /tmp/mode0test && echo ok"])
+            .env("PATH", ALPINE_PATH)
+            .with_image_layers(layers)
+            .with_namespaces(Namespace::MOUNT | Namespace::UTS | Namespace::PID)
+            .stdout(Stdio::Piped)
+            .stderr(Stdio::Piped)
+            .spawn()
+            .expect("spawn failed");
+
+        let (status, stdout, stderr) = child.wait_with_output().expect("wait failed");
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(
+            status.success(),
+            "mkdir mode=0 failed inside rootless overlay container; \
+             stdout={out}, stderr={err}\n\
+             Regression: user-namespace fuse-overlayfs squash_to_uid=0 fix not working"
+        );
+        assert_eq!(
+            out.trim(),
+            "ok",
+            "expected 'ok' from mkdir mode=0 test, got: {}",
+            out.trim()
+        );
+    }
+
     #[test]
     fn test_rootless_single_uid_fallback() {
         if is_root() {
