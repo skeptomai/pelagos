@@ -1717,18 +1717,79 @@ fn execute_add_archive(
 pub fn create_layer_from_dir(source_dir: &Path) -> Result<String, io::Error> {
     use sha2::{Digest, Sha256};
 
+    let is_rootless = unsafe { libc::getuid() } != 0;
+
     // Build the raw (uncompressed) tar first so we can compute the diff_id
     // (sha256 of the uncompressed tar stream, required for OCI config JSON).
     // We walk the tree manually instead of using `append_dir_all` because the
     // overlay upper dir may contain absolute symlinks that only resolve inside
     // the container rootfs — following them on the host would fail with ENOENT.
-    let mut raw_tar_bytes = Vec::new();
-    {
-        let mut tar_builder = tar::Builder::new(&mut raw_tar_bytes);
-        tar_builder.follow_symlinks(false);
-        append_dir_all_no_follow(&mut tar_builder, Path::new("."), source_dir)?;
-        tar_builder.into_inner()?;
-    }
+    //
+    // Rootless: the upper dir may contain files owned by subordinate UIDs (e.g.
+    // uid 65534 = nobody inside the container → host uid ~165533), which the
+    // calling user cannot read.  collect_layer_in_userns() forks a helper that
+    // enters a user namespace with the full uid_map and reads everything as root.
+    let raw_tar_bytes = if is_rootless {
+        // Rootless: the overlay upper dir may contain files owned by subordinate
+        // UIDs (e.g. uid 65534/nobody inside the container → host uid ~165533)
+        // that the calling process cannot read.  collect_layer_in_userns forks
+        // a helper that enters the full uid_map user namespace, builds the raw
+        // tar (with correct uid/gid), and copies the files to a temp dir.
+        //
+        // We use a temp dir as an intermediate because we need the raw tar bytes
+        // to compute the sha256 digest (which determines the final dest path)
+        // before we can write the files to the layer store.
+        let tmp_dest = tempfile::tempdir()
+            .map_err(|e| io::Error::other(format!("collect_layer_in_userns tmpdir: {}", e)))?;
+        let raw = collect_layer_in_userns(source_dir, tmp_dest.path())?;
+        let diff_id = format!("sha256:{:x}", Sha256::digest(&raw));
+        let gz = {
+            let mut gz_bytes = Vec::new();
+            let mut enc = flate2::write::GzEncoder::new(&mut gz_bytes, flate2::Compression::fast());
+            io::Write::write_all(&mut enc, &raw)?;
+            enc.finish()?;
+            gz_bytes
+        };
+        let hex = format!("{:x}", Sha256::digest(&gz));
+        let digest_str = format!("sha256:{}", hex);
+
+        if image::layer_exists(&digest_str) {
+            log::debug!("layer {} already exists, skipping", &hex[..12]);
+            if !image::blob_exists(&digest_str) {
+                image::save_blob(&digest_str, &gz)?;
+                image::save_blob_diffid(&digest_str, &diff_id)?;
+            }
+            return Ok(digest_str);
+        }
+
+        image::save_blob(&digest_str, &gz)?;
+        image::save_blob_diffid(&digest_str, &diff_id)?;
+
+        // Move the temp dir to the real layer store path.
+        // rename(2) is atomic and fast when same filesystem; falls back to copy.
+        let dest = image::layer_dir(&digest_str);
+        let tmp_path = tmp_dest.path().to_path_buf();
+        if std::fs::rename(&tmp_path, &dest).is_err() {
+            // Cross-filesystem or rename failed — copy and set group permissions.
+            image::create_store_dir(&dest)?;
+            copy_dir_recursive(&tmp_path, &dest)?;
+        } else {
+            // rename succeeded; fix group permissions on the moved dir.
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o775));
+        }
+
+        log::debug!("created layer {}", &hex[..12]);
+        return Ok(digest_str);
+    } else {
+        let mut bytes = Vec::new();
+        let mut builder = tar::Builder::new(&mut bytes);
+        builder.follow_symlinks(false);
+        append_dir_all_no_follow(&mut builder, Path::new("."), source_dir)?;
+        builder.into_inner()?;
+        bytes
+    };
+
     let diff_id = format!("sha256:{:x}", Sha256::digest(&raw_tar_bytes));
 
     // Compress to get the canonical tar.gz blob.
@@ -1864,6 +1925,231 @@ fn append_dir_all_no_follow<W: io::Write>(
 fn dir_has_content(dir: &Path) -> Result<bool, io::Error> {
     let mut entries = std::fs::read_dir(dir)?;
     Ok(entries.next().is_some())
+}
+
+/// Collect a directory as a raw tar and copy it to a destination, both operations
+/// running inside a temporary user namespace.
+///
+/// Used by rootless builds to handle upper-dir files owned by subordinate UIDs
+/// (e.g. uid 65534/nobody = host uid ~165533) that the calling process cannot
+/// read.  Inside the user namespace (uid_map: 0→host_uid, 1→subuid_start,
+/// count=65536), the process is root with CAP_DAC_READ_SEARCH and can access
+/// any file whose UID is within the mapped range.
+///
+/// Returns the raw (uncompressed) tar bytes.
+fn collect_layer_in_userns(source_dir: &Path, dest_dir: &Path) -> Result<Vec<u8>, io::Error> {
+    use std::io::Read as _;
+    use std::os::unix::io::FromRawFd as _;
+
+    // Three pipe pairs:
+    //   ready: child → parent (child sends its pid after unshare)
+    //   done:  parent → child (parent signals uid/gid map written, 0x01=ok)
+    //   data:  child → parent (child sends length-prefixed raw tar bytes)
+    let mut ready = [0i32; 2];
+    let mut done = [0i32; 2];
+    let mut data = [0i32; 2];
+    unsafe {
+        if libc::pipe(ready.as_mut_ptr()) != 0
+            || libc::pipe(done.as_mut_ptr()) != 0
+            || libc::pipe(data.as_mut_ptr()) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    let child_pid = unsafe { libc::fork() };
+    if child_pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if child_pid == 0 {
+        // ---- CHILD ----
+        // Safe: build.rs is single-threaded (no tokio), so fork is safe here.
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(done[1]);
+            libc::close(data[0]);
+
+            // Enter a new user namespace.
+            if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                libc::_exit(1);
+            }
+
+            // Send our PID to the parent so it can invoke newuidmap/newgidmap.
+            let pid = libc::getpid() as u32;
+            let pb = pid.to_ne_bytes();
+            libc::write(ready[1], pb.as_ptr() as *const libc::c_void, 4);
+            libc::close(ready[1]);
+
+            // Block until the parent writes uid/gid maps.
+            let mut ok = [0u8; 1];
+            let n = libc::read(done[0], ok.as_mut_ptr() as *mut libc::c_void, 1);
+            libc::close(done[0]);
+            if n != 1 || ok[0] == 0 {
+                libc::close(data[1]);
+                libc::_exit(1);
+            }
+        }
+
+        // Now root (uid 0) in the user namespace with CAP_DAC_READ_SEARCH.
+        // Build the raw tar of source_dir and copy its contents to dest_dir.
+        let run = (|| -> io::Result<Vec<u8>> {
+            let mut raw_tar = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut raw_tar);
+                builder.follow_symlinks(false);
+                append_dir_all_no_follow(&mut builder, Path::new("."), source_dir)?;
+                builder.into_inner()?;
+            }
+            copy_dir_recursive(source_dir, dest_dir)?;
+            Ok(raw_tar)
+        })();
+
+        match run {
+            Ok(bytes) => unsafe {
+                // Write length (8 bytes LE) then the raw tar bytes.
+                let len = bytes.len() as u64;
+                let lb = len.to_le_bytes();
+                libc::write(data[1], lb.as_ptr() as *const libc::c_void, 8);
+                let mut off = 0usize;
+                while off < bytes.len() {
+                    let n = libc::write(
+                        data[1],
+                        bytes[off..].as_ptr() as *const libc::c_void,
+                        bytes.len() - off,
+                    );
+                    if n <= 0 {
+                        break;
+                    }
+                    off += n as usize;
+                }
+                libc::close(data[1]);
+                libc::_exit(0);
+            },
+            Err(_) => unsafe {
+                libc::close(data[1]);
+                libc::_exit(1);
+            },
+        }
+    }
+
+    // ---- PARENT ----
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(done[0]);
+        libc::close(data[1]);
+    }
+
+    // Read child PID.
+    let mut pid_bytes = [0u8; 4];
+    let n = unsafe { libc::read(ready[0], pid_bytes.as_mut_ptr() as *mut libc::c_void, 4) };
+    unsafe {
+        libc::close(ready[0]);
+    }
+    if n != 4 {
+        unsafe {
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+        return Err(io::Error::other(
+            "collect_layer_in_userns: child pipe broken",
+        ));
+    }
+    let ns_pid = u32::from_ne_bytes(pid_bytes);
+
+    // Set up uid/gid maps via newuidmap/newgidmap.
+    let host_uid = unsafe { libc::getuid() };
+    let host_gid = unsafe { libc::getgid() };
+    let username = crate::idmap::current_username().unwrap_or_else(|_| host_uid.to_string());
+    let uid_ranges = crate::idmap::parse_subid_file(Path::new("/etc/subuid"), &username, host_uid)
+        .unwrap_or_default();
+    let gid_ranges = crate::idmap::parse_subid_file(Path::new("/etc/subgid"), &username, host_gid)
+        .unwrap_or_default();
+
+    let mut ok_byte = [0u8; 1];
+    // Write setgroups=deny before newgidmap (required by kernel).
+    let _ = std::fs::write(format!("/proc/{}/setgroups", ns_pid), "deny\n");
+
+    if !uid_ranges.is_empty()
+        && !gid_ranges.is_empty()
+        && crate::idmap::has_newuidmap()
+        && crate::idmap::has_newgidmap()
+    {
+        let uid_maps = [
+            crate::container::UidMap {
+                inside: 0,
+                outside: host_uid,
+                count: 1,
+            },
+            crate::container::UidMap {
+                inside: 1,
+                outside: uid_ranges[0].start,
+                count: uid_ranges[0].count,
+            },
+        ];
+        let gid_maps = [
+            crate::container::GidMap {
+                inside: 0,
+                outside: host_gid,
+                count: 1,
+            },
+            crate::container::GidMap {
+                inside: 1,
+                outside: gid_ranges[0].start,
+                count: gid_ranges[0].count,
+            },
+        ];
+        if crate::idmap::apply_uid_map(ns_pid, &uid_maps).is_ok()
+            && crate::idmap::apply_gid_map(ns_pid, &gid_maps).is_ok()
+        {
+            ok_byte[0] = 1;
+        }
+    } else {
+        // Fallback: single-entry map (works when all container files are owned
+        // by the calling user — no subordinate-uid ownership in the upper dir).
+        let _ = std::fs::write(
+            format!("/proc/{}/uid_map", ns_pid),
+            format!("0 {} 1\n", host_uid),
+        );
+        let _ = std::fs::write(
+            format!("/proc/{}/gid_map", ns_pid),
+            format!("0 {} 1\n", host_gid),
+        );
+        ok_byte[0] = 1;
+    }
+
+    unsafe {
+        libc::write(done[1], ok_byte.as_ptr() as *const libc::c_void, 1);
+        libc::close(done[1]);
+    }
+
+    if ok_byte[0] == 0 {
+        unsafe {
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+        return Err(io::Error::other(
+            "collect_layer_in_userns: uid/gid map setup failed",
+        ));
+    }
+
+    // Read raw tar bytes from child (length-prefixed).
+    let data_file = unsafe { std::fs::File::from_raw_fd(data[0]) };
+    let mut reader = io::BufReader::new(data_file);
+    let mut len_bytes = [0u8; 8];
+    reader.read_exact(&mut len_bytes)?;
+    let len = u64::from_le_bytes(len_bytes) as usize;
+    let mut raw_tar = vec![0u8; len];
+    reader.read_exact(&mut raw_tar)?;
+    drop(reader);
+
+    let mut status = 0i32;
+    unsafe {
+        libc::waitpid(child_pid, &mut status, 0);
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(io::Error::other("collect_layer_in_userns: child failed"));
+    }
+
+    Ok(raw_tar)
 }
 
 /// Recursively copy a directory tree, preserving permissions.

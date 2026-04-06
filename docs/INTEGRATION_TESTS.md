@@ -622,10 +622,11 @@ indicate that `enable_nat()` did not install the MASQUERADE rule set, or that
 ### `test_nat_cleanup` — N3
 **Requires:** root, rootfs
 
-Spawns a bridge+NAT container with `ash -c "exit 0"` (exits immediately). After
-`wait()`, runs `nft list table ip pelagos` and asserts non-zero exit. Failure
-would indicate that `disable_nat()` did not remove the nftables table (refcount
-not decremented to zero, or `nft delete table` failed silently).
+Resets any leftover NAT refcount/nftables state (from crashed prior test runs),
+then spawns a bridge+NAT container with `ash -c "exit 0"` (exits immediately).
+After `wait()`, runs `nft list table ip pelagos-pelagos0` and asserts non-zero
+exit. Failure would indicate that `disable_nat()` did not remove the nftables
+table (refcount not decremented to zero, or `nft delete table` failed silently).
 
 ### `test_nat_refcount` — N3
 **Requires:** root, rootfs

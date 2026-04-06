@@ -3185,6 +3185,15 @@ mod networking {
             return;
         };
 
+        // Reset any leftover NAT state from previous test runs (crashed tests may
+        // leave a non-zero refcount, which would prevent cleanup after our container
+        // exits). Safe here because #[serial(nat)] guarantees no concurrent NAT tests.
+        let _ = std::fs::write(pelagos::paths::network_nat_refcount_file("pelagos0"), "0\n");
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", "ip", "pelagos-pelagos0"])
+            .stderr(std::process::Stdio::null())
+            .status();
+
         let mut child = Command::new("/bin/ash")
             .args(["-c", "exit 0"])
             .with_namespaces(Namespace::MOUNT | Namespace::UTS)

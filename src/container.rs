@@ -3704,13 +3704,50 @@ impl Command {
                                 // Rootless: launch fuse-overlayfs inline in our user+mount namespace.
                                 // fuse-overlayfs inherits our user namespace — kernel's
                                 // current_in_userns(fc->user_ns) passes for same-ns access.
+                                //
+                                // Deadlock prevention: after pivot_root(merged), absolute paths
+                                // inside the container's namespace resolve through the FUSE mount
+                                // that fuse-overlayfs serves.  If fuse-overlayfs is in the same
+                                // mount namespace, any path lookup it performs (for the lower/upper/
+                                // work dirs) goes back through its own FUSE mount → deadlock.
+                                //
+                                // Fix: make `merged` a shared mountpoint BEFORE fork.  In the
+                                // grandchild we call unshare(CLONE_NEWNS) to get a separate mount
+                                // namespace; the FUSE mount the grandchild creates at `merged`
+                                // propagates to our namespace via the shared peer group.  Our
+                                // subsequent pivot_root(merged) only changes our namespace root —
+                                // the grandchild's root is unaffected, so its lowerdir/upperdir/
+                                // workdir paths continue to resolve correctly.
                                 if let Some(ref opts) = fuse_overlay_opts_c {
+                                    // Bind-mount merged to itself (makes it a proper mountpoint).
+                                    libc::mount(
+                                        merged.as_ptr(),
+                                        merged.as_ptr(),
+                                        std::ptr::null(),
+                                        libc::MS_BIND,
+                                        std::ptr::null(),
+                                    );
+                                    // Mark it shared so the grandchild's FUSE mount propagates here.
+                                    libc::mount(
+                                        std::ptr::null(),
+                                        merged.as_ptr(),
+                                        std::ptr::null(),
+                                        libc::MS_SHARED,
+                                        std::ptr::null(),
+                                    );
+
                                     let fuse_pid = libc::fork();
                                     if fuse_pid < 0 {
                                         return Err(io::Error::last_os_error());
                                     }
                                     if fuse_pid == 0 {
-                                        // Grandchild: exec fuse-overlayfs.
+                                        // Grandchild: get a separate mount namespace so that
+                                        // pivot_root in the parent does not change our root and
+                                        // break our path resolution for lowerdir/upperdir/workdir.
+                                        // Our `merged` is in the same shared peer group as the
+                                        // parent's, so the FUSE mount we create here propagates back.
+                                        libc::unshare(libc::CLONE_NEWNS);
+
                                         // Close all fds except 0-2 (redirected to /dev/null) to avoid
                                         // leaking notif sockets, PTY fds, etc. into the FUSE server.
                                         let dn = libc::open(
@@ -3777,6 +3814,18 @@ impl Command {
                                         };
                                         libc::nanosleep(&ts, std::ptr::null_mut());
                                     }
+                                    // Demote the propagated FUSE mount from shared to slave.
+                                    // pivot_root prohibits shared mounts as new_root
+                                    // (IS_MNT_SHARED check → EINVAL); slave mounts are
+                                    // allowed.  The slave still receives unmounts from the
+                                    // master peer when fuse-overlayfs exits.
+                                    libc::mount(
+                                        std::ptr::null(),
+                                        merged.as_ptr(),
+                                        std::ptr::null(),
+                                        libc::MS_SLAVE,
+                                        std::ptr::null(),
+                                    );
                                 }
                                 Some(merged)
                             } else {
@@ -6094,15 +6143,34 @@ impl Command {
                         if use_fuse_overlay {
                             if is_rootless {
                                 // Rootless: launch fuse-overlayfs inline in our user+mount namespace.
-                                // fuse-overlayfs inherits our user namespace — kernel's
-                                // current_in_userns(fc->user_ns) passes for same-ns access.
+                                // See spawn path 1 comment for the deadlock-prevention strategy
+                                // (MS_SHARED + grandchild unshare(CLONE_NEWNS)).
                                 if let Some(ref opts) = fuse_overlay_opts_c {
+                                    // Bind-mount merged to itself (makes it a proper mountpoint).
+                                    libc::mount(
+                                        merged.as_ptr(),
+                                        merged.as_ptr(),
+                                        std::ptr::null(),
+                                        libc::MS_BIND,
+                                        std::ptr::null(),
+                                    );
+                                    // Mark it shared so the grandchild's FUSE mount propagates here.
+                                    libc::mount(
+                                        std::ptr::null(),
+                                        merged.as_ptr(),
+                                        std::ptr::null(),
+                                        libc::MS_SHARED,
+                                        std::ptr::null(),
+                                    );
+
                                     let fuse_pid = libc::fork();
                                     if fuse_pid < 0 {
                                         return Err(io::Error::last_os_error());
                                     }
                                     if fuse_pid == 0 {
-                                        // Grandchild: exec fuse-overlayfs.
+                                        // Grandchild: separate mount namespace to survive pivot_root.
+                                        libc::unshare(libc::CLONE_NEWNS);
+
                                         let dn = libc::open(
                                             b"/dev/null\0".as_ptr() as *const libc::c_char,
                                             libc::O_RDWR,
@@ -6166,6 +6234,18 @@ impl Command {
                                         };
                                         libc::nanosleep(&ts, std::ptr::null_mut());
                                     }
+                                    // Demote the propagated FUSE mount from shared to slave.
+                                    // pivot_root prohibits shared mounts as new_root
+                                    // (IS_MNT_SHARED check → EINVAL); slave mounts are
+                                    // allowed.  The slave still receives unmounts from the
+                                    // master peer when fuse-overlayfs exits.
+                                    libc::mount(
+                                        std::ptr::null(),
+                                        merged.as_ptr(),
+                                        std::ptr::null(),
+                                        libc::MS_SLAVE,
+                                        std::ptr::null(),
+                                    );
                                 }
                                 Some(merged)
                             } else {

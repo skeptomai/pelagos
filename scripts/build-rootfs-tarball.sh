@@ -75,6 +75,14 @@ sudo tar -C alpine-rootfs -xzf "$TARBALL"
 echo "==> Setting ownership to current user..."
 sudo chown -R $(id -u):$(id -g) alpine-rootfs
 
+echo "==> Ensuring busybox is world-executable..."
+# Alpine's minirootfs tarball ships busybox at mode 700. After chown to the current
+# user the binary is owned by a non-root uid.  Tests that drop all capabilities
+# (including CAP_DAC_OVERRIDE) run as uid 0 but can no longer bypass DAC checks,
+# so execve fails with EACCES on a 700 binary owned by another user.  Ensure at
+# least world-execute so all users can exec it.
+chmod 755 alpine-rootfs/bin/busybox
+
 echo "==> Cleaning up tarball..."
 rm "$TARBALL"
 
