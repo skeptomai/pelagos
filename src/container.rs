@@ -5842,13 +5842,22 @@ impl Command {
                 use std::ptr;
 
                 // Step 0: PTY slave setup — runs before everything else.
+                //
+                // setsid() here detaches from the parent's session so the
+                // intermediate process (inner_pid > 0 in the PID-namespace
+                // double-fork below) does not hold a controlling-terminal
+                // association that would block the grandchild from claiming
+                // it.  TIOCSCTTY is intentionally deferred: calling it here
+                // would assign the PTY to *this* session (host-namespace SID),
+                // and the grandchild's later TIOCSCTTY(arg=0) would then fail
+                // (PTY already owned) — leaving the shell with no controlling
+                // terminal.  Instead, TIOCSCTTY is called once, after the
+                // double-fork, when the grandchild is PID 1 in the container
+                // namespace and the PTY has no owner.  For non-PID-namespace
+                // containers the same code path runs without a fork, so the
+                // call is equally late and equally uncontested.
                 let setsid_ret = libc::setsid();
                 if setsid_ret < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-
-                let ioctl_ret = libc::ioctl(slave_raw_fd, libc::TIOCSCTTY as _, 0 as libc::c_int);
-                if ioctl_ret < 0 {
                     return Err(io::Error::last_os_error());
                 }
 
@@ -6100,23 +6109,22 @@ impl Command {
                     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 }
 
-                // PTY session fix for PID-namespace containers (#198).
+                // Claim the PTY as our controlling terminal (#198).
                 //
-                // setsid() at Step 0 ran before the double-fork while the process
-                // was still in the host PID namespace.  The resulting SID equals the
-                // host PID, which has no mapping inside the container namespace
-                // (NSsid=0 as seen from /proc/self/status inside the container).
+                // For PID-namespace containers (reached via the double-fork above):
+                //   setsid() here runs while we ARE PID 1 in the container namespace,
+                //   so the new session's SID maps to NSpid 1 (NSsid=1).  Without this,
+                //   NSsid=0 (host SID unmapped in container), and dash/bash call
+                //   tcsetpgrp(0, 0) on exit → ESRCH → "Cannot set tty process group".
                 //
-                // dash/bash save tcgetpgrp(0)->0 as initialpgrp at startup and call
-                // tcsetpgrp(0, 0) on exit.  Process group 0 does not exist, so the
-                // kernel returns ESRCH and dash prints "Cannot set tty process group
-                // (No such process)" with exit code 2.
+                // For non-PID-namespace containers (no double-fork, falls through here):
+                //   setsid() fails with EPERM (already session leader from Step 0) —
+                //   that is harmless.  TIOCSCTTY still runs and succeeds.
                 //
-                // Calling setsid() here — while we are PID 1 in the container PID
-                // namespace — produces a SID that maps to 1 inside the container.
-                // TIOCSCTTY re-assigns the controlling terminal to the new session.
-                // After this, tcgetpgrp(0) returns 1, and tcsetpgrp(0, 1) on exit
-                // succeeds cleanly.
+                // In both cases the PTY (fd 0) has no controlling session yet: Step 0
+                // intentionally skips TIOCSCTTY so the intermediate process in the
+                // double-fork does not hold the terminal, which would cause this call
+                // to fail (arg=0 does not steal an already-owned terminal).
                 libc::setsid();
                 libc::ioctl(0, libc::TIOCSCTTY as _, 0 as libc::c_int);
 
