@@ -8,6 +8,40 @@ use std::io::{Read as _, Write};
 
 use super::auth::{parse_docker_config, remove_docker_config, resolve_auth, write_docker_config};
 
+fn oci_err(registry: &str, e: oci_client::errors::OciDistributionError) -> String {
+    use oci_client::errors::{OciDistributionError, OciErrorCode};
+    let auth_hint = format!(
+        "\n  hint: run 'pelagos image login {}' if authentication is required",
+        registry
+    );
+    match &e {
+        OciDistributionError::UnauthorizedError { .. }
+        | OciDistributionError::AuthenticationFailure(_) => {
+            format!("{}{}", e, auth_hint)
+        }
+        OciDistributionError::RegistryError { envelope, .. } => {
+            let is_auth = envelope.errors.iter().any(|err| {
+                matches!(err.code, OciErrorCode::Unauthorized | OciErrorCode::Denied)
+            });
+            if is_auth {
+                format!("{}{}", e, auth_hint)
+            } else {
+                e.to_string()
+            }
+        }
+        OciDistributionError::RequestError(req_err) => {
+            let msg = req_err.to_string();
+            let lower = msg.to_lowercase();
+            if lower.contains("401") || lower.contains("403") || lower.contains("unauthorized") {
+                format!("{}{}", msg, auth_hint)
+            } else {
+                msg
+            }
+        }
+        _ => e.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client config helper
 // ---------------------------------------------------------------------------
@@ -259,7 +293,7 @@ async fn pull_image(
     let (manifest, digest, config_json) = client
         .pull_manifest_and_config(&oci_ref, &auth)
         .await
-        .map_err(|e| format!("failed to pull manifest: {}", e))?;
+        .map_err(|e| format!("failed to pull manifest: {}", oci_err(registry, e)))?;
 
     println!(
         "  Manifest: {} ({} layers)",
@@ -393,7 +427,7 @@ async fn push_image(
     let response = client
         .push(&dest_oci_ref, &layers, config, &auth, None)
         .await
-        .map_err(|e| format!("push failed: {}", e))?;
+        .map_err(|e| format!("push failed: {}", oci_err(registry, e)))?;
 
     println!("Pushed {}", dest_ref);
     println!("  manifest: {}", response.manifest_url);
