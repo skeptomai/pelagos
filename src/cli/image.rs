@@ -39,9 +39,10 @@ fn oci_err(registry: &str, e: oci_client::errors::OciDistributionError) -> Strin
             format!("{}{}", e, auth_hint)
         }
         OciDistributionError::RegistryError { envelope, .. } => {
-            let is_auth = envelope.errors.iter().any(|err| {
-                matches!(err.code, OciErrorCode::Unauthorized | OciErrorCode::Denied)
-            });
+            let is_auth = envelope
+                .errors
+                .iter()
+                .any(|err| matches!(err.code, OciErrorCode::Unauthorized | OciErrorCode::Denied));
             if is_auth {
                 format!("{}{}", e, auth_hint)
             } else {
