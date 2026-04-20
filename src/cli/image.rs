@@ -8,6 +8,25 @@ use std::io::{Read as _, Write};
 
 use super::auth::{parse_docker_config, remove_docker_config, resolve_auth, write_docker_config};
 
+/// Returns true if `e` is a transport-level failure (broken connection, EOF,
+/// connect reset) rather than a registry-protocol error.  Used to decide
+/// whether to retry with a fresh connection.
+///
+/// Background: registry load balancers (Docker Hub, ECR) silently drop idle
+/// TCP connections after ~30 s.  With a kernel-level NAT relay the VM's
+/// socket has no way to learn about the server-side close until the next
+/// write times out.  A single retry with a freshly-created client is
+/// sufficient because the new client opens a new connection.
+fn is_transport_error(e: &oci_client::errors::OciDistributionError) -> bool {
+    use oci_client::errors::OciDistributionError;
+    match e {
+        OciDistributionError::RequestError(re) => {
+            re.is_connect() || re.is_request() || re.is_timeout()
+        }
+        _ => false,
+    }
+}
+
 fn oci_err(registry: &str, e: oci_client::errors::OciDistributionError) -> String {
     use oci_client::errors::{OciDistributionError, OciErrorCode};
     let auth_hint = format!(
@@ -290,10 +309,19 @@ async fn pull_image(
 
     let client = Client::new(oci_client_config(registry, insecure));
 
-    let (manifest, digest, config_json) = client
-        .pull_manifest_and_config(&oci_ref, &auth)
-        .await
-        .map_err(|e| format!("failed to pull manifest: {}", oci_err(registry, e)))?;
+    let manifest_result = client.pull_manifest_and_config(&oci_ref, &auth).await;
+    let (manifest, digest, config_json) = match manifest_result {
+        Ok(r) => r,
+        Err(e) if is_transport_error(&e) => {
+            // Stale pooled connection — create a fresh client and retry once.
+            log::debug!("pull: manifest transport error, retrying with fresh connection: {e}");
+            Client::new(oci_client_config(registry, insecure))
+                .pull_manifest_and_config(&oci_ref, &auth)
+                .await
+                .map_err(|e| format!("failed to pull manifest: {}", oci_err(registry, e)))?
+        }
+        Err(e) => return Err(format!("failed to pull manifest: {}", oci_err(registry, e)).into()),
+    };
 
     println!(
         "  Manifest: {} ({} layers)",
