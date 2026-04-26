@@ -768,6 +768,7 @@ mod tests {
             read_only: true,
             rm: false,
             nat: true,
+            no_nat: false,
             labels: vec!["env=staging".to_string(), "managed=true".to_string()],
             tmpfs: vec!["/run".to_string(), "/tmp:size=64m".to_string()],
         };
