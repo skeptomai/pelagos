@@ -71,7 +71,7 @@ pub async fn start(
     };
 
     log::info!(
-        "exec {} on {}: {:?} detach={} tty={}",
+        "exec {} on {}: {:?} detach={:?} tty={}",
         exec_id,
         session.container_name,
         session.cmd,
