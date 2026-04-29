@@ -1,7 +1,16 @@
 //! Axum router and handler modules for the Docker Engine API.
 
-use axum::{Router, routing};
+use axum::{Router, routing, middleware, extract::Request, response::Response};
 use crate::state::AppState;
+
+async fn log_requests(req: Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    log::info!("--> {} {}", method, uri);
+    let resp = next.run(req).await;
+    log::info!("<-- {} {}", method, resp.status());
+    resp
+}
 
 mod containers;
 mod exec;
@@ -33,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/exec/:id/start", routing::post(exec::start))
         .route("/exec/:id/json", routing::get(exec::inspect))
         .with_state(state)
+        .layer(middleware::from_fn(log_requests))
 }
 
 async fn ping() -> &'static str {
