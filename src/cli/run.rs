@@ -669,7 +669,33 @@ fn apply_cli_options(
         network_mode,
         NetworkMode::Bridge | NetworkMode::BridgeNamed(_)
     );
-    if network_mode != NetworkMode::None {
+    if let NetworkMode::Container(ref target_name) = network_mode {
+        // Join the target container's named network namespace instead of creating
+        // a new one.  The target must have been started with bridge networking so
+        // that its network_ns_name is populated in its ContainerState.
+        let target_state = super::read_state(target_name).map_err(|_| {
+            format!(
+                "container '{}' not found — cannot join its network namespace",
+                target_name
+            )
+        })?;
+        let ns_name = target_state.network_ns_name.ok_or_else(|| {
+            format!(
+                "container '{}' has no named network namespace \
+                 (must be a bridge-networked container)",
+                target_name
+            )
+        })?;
+        let netns_path = format!("/run/netns/{}", ns_name);
+        if !std::path::Path::new(&netns_path).exists() {
+            return Err(format!(
+                "network namespace '{}' not found — is container '{}' still running?",
+                netns_path, target_name
+            )
+            .into());
+        }
+        cmd = cmd.with_namespace_join(netns_path, Namespace::NET);
+    } else if network_mode != NetworkMode::None {
         cmd = cmd.with_network(network_mode);
     }
     for net_name in additional_networks {
@@ -894,6 +920,13 @@ fn apply_cli_options(
 }
 
 fn parse_network_mode(s: &str) -> Result<NetworkMode, Box<dyn std::error::Error>> {
+    // Handle container:NAME before lowercasing so container names are case-preserved.
+    if let Some(target) = s.strip_prefix("container:") {
+        if target.is_empty() {
+            return Err("--network container: requires a container name".into());
+        }
+        return Ok(NetworkMode::Container(target.to_string()));
+    }
     match s.to_ascii_lowercase().as_str() {
         "none" | "" => Ok(NetworkMode::None),
         "loopback" => Ok(NetworkMode::Loopback),
@@ -1021,6 +1054,8 @@ fn run_foreground(
     // Gather network info before writing state.
     let mnt_ns_inode = super::read_mnt_ns_inode(pid);
     let bridge_ip = child.container_ip();
+    let network_ns_name = child.netns_name().map(|s| s.to_string());
+    let cgroup_name = child.cgroup_path();
     let all_ips: Vec<(String, String)> = child
         .container_ips()
         .into_iter()
@@ -1050,6 +1085,8 @@ fn run_foreground(
         labels,
         mnt_ns_inode,
         upper_dir,
+        network_ns_name,
+        cgroup_name,
     };
     write_state(&state)?;
 
@@ -1137,6 +1174,8 @@ fn run_interactive(
     // so `pelagos ps` sees the container immediately (mirrors run_foreground).
     let mnt_ns_inode = super::read_mnt_ns_inode(pid);
     let bridge_ip = session.child.container_ip();
+    let network_ns_name = session.child.netns_name().map(|s| s.to_string());
+    let cgroup_name = session.child.cgroup_path();
     let all_ips: Vec<(String, String)> = session
         .child
         .container_ips()
@@ -1165,6 +1204,8 @@ fn run_interactive(
         labels,
         mnt_ns_inode,
         upper_dir,
+        network_ns_name,
+        cgroup_name,
     };
     write_state(&state)?;
     register_dns(&name, &all_ips);
@@ -1250,6 +1291,8 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
         labels,
         mnt_ns_inode: None,
         upper_dir,
+        network_ns_name: None,
+        cgroup_name: None,
     };
     write_state(&state)?;
 
@@ -1365,6 +1408,8 @@ fn run_detached(a: DetachedArgs) -> Result<(), Box<dyn std::error::Error>> {
             updated.mnt_ns_inode = super::read_mnt_ns_inode(pid);
             updated.watcher_pid = watcher_pid;
             updated.bridge_ip = child.container_ip();
+            updated.network_ns_name = child.netns_name().map(|s| s.to_string());
+            updated.cgroup_name = child.cgroup_path();
             let all_ips: Vec<(String, String)> = child
                 .container_ips()
                 .into_iter()
