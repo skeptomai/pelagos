@@ -21,7 +21,9 @@ pub async fn create(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
+    log::info!("exec create raw body: {}", String::from_utf8_lossy(&body));
     let body: ExecCreateBody = serde_json::from_slice(&body).unwrap_or_default();
+    log::info!("exec create parsed cmd: {:?}", body.cmd);
     if pelagos_state::read_state(&container_id).is_err() {
         return (
             StatusCode::NOT_FOUND,
