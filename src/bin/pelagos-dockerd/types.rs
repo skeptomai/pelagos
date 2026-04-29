@@ -46,7 +46,7 @@ pub struct HostConfig {
     pub privileged: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExecCreateBody {
     #[serde(default)]

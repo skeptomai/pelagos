@@ -19,8 +19,9 @@ use crate::{
 pub async fn create(
     Path(container_id): Path<String>,
     State(state): State<AppState>,
-    Json(body): Json<ExecCreateBody>,
+    body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
+    let body: ExecCreateBody = serde_json::from_slice(&body).unwrap_or_default();
     if pelagos_state::read_state(&container_id).is_err() {
         return (
             StatusCode::NOT_FOUND,
