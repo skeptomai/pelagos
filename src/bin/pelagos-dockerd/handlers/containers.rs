@@ -1,0 +1,452 @@
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use crate::{
+    pelagos_state::{self, ContainerState},
+    state::{self, AppState},
+    types::{ContainerCreateBody, PendingContainer},
+};
+
+// ── List ─────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub all: Option<String>,
+    #[serde(default)]
+    pub filters: Option<String>,
+}
+
+pub async fn list(Query(q): Query<ListQuery>) -> (StatusCode, Json<Value>) {
+    let show_all = q.all.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
+
+    let label_filters = parse_label_filters(q.filters.as_deref());
+
+    let mut items: Vec<Value> = Vec::new();
+
+    // Running/exited containers from pelagos state
+    for c in pelagos_state::list_states() {
+        if !show_all && !c.is_running() {
+            continue;
+        }
+        if !label_filters.is_empty() && !matches_labels(&c.labels, &label_filters) {
+            continue;
+        }
+        items.push(container_summary_json(&c));
+    }
+
+    // Pending (created but not started) containers
+    for p in state::list_pending() {
+        if !show_all {
+            continue;
+        }
+        if !label_filters.is_empty() && !matches_labels(&p.labels, &label_filters) {
+            continue;
+        }
+        items.push(pending_summary_json(&p));
+    }
+
+    (StatusCode::OK, Json(Value::Array(items)))
+}
+
+// ── Create ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct CreateQuery {
+    pub name: Option<String>,
+}
+
+pub async fn create(
+    Query(q): Query<CreateQuery>,
+    Json(body): Json<ContainerCreateBody>,
+) -> (StatusCode, Json<Value>) {
+    let name = match q.name {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "container name is required"})),
+            );
+        }
+    };
+
+    if pelagos_state::read_state(&name).is_ok() || state::load_pending(&name).is_ok() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"message": format!("container '{}' already exists", name)})),
+        );
+    }
+
+    let pending = PendingContainer::from_create(name.clone(), body);
+    if let Err(e) = state::save_pending(&pending) {
+        log::error!("save pending {}: {}", name, e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        );
+    }
+
+    log::info!("created container: {}", name);
+    (StatusCode::CREATED, Json(json!({"Id": name, "Warnings": []})))
+}
+
+// ── Inspect ───────────────────────────────────────────────────────────────────
+
+pub async fn inspect(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+    // Running/exited container
+    if let Ok(c) = pelagos_state::read_state(&id) {
+        return (StatusCode::OK, Json(container_inspect_json(&c)));
+    }
+    // Pending (created, not started)
+    if let Ok(p) = state::load_pending(&id) {
+        return (StatusCode::OK, Json(pending_inspect_json(&p)));
+    }
+    (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})))
+}
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+
+pub async fn start(Path(id): Path<String>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+    let pending = match state::load_pending(&id) {
+        Ok(p) => p,
+        Err(_) => {
+            if pelagos_state::read_state(&id).is_ok() {
+                return (StatusCode::NOT_MODIFIED, Json(json!({})));
+            }
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": format!("container '{}' not found", id)})),
+            );
+        }
+    };
+
+    log::info!("starting container: {}", id);
+    if let Err(e) = pelagos_state::run_container(app.pelagos_bin(), &pending).await {
+        log::error!("start {}: {}", id, e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e})),
+        );
+    }
+
+    state::remove_pending(&id);
+    (StatusCode::NO_CONTENT, Json(json!({})))
+}
+
+// ── Stop ──────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct StopQuery {
+    pub t: Option<u32>,
+}
+
+pub async fn stop(Path(id): Path<String>, Query(q): Query<StopQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+    log::info!("stopping container: {}", id);
+    match pelagos_state::stop_container(app.pelagos_bin(), &id, q.t).await {
+        Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Err(e) => {
+            if e.contains("not found") || e.contains("no such") {
+                (StatusCode::NOT_FOUND, Json(json!({"message": e})))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e})))
+            }
+        }
+    }
+}
+
+// ── Kill ──────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct KillQuery {
+    pub signal: Option<String>,
+}
+
+pub async fn kill(Path(id): Path<String>, Query(_q): Query<KillQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+    log::info!("killing container: {}", id);
+    match pelagos_state::stop_container(app.pelagos_bin(), &id, Some(0)).await {
+        Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e}))),
+    }
+}
+
+// ── Remove ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct RemoveQuery {
+    #[serde(default)]
+    pub force: Option<String>,
+    #[serde(default)]
+    pub v: Option<String>,
+}
+
+pub async fn remove(Path(id): Path<String>, Query(q): Query<RemoveQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+    let force = q.force.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
+    state::remove_pending(&id);
+    log::info!("removing container: {} (force={})", id, force);
+    match pelagos_state::remove_container(app.pelagos_bin(), &id, force).await {
+        Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Err(e) => {
+            if e.contains("not found") || e.contains("no such") {
+                (StatusCode::NOT_FOUND, Json(json!({"message": e})))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e})))
+            }
+        }
+    }
+}
+
+// ── Wait ──────────────────────────────────────────────────────────────────────
+
+pub async fn wait(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+    // Poll until container exits
+    loop {
+        match pelagos_state::read_state(&id) {
+            Ok(c) if !c.is_running() => {
+                return (StatusCode::OK, Json(json!({"StatusCode": c.exit_code.unwrap_or(0)})));
+            }
+            Err(_) => {
+                return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})));
+            }
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct LogsQuery {
+    #[serde(default)]
+    pub stdout: Option<String>,
+    #[serde(default)]
+    pub stderr: Option<String>,
+    #[serde(default)]
+    pub tail: Option<String>,
+}
+
+pub async fn logs(Path(id): Path<String>, Query(_q): Query<LogsQuery>) -> (StatusCode, Json<Value>) {
+    let c = match pelagos_state::read_state(&id) {
+        Ok(c) => c,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})));
+        }
+    };
+
+    let mut output = String::new();
+    if let Some(log_path) = &c.stdout_log {
+        if let Ok(data) = std::fs::read_to_string(log_path) {
+            output.push_str(&data);
+        }
+    }
+
+    // Return raw text for now (exec logs use multiplexed stream format, but
+    // a plain text body works for simple log reading use cases)
+    (StatusCode::OK, Json(json!({"logs": output})))
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+pub async fn stats(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+    let c = match pelagos_state::read_state(&id) {
+        Ok(c) => c,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})));
+        }
+    };
+
+    let (cpu_ns, mem_bytes) = read_cgroup_stats(c.cgroup_name.as_deref());
+
+    (StatusCode::OK, Json(json!({
+        "id": id,
+        "cpu_stats": {
+            "cpu_usage": {
+                "total_usage": cpu_ns
+            },
+            "system_cpu_usage": read_system_cpu_ns()
+        },
+        "memory_stats": {
+            "usage": mem_bytes
+        },
+        "networks": {}
+    })))
+}
+
+fn read_cgroup_stats(cgroup: Option<&str>) -> (u64, u64) {
+    let Some(cg) = cgroup else { return (0, 0) };
+    let cpu = read_cpu_ns(cg);
+    let mem = read_mem_bytes(cg);
+    (cpu, mem)
+}
+
+fn read_cpu_ns(cg: &str) -> u64 {
+    let path = format!("/sys/fs/cgroup/{}/cpu.stat", cg);
+    let Ok(data) = std::fs::read_to_string(&path) else { return 0 };
+    for line in data.lines() {
+        if let Some(rest) = line.strip_prefix("usage_usec ") {
+            if let Ok(usec) = rest.trim().parse::<u64>() {
+                return usec * 1000; // to nanoseconds
+            }
+        }
+    }
+    0
+}
+
+fn read_mem_bytes(cg: &str) -> u64 {
+    let path = format!("/sys/fs/cgroup/{}/memory.current", cg);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn read_system_cpu_ns() -> u64 {
+    let Ok(data) = std::fs::read_to_string("/proc/stat") else { return 0 };
+    let line = data.lines().next().unwrap_or("");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    // Fields 1..=8: user nice system idle iowait irq softirq steal
+    let ticks: u64 = fields[1..].iter()
+        .take(8)
+        .filter_map(|s| s.parse::<u64>().ok())
+        .sum();
+    // Convert jiffies (typically 100Hz) to nanoseconds
+    ticks * 10_000_000
+}
+
+// ── JSON builders ─────────────────────────────────────────────────────────────
+
+fn container_summary_json(c: &ContainerState) -> Value {
+    let status_str = if c.is_running() {
+        "Up".to_string()
+    } else {
+        format!("Exited ({})", c.exit_code.unwrap_or(0))
+    };
+    json!({
+        "Id": c.name,
+        "Names": [format!("/{}", c.name)],
+        "Image": c.image(),
+        "ImageID": "",
+        "State": c.docker_status_str(),
+        "Status": status_str,
+        "Labels": c.labels,
+        "Created": 0
+    })
+}
+
+fn pending_summary_json(p: &PendingContainer) -> Value {
+    json!({
+        "Id": p.name,
+        "Names": [format!("/{}", p.name)],
+        "Image": p.image,
+        "ImageID": "",
+        "State": "created",
+        "Status": "Created",
+        "Labels": p.labels,
+        "Created": 0
+    })
+}
+
+fn container_inspect_json(c: &ContainerState) -> Value {
+    let ip = c.bridge_ip.clone().unwrap_or_default();
+    let mut networks = serde_json::Map::new();
+    if !ip.is_empty() {
+        networks.insert("bridge".to_string(), json!({
+            "IPAddress": ip,
+            "Gateway": "172.19.0.1",
+            "MacAddress": ""
+        }));
+    }
+    json!({
+        "Id": c.name,
+        "Name": format!("/{}", c.name),
+        "State": {
+            "Status": c.docker_status_str(),
+            "Running": c.is_running(),
+            "Paused": false,
+            "Restarting": false,
+            "Dead": false,
+            "Pid": c.pid,
+            "ExitCode": c.exit_code.unwrap_or(0),
+            "StartedAt": c.started_at,
+            "FinishedAt": if c.is_running() { "0001-01-01T00:00:00Z".to_string() } else { c.started_at.clone() }
+        },
+        "Config": {
+            "Image": c.image(),
+            "Cmd": c.command,
+            "Env": c.env(),
+            "Labels": c.labels,
+            "WorkingDir": c.spawn_config.as_ref().and_then(|sc| sc.working_dir.as_deref()).unwrap_or("")
+        },
+        "HostConfig": {
+            "NetworkMode": c.network_mode(),
+            "Binds": c.binds()
+        },
+        "NetworkSettings": {
+            "IPAddress": ip,
+            "Networks": networks
+        }
+    })
+}
+
+fn pending_inspect_json(p: &PendingContainer) -> Value {
+    json!({
+        "Id": p.name,
+        "Name": format!("/{}", p.name),
+        "State": {
+            "Status": "created",
+            "Running": false,
+            "Paused": false,
+            "Restarting": false,
+            "Dead": false,
+            "Pid": 0,
+            "ExitCode": 0,
+            "StartedAt": "0001-01-01T00:00:00Z",
+            "FinishedAt": "0001-01-01T00:00:00Z"
+        },
+        "Config": {
+            "Image": p.image,
+            "Cmd": p.cmd,
+            "Env": p.env,
+            "Labels": p.labels,
+            "WorkingDir": p.working_dir.as_deref().unwrap_or("")
+        },
+        "HostConfig": {
+            "NetworkMode": p.network_mode,
+            "Binds": p.binds
+        },
+        "NetworkSettings": {
+            "IPAddress": "",
+            "Networks": {}
+        }
+    })
+}
+
+fn parse_label_filters(raw: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = raw else { return Vec::new() };
+    // filters={"label":["key=value","key2=value2"]}
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
+    let Some(labels) = parsed.get("label").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    labels
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+fn matches_labels(
+    container_labels: &std::collections::HashMap<String, String>,
+    filters: &[(String, String)],
+) -> bool {
+    filters.iter().all(|(k, v)| {
+        container_labels.get(k).map(|cv| cv == v).unwrap_or(false)
+    })
+}
