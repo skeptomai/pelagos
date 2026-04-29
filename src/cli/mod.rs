@@ -272,6 +272,15 @@ pub struct ContainerState {
     /// overlay upper dir so filesystem changes survive stop/start cycles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upper_dir: Option<std::path::PathBuf>,
+    /// Named network namespace for this container's primary bridge interface.
+    /// Lives at `/run/netns/{name}` and persists after the container exits.
+    /// Used by `--net=container:NAME` to join another container's netns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_ns_name: Option<String>,
+    /// Cgroup path for this container (e.g. `pelagos-12345-0`).
+    /// Used by `pelagos-dockerd` to read CPU/memory stats from the cgroup fs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_name: Option<String>,
 }
 
 pub fn now_iso8601() -> String {
@@ -848,6 +857,8 @@ mod tests {
                     .collect(),
                 mnt_ns_inode: None,
                 upper_dir: None,
+                network_ns_name: None,
+                cgroup_name: None,
             }
         }
 
@@ -909,6 +920,8 @@ mod tests {
             labels,
             mnt_ns_inode: None,
             upper_dir: None,
+            network_ns_name: None,
+            cgroup_name: None,
         };
 
         let json = serde_json::to_string(&state).unwrap();

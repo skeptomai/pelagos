@@ -423,6 +423,12 @@ pub enum NetworkMode {
     /// relays packets to/from the host using ordinary userspace sockets, requiring
     /// no kernel privileges. Works for both root and rootless containers.
     Pasta,
+    /// Join an existing container's named network namespace.
+    ///
+    /// The string is the target container name. At spawn time the container's
+    /// `network_ns_name` is resolved to `/run/netns/{name}` and joined via
+    /// `setns(CLONE_NEWNET)`. No new network namespace is created.
+    Container(String),
 }
 
 impl NetworkMode {

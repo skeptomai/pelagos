@@ -710,6 +710,8 @@ fn spawn_service(
         labels: std::collections::HashMap::new(),
         mnt_ns_inode: super::read_mnt_ns_inode(pid),
         upper_dir: None,
+        network_ns_name: child.netns_name().map(|s| s.to_string()),
+        cgroup_name: child.cgroup_path(),
     };
     write_state(&cstate)?;
 
