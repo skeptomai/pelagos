@@ -1,11 +1,11 @@
 use axum::{
     Json,
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::pelagos_state;
+use crate::{pelagos_state, state::AppState};
 
 #[derive(Deserialize)]
 pub struct CreateQuery {
@@ -15,7 +15,7 @@ pub struct CreateQuery {
 }
 
 /// POST /images/create?fromImage=...&tag=...
-pub async fn create(Query(q): Query<CreateQuery>) -> (StatusCode, Json<Value>) {
+pub async fn create(Query(q): Query<CreateQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
     let Some(from_image) = q.from_image else {
         return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"})));
     };
@@ -26,7 +26,7 @@ pub async fn create(Query(q): Query<CreateQuery>) -> (StatusCode, Json<Value>) {
     };
 
     log::info!("pulling image: {}", image);
-    match pelagos_state::pull_image(&image).await {
+    match pelagos_state::pull_image(app.pelagos_bin(), &image).await {
         Ok(output) => {
             let text = String::from_utf8_lossy(&output);
             // Emit Docker-style progress lines
@@ -51,9 +51,9 @@ pub async fn create(Query(q): Query<CreateQuery>) -> (StatusCode, Json<Value>) {
 }
 
 /// GET /images/{name}/json
-pub async fn inspect(Path(name): Path<String>) -> (StatusCode, Json<Value>) {
+pub async fn inspect(Path(name): Path<String>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
     let name = urlencoding_decode(&name);
-    let images = match pelagos_state::list_images_json().await {
+    let images = match pelagos_state::list_images_json(app.pelagos_bin()).await {
         Ok(v) => v,
         Err(e) => {
             log::warn!("list images failed: {}", e);

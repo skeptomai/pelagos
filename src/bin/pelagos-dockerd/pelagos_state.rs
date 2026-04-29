@@ -141,8 +141,8 @@ pub fn list_states() -> Vec<ContainerState> {
 
 // ── CLI helpers ──────────────────────────────────────────────────────────────
 
-pub async fn run_container(p: &crate::types::PendingContainer) -> Result<(), String> {
-    let mut cmd = Command::new("pelagos");
+pub async fn run_container(bin: &str, p: &crate::types::PendingContainer) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
     cmd.arg("run");
     cmd.arg("--name").arg(&p.name);
     cmd.arg("--detach");
@@ -198,8 +198,8 @@ pub async fn run_container(p: &crate::types::PendingContainer) -> Result<(), Str
     }
 }
 
-pub async fn stop_container(name: &str, timeout: Option<u32>) -> Result<(), String> {
-    let mut cmd = Command::new("pelagos");
+pub async fn stop_container(bin: &str, name: &str, timeout: Option<u32>) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
     cmd.arg("stop");
     if let Some(t) = timeout {
         cmd.arg("--time").arg(t.to_string());
@@ -216,8 +216,8 @@ pub async fn stop_container(name: &str, timeout: Option<u32>) -> Result<(), Stri
     }
 }
 
-pub async fn remove_container(name: &str, force: bool) -> Result<(), String> {
-    let mut cmd = Command::new("pelagos");
+pub async fn remove_container(bin: &str, name: &str, force: bool) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
     cmd.arg("rm");
     if force {
         cmd.arg("--force");
@@ -235,8 +235,8 @@ pub async fn remove_container(name: &str, force: bool) -> Result<(), String> {
 }
 
 /// Pull an image, returning stdout+stderr output for progress reporting.
-pub async fn pull_image(image: &str) -> Result<Vec<u8>, String> {
-    let out = Command::new("pelagos")
+pub async fn pull_image(bin: &str, image: &str) -> Result<Vec<u8>, String> {
+    let out = Command::new(bin)
         .args(["image", "pull", image])
         .output()
         .await
@@ -249,8 +249,8 @@ pub async fn pull_image(image: &str) -> Result<Vec<u8>, String> {
 }
 
 /// List images as JSON (calls `pelagos image ls --json`).
-pub async fn list_images_json() -> Result<Vec<serde_json::Value>, String> {
-    let out = Command::new("pelagos")
+pub async fn list_images_json(bin: &str) -> Result<Vec<serde_json::Value>, String> {
+    let out = Command::new(bin)
         .args(["image", "ls", "--json"])
         .output()
         .await

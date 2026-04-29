@@ -14,16 +14,26 @@ pub struct AppState {
 
 struct Inner {
     exec_sessions: Mutex<HashMap<String, ExecSession>>,
+    pub pelagos_bin: String,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        Self::new_with_bin("pelagos".to_string())
+    }
+
+    pub fn new_with_bin(pelagos_bin: String) -> Self {
         let _ = std::fs::create_dir_all(PENDING_DIR);
         Self {
             inner: Arc::new(Inner {
                 exec_sessions: Mutex::new(HashMap::new()),
+                pelagos_bin,
             }),
         }
+    }
+
+    pub fn pelagos_bin(&self) -> &str {
+        &self.inner.pelagos_bin
     }
 
     pub async fn add_exec(&self, id: String, session: ExecSession) {

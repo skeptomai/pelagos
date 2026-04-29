@@ -1,13 +1,13 @@
 use axum::{
     Json,
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::{
     pelagos_state::{self, ContainerState},
-    state,
+    state::{self, AppState},
     types::{ContainerCreateBody, PendingContainer},
 };
 
@@ -110,11 +110,10 @@ pub async fn inspect(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-pub async fn start(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+pub async fn start(Path(id): Path<String>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
     let pending = match state::load_pending(&id) {
         Ok(p) => p,
         Err(_) => {
-            // Maybe already started?
             if pelagos_state::read_state(&id).is_ok() {
                 return (StatusCode::NOT_MODIFIED, Json(json!({})));
             }
@@ -126,7 +125,7 @@ pub async fn start(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
     };
 
     log::info!("starting container: {}", id);
-    if let Err(e) = pelagos_state::run_container(&pending).await {
+    if let Err(e) = pelagos_state::run_container(app.pelagos_bin(), &pending).await {
         log::error!("start {}: {}", id, e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -145,9 +144,9 @@ pub struct StopQuery {
     pub t: Option<u32>,
 }
 
-pub async fn stop(Path(id): Path<String>, Query(q): Query<StopQuery>) -> (StatusCode, Json<Value>) {
+pub async fn stop(Path(id): Path<String>, Query(q): Query<StopQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
     log::info!("stopping container: {}", id);
-    match pelagos_state::stop_container(&id, q.t).await {
+    match pelagos_state::stop_container(app.pelagos_bin(), &id, q.t).await {
         Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
         Err(e) => {
             if e.contains("not found") || e.contains("no such") {
@@ -166,10 +165,9 @@ pub struct KillQuery {
     pub signal: Option<String>,
 }
 
-pub async fn kill(Path(id): Path<String>, Query(_q): Query<KillQuery>) -> (StatusCode, Json<Value>) {
-    // pelagos stop sends SIGTERM; use it for kill too
+pub async fn kill(Path(id): Path<String>, Query(_q): Query<KillQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
     log::info!("killing container: {}", id);
-    match pelagos_state::stop_container(&id, Some(0)).await {
+    match pelagos_state::stop_container(app.pelagos_bin(), &id, Some(0)).await {
         Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e}))),
     }
@@ -185,11 +183,11 @@ pub struct RemoveQuery {
     pub v: Option<String>,
 }
 
-pub async fn remove(Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> (StatusCode, Json<Value>) {
+pub async fn remove(Path(id): Path<String>, Query(q): Query<RemoveQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
     let force = q.force.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
     state::remove_pending(&id);
     log::info!("removing container: {} (force={})", id, force);
-    match pelagos_state::remove_container(&id, force).await {
+    match pelagos_state::remove_container(app.pelagos_bin(), &id, force).await {
         Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
         Err(e) => {
             if e.contains("not found") || e.contains("no such") {

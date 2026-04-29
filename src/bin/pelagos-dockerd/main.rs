@@ -27,6 +27,9 @@ struct Args {
     /// Unix socket path to listen on.
     #[clap(long, default_value = "/var/run/pelagos-dockerd.sock")]
     socket: String,
+    /// Path to the pelagos binary.
+    #[clap(long, default_value = "pelagos")]
+    pelagos_bin: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -59,7 +62,7 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let app_state = state::AppState::new();
+    let app_state = state::AppState::new_with_bin(args.pelagos_bin.clone());
     let mut make_service = handlers::router(app_state).into_make_service();
 
     let listener = UnixListener::bind(&args.socket)?;

@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
 };
 use serde_json::{json, Value};
+use tokio::process::Command;
 use uuid::Uuid;
 use crate::{
     pelagos_state,
@@ -64,7 +65,7 @@ pub async fn start(
         body.detach
     );
 
-    let mut cmd = tokio::process::Command::new("pelagos");
+    let mut cmd = Command::new(app.pelagos_bin());
     cmd.arg("exec");
 
     if let Some(wd) = &session.working_dir {
