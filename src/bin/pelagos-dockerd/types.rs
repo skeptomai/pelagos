@@ -67,7 +67,7 @@ pub struct ExecCreateBody {
     pub user: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExecStartBody {
     #[serde(default)]
