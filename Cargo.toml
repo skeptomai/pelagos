@@ -68,7 +68,7 @@ path = "src/bin/pelagos-dockerd/main.rs"
 [target.'cfg(target_os = "linux")'.dependencies]
 axum = "0.7"
 hyper = { version = "1", features = ["http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = "0.4"
 uuid = { version = "1", features = ["v4"] }
 

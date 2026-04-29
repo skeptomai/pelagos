@@ -47,6 +47,7 @@ fn linux_run() {
 async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
+    use hyper_util::service::TowerToHyperService;
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
     use tower::Service;
@@ -71,6 +72,7 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let io = TokioIo::new(stream);
         let svc = make_service.call(()).await?;
         tokio::spawn(async move {
+            let svc = TowerToHyperService::new(svc);
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                 log::debug!("connection error: {}", e);
             }
