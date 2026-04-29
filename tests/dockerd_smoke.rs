@@ -8,7 +8,9 @@
 mod smoke {
     use bollard::Docker;
     use bollard::container::{CreateContainerOptions, Config, StartContainerOptions, RemoveContainerOptions};
+    use bollard::exec::{CreateExecOptions, StartExecResults};
     use bollard::models::HostConfig;
+    use futures_util::StreamExt;
 
     fn connect() -> Docker {
         let sock = std::env::var("PELAGOS_DOCKERD_SOCK")
@@ -98,6 +100,78 @@ mod smoke {
             )
             .await
             .expect("remove_container()");
+    }
+
+    #[tokio::test]
+    async fn exec_captures_output_and_exit_code() {
+        let docker = connect();
+        let container = "bollard-exec-test";
+
+        // Clean up any leftover
+        let _ = docker
+            .remove_container(container, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .await;
+
+        // Create and start a long-lived container
+        docker
+            .create_container(
+                Some(CreateContainerOptions { name: container, platform: None }),
+                Config {
+                    image: Some("alpine:latest"),
+                    cmd: Some(vec!["sleep", "30"]),
+                    host_config: Some(HostConfig {
+                        network_mode: Some("bridge".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create_container");
+        docker.start_container(container, None::<StartContainerOptions<String>>).await.expect("start_container");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // exec: echo a known string to stdout
+        let exec = docker
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    cmd: Some(vec!["sh", "-c", "echo hello-from-exec"]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create_exec");
+
+        let mut output_text = String::new();
+        if let StartExecResults::Attached { mut output, .. } = docker
+            .start_exec(&exec.id, None)
+            .await
+            .expect("start_exec")
+        {
+            while let Some(Ok(msg)) = output.next().await {
+                output_text.push_str(&msg.to_string());
+            }
+        } else {
+            panic!("expected Attached exec result");
+        }
+
+        println!("exec output: {:?}", output_text);
+        assert!(output_text.contains("hello-from-exec"), "unexpected output: {}", output_text);
+
+        // Inspect exec — should report completed (Running: false)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let info = docker.inspect_exec(&exec.id).await.expect("inspect_exec");
+        assert_eq!(info.running, Some(false), "exec should not be running after completion");
+        assert_eq!(info.exit_code, Some(0), "exit code should be 0");
+
+        // Cleanup
+        docker
+            .remove_container(container, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .await
+            .expect("remove_container");
     }
 }
 

@@ -14,6 +14,7 @@ pub struct AppState {
 
 struct Inner {
     exec_sessions: Mutex<HashMap<String, ExecSession>>,
+    completed_execs: Mutex<HashMap<String, i64>>,
     pub pelagos_bin: String,
 }
 
@@ -27,6 +28,7 @@ impl AppState {
         Self {
             inner: Arc::new(Inner {
                 exec_sessions: Mutex::new(HashMap::new()),
+                completed_execs: Mutex::new(HashMap::new()),
                 pelagos_bin,
             }),
         }
@@ -46,6 +48,15 @@ impl AppState {
 
     pub async fn remove_exec(&self, id: &str) {
         self.inner.exec_sessions.lock().await.remove(id);
+    }
+
+    pub async fn complete_exec(&self, id: String, exit_code: i64) {
+        self.inner.exec_sessions.lock().await.remove(&id);
+        self.inner.completed_execs.lock().await.insert(id, exit_code);
+    }
+
+    pub async fn get_completed_exec(&self, id: &str) -> Option<i64> {
+        self.inner.completed_execs.lock().await.get(id).copied()
     }
 }
 

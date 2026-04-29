@@ -76,7 +76,11 @@ async fn async_run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let svc = make_service.call(()).await?;
         tokio::spawn(async move {
             let svc = TowerToHyperService::new(svc);
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, svc)
+                .with_upgrades()
+                .await
+            {
                 log::debug!("connection error: {}", e);
             }
         });
