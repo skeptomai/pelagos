@@ -1,11 +1,11 @@
+use crate::{pelagos_state, state::AppState};
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
+    Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::{pelagos_state, state::AppState};
 
 #[derive(Deserialize)]
 pub struct CreateQuery {
@@ -15,9 +15,15 @@ pub struct CreateQuery {
 }
 
 /// POST /images/create?fromImage=...&tag=...
-pub async fn create(Query(q): Query<CreateQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+pub async fn create(
+    Query(q): Query<CreateQuery>,
+    State(app): State<AppState>,
+) -> (StatusCode, Json<Value>) {
     let Some(from_image) = q.from_image else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"message": "fromImage is required"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "fromImage is required"})),
+        );
     };
     let image = if let Some(tag) = q.tag.filter(|t| !t.is_empty()) {
         format!("{}:{}", from_image, tag)
@@ -33,7 +39,10 @@ pub async fn create(Query(q): Query<CreateQuery>, State(app): State<AppState>) -
             let mut lines = Vec::new();
             for line in text.lines() {
                 if !line.is_empty() {
-                    lines.push(format!("{{\"status\":\"{}\",\"progressDetail\":{{}}}}", escape_json_str(line)));
+                    lines.push(format!(
+                        "{{\"status\":\"{}\",\"progressDetail\":{{}}}}",
+                        escape_json_str(line)
+                    ));
                 }
             }
             lines.push(format!(
@@ -41,23 +50,35 @@ pub async fn create(Query(q): Query<CreateQuery>, State(app): State<AppState>) -
                 image
             ));
             let body = lines.join("\n");
-            (StatusCode::OK, Json(json!({"status": "pull complete", "raw": body})))
+            (
+                StatusCode::OK,
+                Json(json!({"status": "pull complete", "raw": body})),
+            )
         }
         Err(e) => {
             log::error!("pull {} failed: {}", image, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": e})),
+            )
         }
     }
 }
 
 /// GET /images/{name}/json
-pub async fn inspect(Path(name): Path<String>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+pub async fn inspect(
+    Path(name): Path<String>,
+    State(app): State<AppState>,
+) -> (StatusCode, Json<Value>) {
     let name = urlencoding_decode(&name);
     let images = match pelagos_state::list_images_json(app.pelagos_bin()).await {
         Ok(v) => v,
         Err(e) => {
             log::warn!("list images failed: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e})));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": e})),
+            );
         }
     };
 
@@ -70,20 +91,29 @@ pub async fn inspect(Path(name): Path<String>, State(app): State<AppState>) -> (
 
     match matched {
         Some(img) => {
-            let reference = img.get("reference").and_then(|r| r.as_str()).unwrap_or(&name);
+            let reference = img
+                .get("reference")
+                .and_then(|r| r.as_str())
+                .unwrap_or(&name);
             let digest = img.get("digest").and_then(|d| d.as_str()).unwrap_or("");
-            (StatusCode::OK, Json(json!({
-                "Id": format!("{}", digest),
-                "RepoTags": [reference],
-                "RepoDigests": [format!("{}@{}", reference, digest)],
-                "Size": 10000000,
-                "VirtualSize": 10000000,
-                "Os": "linux",
-                "Architecture": "arm64",
-                "Created": "2024-01-01T00:00:00Z"
-            })))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "Id": format!("{}", digest),
+                    "RepoTags": [reference],
+                    "RepoDigests": [format!("{}@{}", reference, digest)],
+                    "Size": 10000000,
+                    "VirtualSize": 10000000,
+                    "Os": "linux",
+                    "Architecture": "arm64",
+                    "Created": "2024-01-01T00:00:00Z"
+                })),
+            )
         }
-        None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("image {} not found", name)}))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": format!("image {} not found", name)})),
+        ),
     }
 }
 

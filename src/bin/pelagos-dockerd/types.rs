@@ -29,6 +29,7 @@ pub struct ContainerCreateBody {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
+#[allow(dead_code)]
 pub struct HostConfig {
     #[serde(default)]
     pub network_mode: Option<String>,
@@ -48,6 +49,7 @@ pub struct HostConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
+#[allow(dead_code)]
 pub struct ExecCreateBody {
     #[serde(default)]
     pub cmd: Vec<String>,
@@ -69,6 +71,7 @@ pub struct ExecCreateBody {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
+#[allow(dead_code)]
 pub struct ExecStartBody {
     #[serde(default)]
     pub detach: Option<bool>,

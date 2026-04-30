@@ -1,19 +1,19 @@
-use axum::{
-    Json,
-    body::Body,
-    extract::{Path, Request, State},
-    http::{Response, StatusCode},
-    response::IntoResponse,
-};
-use hyper_util::rt::TokioIo;
-use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uuid::Uuid;
 use crate::{
     pelagos_state,
     state::AppState,
     types::{ExecCreateBody, ExecSession, ExecStartBody},
 };
+use axum::{
+    body::Body,
+    extract::{Path, Request, State},
+    http::{Response, StatusCode},
+    response::IntoResponse,
+    Json,
+};
+use hyper_util::rt::TokioIo;
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use uuid::Uuid;
 
 /// POST /containers/{id}/exec — register an exec instance.
 pub async fn create(
@@ -134,26 +134,35 @@ pub async fn inspect(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<Value>) {
     if let Some(exit_code) = state.get_completed_exec(&exec_id).await {
-        return (StatusCode::OK, Json(json!({
-            "ID": exec_id,
-            "Running": false,
-            "ExitCode": exit_code,
-            "ProcessConfig": {"entrypoint": "", "arguments": []}
-        })));
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ID": exec_id,
+                "Running": false,
+                "ExitCode": exit_code,
+                "ProcessConfig": {"entrypoint": "", "arguments": []}
+            })),
+        );
     }
     if let Some(s) = state.get_exec(&exec_id).await {
-        return (StatusCode::OK, Json(json!({
-            "ID": exec_id,
-            "ContainerID": s.container_name,
-            "Running": true,
-            "ExitCode": null,
-            "ProcessConfig": {
-                "entrypoint": s.cmd.first().cloned().unwrap_or_default(),
-                "arguments": s.cmd.get(1..).unwrap_or(&[]).to_vec()
-            }
-        })));
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ID": exec_id,
+                "ContainerID": s.container_name,
+                "Running": true,
+                "ExitCode": null,
+                "ProcessConfig": {
+                    "entrypoint": s.cmd.first().cloned().unwrap_or_default(),
+                    "arguments": s.cmd.get(1..).unwrap_or(&[]).to_vec()
+                }
+            })),
+        );
     }
-    (StatusCode::NOT_FOUND, Json(json!({"message": "exec not found"})))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"message": "exec not found"})),
+    )
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -259,7 +268,10 @@ async fn write_docker_frame<W: tokio::io::AsyncWrite + Unpin>(
 ) -> std::io::Result<()> {
     let len = data.len() as u32;
     let header = [
-        stream_type, 0, 0, 0,
+        stream_type,
+        0,
+        0,
+        0,
         (len >> 24) as u8,
         (len >> 16) as u8,
         (len >> 8) as u8,
