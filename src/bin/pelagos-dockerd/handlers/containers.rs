@@ -23,28 +23,37 @@ pub struct ListQuery {
 
 pub async fn list(Query(q): Query<ListQuery>) -> (StatusCode, Json<Value>) {
     let show_all = q.all.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
-
-    let label_filters = parse_label_filters(q.filters.as_deref());
+    let filters = parse_filters(q.filters.as_deref());
 
     let mut items: Vec<Value> = Vec::new();
 
-    // Running/exited containers from pelagos state
     for c in pelagos_state::list_states() {
         if !show_all && !c.is_running() {
             continue;
         }
-        if !label_filters.is_empty() && !matches_labels(&c.labels, &label_filters) {
+        if !filters.labels.is_empty() && !matches_labels(&c.labels, &filters.labels) {
+            continue;
+        }
+        if !filters.names.is_empty() && !matches_name(&c.name, &filters.names) {
+            continue;
+        }
+        if !filters.statuses.is_empty() && !filters.statuses.iter().any(|s| s == c.docker_status_str()) {
             continue;
         }
         items.push(container_summary_json(&c));
     }
 
-    // Pending (created but not started) containers
     for p in state::list_pending() {
         if !show_all {
             continue;
         }
-        if !label_filters.is_empty() && !matches_labels(&p.labels, &label_filters) {
+        if !filters.labels.is_empty() && !matches_labels(&p.labels, &filters.labels) {
+            continue;
+        }
+        if !filters.names.is_empty() && !matches_name(&p.name, &filters.names) {
+            continue;
+        }
+        if !filters.statuses.is_empty() && !filters.statuses.contains(&"created".to_string()) {
             continue;
         }
         items.push(pending_summary_json(&p));
@@ -425,21 +434,47 @@ fn pending_inspect_json(p: &PendingContainer) -> Value {
     })
 }
 
-fn parse_label_filters(raw: Option<&str>) -> Vec<(String, String)> {
-    let Some(raw) = raw else { return Vec::new() };
-    // filters={"label":["key=value","key2=value2"]}
-    let Ok(parsed) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
-    let Some(labels) = parsed.get("label").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    labels
-        .iter()
-        .filter_map(|v| v.as_str())
-        .filter_map(|s| {
-            let (k, v) = s.split_once('=')?;
-            Some((k.to_string(), v.to_string()))
-        })
-        .collect()
+/// GET /volumes — list volumes (kubelet calls this to clean up emptyDir volumes)
+pub async fn list_volumes() -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(json!({"Volumes": [], "Warnings": []})))
+}
+
+/// DELETE /volumes/{name} — remove a volume
+pub async fn remove_volume(Path(_name): Path<String>) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// GET /containers/{id}/archive — download file from container (kubelet fallback path)
+pub async fn archive(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_FOUND, Json(json!({"message": format!("archive not supported for '{}'", id)})))
+}
+
+struct Filters {
+    labels: Vec<(String, String)>,
+    names: Vec<String>,
+    statuses: Vec<String>,
+}
+
+fn parse_filters(raw: Option<&str>) -> Filters {
+    let mut f = Filters { labels: Vec::new(), names: Vec::new(), statuses: Vec::new() };
+    let Some(raw) = raw else { return f };
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else { return f };
+
+    if let Some(labels) = parsed.get("label").and_then(|v| v.as_array()) {
+        f.labels = labels.iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|s| { let (k, v) = s.split_once('=')?; Some((k.to_string(), v.to_string())) })
+            .collect();
+    }
+    if let Some(names) = parsed.get("name").and_then(|v| v.as_array()) {
+        f.names = names.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+    }
+    if let Some(statuses) = parsed.get("status").and_then(|v| v.as_array()) {
+        // Docker status values: "running","exited","created","paused","restarting","dead"
+        // Map Docker status names to our docker_status_str() equivalents
+        f.statuses = statuses.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+    }
+    f
 }
 
 fn matches_labels(
@@ -448,5 +483,19 @@ fn matches_labels(
 ) -> bool {
     filters.iter().all(|(k, v)| {
         container_labels.get(k).map(|cv| cv == v).unwrap_or(false)
+    })
+}
+
+fn matches_name(container_name: &str, patterns: &[String]) -> bool {
+    let full_name = format!("/{}", container_name);
+    patterns.iter().any(|pat| {
+        // Docker name filter supports regex; handle the common prefix case (^/name)
+        // and substring match
+        if pat.starts_with('^') {
+            let prefix = &pat[1..];
+            full_name.starts_with(prefix) || container_name.starts_with(prefix)
+        } else {
+            full_name.contains(pat.as_str()) || container_name.contains(pat.as_str())
+        }
     })
 }

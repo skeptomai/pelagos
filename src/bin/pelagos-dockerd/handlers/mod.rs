@@ -37,6 +37,11 @@ pub fn router(state: AppState) -> Router {
         .route("/containers/:id/wait", routing::post(containers::wait))
         .route("/containers/:id/logs", routing::get(containers::logs))
         .route("/containers/:id/stats", routing::get(containers::stats))
+        // Container archive (fallback, returns 404)
+        .route("/containers/:id/archive", routing::get(containers::archive))
+        // Volumes
+        .route("/volumes", routing::get(containers::list_volumes))
+        .route("/volumes/:name", routing::delete(containers::remove_volume))
         // Exec
         .route("/containers/:id/exec", routing::post(exec::create))
         .route("/exec/:id/start", routing::post(exec::start))
