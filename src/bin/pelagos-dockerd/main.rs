@@ -2,13 +2,13 @@
 //! Linux-only binary.
 
 #[cfg(target_os = "linux")]
+mod handlers;
+#[cfg(target_os = "linux")]
 mod pelagos_state;
 #[cfg(target_os = "linux")]
 mod state;
 #[cfg(target_os = "linux")]
 mod types;
-#[cfg(target_os = "linux")]
-mod handlers;
 
 fn main() {
     #[cfg(not(target_os = "linux"))]

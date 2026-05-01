@@ -1,18 +1,17 @@
-use axum::{
-    Json,
-    body::Body,
-    extract::{Path, Query, State},
-    http::{Response, StatusCode},
-    response::IntoResponse,
-};
-use serde::Deserialize;
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::{
     pelagos_state::{self, ContainerState},
     state::{self, AppState},
     types::{ContainerCreateBody, PendingContainer},
 };
+use axum::{
+    body::Body,
+    extract::{Path, Query, State},
+    http::{Response, StatusCode},
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 // ── List ─────────────────────────────────────────────────────────────────────
 
@@ -25,7 +24,11 @@ pub struct ListQuery {
 }
 
 pub async fn list(Query(q): Query<ListQuery>) -> (StatusCode, Json<Value>) {
-    let show_all = q.all.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
+    let show_all = q
+        .all
+        .as_deref()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     let filters = parse_filters(q.filters.as_deref());
 
     let mut items: Vec<Value> = Vec::new();
@@ -40,7 +43,9 @@ pub async fn list(Query(q): Query<ListQuery>) -> (StatusCode, Json<Value>) {
         if !filters.names.is_empty() && !matches_name(&c.name, &filters.names) {
             continue;
         }
-        if !filters.statuses.is_empty() && !filters.statuses.iter().any(|s| s == c.docker_status_str()) {
+        if !filters.statuses.is_empty()
+            && !filters.statuses.iter().any(|s| s == c.docker_status_str())
+        {
             continue;
         }
         items.push(container_summary_json(&c));
@@ -103,7 +108,10 @@ pub async fn create(
     }
 
     log::info!("created container: {}", name);
-    (StatusCode::CREATED, Json(json!({"Id": name, "Warnings": []})))
+    (
+        StatusCode::CREATED,
+        Json(json!({"Id": name, "Warnings": []})),
+    )
 }
 
 // ── Inspect ───────────────────────────────────────────────────────────────────
@@ -117,12 +125,18 @@ pub async fn inspect(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
     if let Ok(p) = state::load_pending(&id) {
         return (StatusCode::OK, Json(pending_inspect_json(&p)));
     }
-    (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"message": format!("container '{}' not found", id)})),
+    )
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-pub async fn start(Path(id): Path<String>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+pub async fn start(
+    Path(id): Path<String>,
+    State(app): State<AppState>,
+) -> (StatusCode, Json<Value>) {
     let pending = match state::load_pending(&id) {
         Ok(p) => p,
         Err(_) => {
@@ -156,7 +170,11 @@ pub struct StopQuery {
     pub t: Option<u32>,
 }
 
-pub async fn stop(Path(id): Path<String>, Query(q): Query<StopQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+pub async fn stop(
+    Path(id): Path<String>,
+    Query(q): Query<StopQuery>,
+    State(app): State<AppState>,
+) -> (StatusCode, Json<Value>) {
     log::info!("stopping container: {}", id);
     match pelagos_state::stop_container(app.pelagos_bin(), &id, q.t).await {
         Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
@@ -164,7 +182,10 @@ pub async fn stop(Path(id): Path<String>, Query(q): Query<StopQuery>, State(app)
             if e.contains("not found") || e.contains("no such") {
                 (StatusCode::NOT_FOUND, Json(json!({"message": e})))
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e})))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": e})),
+                )
             }
         }
     }
@@ -173,21 +194,30 @@ pub async fn stop(Path(id): Path<String>, Query(q): Query<StopQuery>, State(app)
 // ── Kill ──────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
+#[allow(dead_code)]
 pub struct KillQuery {
     pub signal: Option<String>,
 }
 
-pub async fn kill(Path(id): Path<String>, Query(_q): Query<KillQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+pub async fn kill(
+    Path(id): Path<String>,
+    Query(_q): Query<KillQuery>,
+    State(app): State<AppState>,
+) -> (StatusCode, Json<Value>) {
     log::info!("killing container: {}", id);
     match pelagos_state::stop_container(app.pelagos_bin(), &id, Some(0)).await {
         Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e})),
+        ),
     }
 }
 
 // ── Remove ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
+#[allow(dead_code)]
 pub struct RemoveQuery {
     #[serde(default)]
     pub force: Option<String>,
@@ -195,8 +225,16 @@ pub struct RemoveQuery {
     pub v: Option<String>,
 }
 
-pub async fn remove(Path(id): Path<String>, Query(q): Query<RemoveQuery>, State(app): State<AppState>) -> (StatusCode, Json<Value>) {
-    let force = q.force.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
+pub async fn remove(
+    Path(id): Path<String>,
+    Query(q): Query<RemoveQuery>,
+    State(app): State<AppState>,
+) -> (StatusCode, Json<Value>) {
+    let force = q
+        .force
+        .as_deref()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     state::remove_pending(&id);
     log::info!("removing container: {} (force={})", id, force);
     match pelagos_state::remove_container(app.pelagos_bin(), &id, force).await {
@@ -205,7 +243,10 @@ pub async fn remove(Path(id): Path<String>, Query(q): Query<RemoveQuery>, State(
             if e.contains("not found") || e.contains("no such") {
                 (StatusCode::NOT_FOUND, Json(json!({"message": e})))
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e})))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": e})),
+                )
             }
         }
     }
@@ -218,10 +259,16 @@ pub async fn wait(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
     loop {
         match pelagos_state::read_state(&id) {
             Ok(c) if !c.is_running() => {
-                return (StatusCode::OK, Json(json!({"StatusCode": c.exit_code.unwrap_or(0)})));
+                return (
+                    StatusCode::OK,
+                    Json(json!({"StatusCode": c.exit_code.unwrap_or(0)})),
+                );
             }
             Err(_) => {
-                return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})));
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"message": format!("container '{}' not found", id)})),
+                );
             }
             _ => {}
         }
@@ -232,6 +279,7 @@ pub async fn wait(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
 // ── Logs ──────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
+#[allow(dead_code)]
 pub struct LogsQuery {
     #[serde(default)]
     pub stdout: Option<String>,
@@ -247,7 +295,11 @@ pub async fn logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> Respons
     let c = match pelagos_state::read_state(&id) {
         Ok(c) => c,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": format!("container '{}' not found", id)})),
+            )
+                .into_response();
         }
     };
 
@@ -258,12 +310,18 @@ pub async fn logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> Respons
         }
     };
 
-    let follow = q.follow.as_deref().map(|v| v == "true" || v == "1").unwrap_or(false);
+    let follow = q
+        .follow
+        .as_deref()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     let container_name = id.clone();
 
     if !follow {
         // Non-follow: read the whole log file and return it as a single framed body.
-        let data = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+        let data = tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default();
         let mut body: Vec<u8> = Vec::new();
         for line in data.lines() {
             let mut payload = line.as_bytes().to_vec();
@@ -318,7 +376,10 @@ pub async fn logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> Respons
 
 fn docker_frame_header(stream_type: u8, len: u32) -> Vec<u8> {
     vec![
-        stream_type, 0, 0, 0,
+        stream_type,
+        0,
+        0,
+        0,
         (len >> 24) as u8,
         (len >> 16) as u8,
         (len >> 8) as u8,
@@ -332,25 +393,31 @@ pub async fn stats(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
     let c = match pelagos_state::read_state(&id) {
         Ok(c) => c,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"message": format!("container '{}' not found", id)})));
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": format!("container '{}' not found", id)})),
+            );
         }
     };
 
     let (cpu_ns, mem_bytes) = read_cgroup_stats(c.cgroup_name.as_deref());
 
-    (StatusCode::OK, Json(json!({
-        "id": id,
-        "cpu_stats": {
-            "cpu_usage": {
-                "total_usage": cpu_ns
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": id,
+            "cpu_stats": {
+                "cpu_usage": {
+                    "total_usage": cpu_ns
+                },
+                "system_cpu_usage": read_system_cpu_ns()
             },
-            "system_cpu_usage": read_system_cpu_ns()
-        },
-        "memory_stats": {
-            "usage": mem_bytes
-        },
-        "networks": {}
-    })))
+            "memory_stats": {
+                "usage": mem_bytes
+            },
+            "networks": {}
+        })),
+    )
 }
 
 fn read_cgroup_stats(cgroup: Option<&str>) -> (u64, u64) {
@@ -362,7 +429,9 @@ fn read_cgroup_stats(cgroup: Option<&str>) -> (u64, u64) {
 
 fn read_cpu_ns(cg: &str) -> u64 {
     let path = format!("/sys/fs/cgroup/{}/cpu.stat", cg);
-    let Ok(data) = std::fs::read_to_string(&path) else { return 0 };
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
     for line in data.lines() {
         if let Some(rest) = line.strip_prefix("usage_usec ") {
             if let Ok(usec) = rest.trim().parse::<u64>() {
@@ -382,11 +451,14 @@ fn read_mem_bytes(cg: &str) -> u64 {
 }
 
 fn read_system_cpu_ns() -> u64 {
-    let Ok(data) = std::fs::read_to_string("/proc/stat") else { return 0 };
+    let Ok(data) = std::fs::read_to_string("/proc/stat") else {
+        return 0;
+    };
     let line = data.lines().next().unwrap_or("");
     let fields: Vec<&str> = line.split_whitespace().collect();
     // Fields 1..=8: user nice system idle iowait irq softirq steal
-    let ticks: u64 = fields[1..].iter()
+    let ticks: u64 = fields[1..]
+        .iter()
         .take(8)
         .filter_map(|s| s.parse::<u64>().ok())
         .sum();
@@ -431,11 +503,14 @@ fn container_inspect_json(c: &ContainerState) -> Value {
     let ip = c.bridge_ip.clone().unwrap_or_default();
     let mut networks = serde_json::Map::new();
     if !ip.is_empty() {
-        networks.insert("bridge".to_string(), json!({
-            "IPAddress": ip,
-            "Gateway": "172.19.0.1",
-            "MacAddress": ""
-        }));
+        networks.insert(
+            "bridge".to_string(),
+            json!({
+                "IPAddress": ip,
+                "Gateway": "172.19.0.1",
+                "MacAddress": ""
+            }),
+        );
     }
     json!({
         "Id": c.name,
@@ -514,7 +589,10 @@ pub async fn remove_volume(Path(_name): Path<String>) -> StatusCode {
 
 /// GET /containers/{id}/archive — download file from container (kubelet fallback path)
 pub async fn archive(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_FOUND, Json(json!({"message": format!("archive not supported for '{}'", id)})))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"message": format!("archive not supported for '{}'", id)})),
+    )
 }
 
 struct Filters {
@@ -524,23 +602,41 @@ struct Filters {
 }
 
 fn parse_filters(raw: Option<&str>) -> Filters {
-    let mut f = Filters { labels: Vec::new(), names: Vec::new(), statuses: Vec::new() };
+    let mut f = Filters {
+        labels: Vec::new(),
+        names: Vec::new(),
+        statuses: Vec::new(),
+    };
     let Some(raw) = raw else { return f };
-    let Ok(parsed) = serde_json::from_str::<Value>(raw) else { return f };
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return f;
+    };
 
     if let Some(labels) = parsed.get("label").and_then(|v| v.as_array()) {
-        f.labels = labels.iter()
+        f.labels = labels
+            .iter()
             .filter_map(|v| v.as_str())
-            .filter_map(|s| { let (k, v) = s.split_once('=')?; Some((k.to_string(), v.to_string())) })
+            .filter_map(|s| {
+                let (k, v) = s.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
             .collect();
     }
     if let Some(names) = parsed.get("name").and_then(|v| v.as_array()) {
-        f.names = names.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+        f.names = names
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect();
     }
     if let Some(statuses) = parsed.get("status").and_then(|v| v.as_array()) {
         // Docker status values: "running","exited","created","paused","restarting","dead"
         // Map Docker status names to our docker_status_str() equivalents
-        f.statuses = statuses.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+        f.statuses = statuses
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect();
     }
     f
 }
@@ -549,9 +645,9 @@ fn matches_labels(
     container_labels: &std::collections::HashMap<String, String>,
     filters: &[(String, String)],
 ) -> bool {
-    filters.iter().all(|(k, v)| {
-        container_labels.get(k).map(|cv| cv == v).unwrap_or(false)
-    })
+    filters
+        .iter()
+        .all(|(k, v)| container_labels.get(k).map(|cv| cv == v).unwrap_or(false))
 }
 
 fn matches_name(container_name: &str, patterns: &[String]) -> bool {
@@ -559,8 +655,7 @@ fn matches_name(container_name: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pat| {
         // Docker name filter supports regex; handle the common prefix case (^/name)
         // and substring match
-        if pat.starts_with('^') {
-            let prefix = &pat[1..];
+        if let Some(prefix) = pat.strip_prefix('^') {
             full_name.starts_with(prefix) || container_name.starts_with(prefix)
         } else {
             full_name.contains(pat.as_str()) || container_name.contains(pat.as_str())

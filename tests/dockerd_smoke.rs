@@ -6,10 +6,12 @@
 
 #[cfg(target_os = "linux")]
 mod smoke {
-    use bollard::Docker;
-    use bollard::container::{CreateContainerOptions, Config, StartContainerOptions, RemoveContainerOptions};
+    use bollard::container::{
+        Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
+    };
     use bollard::exec::{CreateExecOptions, StartExecResults};
     use bollard::models::HostConfig;
+    use bollard::Docker;
     use futures_util::StreamExt;
 
     fn connect() -> Docker {
@@ -49,14 +51,20 @@ mod smoke {
         let _ = docker
             .remove_container(
                 name,
-                Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
             )
             .await;
 
         // Create
         docker
             .create_container(
-                Some(CreateContainerOptions { name, platform: None }),
+                Some(CreateContainerOptions {
+                    name,
+                    platform: None,
+                }),
                 Config {
                     image: Some("alpine:latest"),
                     cmd: Some(vec!["sleep", "10"]),
@@ -78,7 +86,10 @@ mod smoke {
 
         // Inspect
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let info = docker.inspect_container(name, None).await.expect("inspect_container()");
+        let info = docker
+            .inspect_container(name, None)
+            .await
+            .expect("inspect_container()");
         let state = info.state.expect("State missing");
         assert_eq!(state.running, Some(true), "container not running");
         let ip = info
@@ -96,7 +107,10 @@ mod smoke {
         docker
             .remove_container(
                 name,
-                Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
             )
             .await
             .expect("remove_container()");
@@ -109,13 +123,22 @@ mod smoke {
 
         // Clean up any leftover
         let _ = docker
-            .remove_container(container, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .remove_container(
+                container,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
             .await;
 
         // Create and start a long-lived container
         docker
             .create_container(
-                Some(CreateContainerOptions { name: container, platform: None }),
+                Some(CreateContainerOptions {
+                    name: container,
+                    platform: None,
+                }),
                 Config {
                     image: Some("alpine:latest"),
                     cmd: Some(vec!["sleep", "30"]),
@@ -128,7 +151,10 @@ mod smoke {
             )
             .await
             .expect("create_container");
-        docker.start_container(container, None::<StartContainerOptions<String>>).await.expect("start_container");
+        docker
+            .start_container(container, None::<StartContainerOptions<String>>)
+            .await
+            .expect("start_container");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         // exec: echo a known string to stdout
@@ -146,10 +172,8 @@ mod smoke {
             .expect("create_exec");
 
         let mut output_text = String::new();
-        if let StartExecResults::Attached { mut output, .. } = docker
-            .start_exec(&exec.id, None)
-            .await
-            .expect("start_exec")
+        if let StartExecResults::Attached { mut output, .. } =
+            docker.start_exec(&exec.id, None).await.expect("start_exec")
         {
             while let Some(Ok(msg)) = output.next().await {
                 output_text.push_str(&msg.to_string());
@@ -159,17 +183,31 @@ mod smoke {
         }
 
         println!("exec output: {:?}", output_text);
-        assert!(output_text.contains("hello-from-exec"), "unexpected output: {}", output_text);
+        assert!(
+            output_text.contains("hello-from-exec"),
+            "unexpected output: {}",
+            output_text
+        );
 
         // Inspect exec — should report completed (Running: false)
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let info = docker.inspect_exec(&exec.id).await.expect("inspect_exec");
-        assert_eq!(info.running, Some(false), "exec should not be running after completion");
+        assert_eq!(
+            info.running,
+            Some(false),
+            "exec should not be running after completion"
+        );
         assert_eq!(info.exit_code, Some(0), "exit code should be 0");
 
         // Cleanup
         docker
-            .remove_container(container, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .remove_container(
+                container,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("remove_container");
     }

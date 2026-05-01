@@ -1,7 +1,7 @@
 //! Axum router and handler modules for the Docker Engine API.
 
-use axum::{Router, routing, middleware, extract::Request, response::Response};
 use crate::state::AppState;
+use axum::{extract::Request, middleware, response::Response, routing, Router};
 
 async fn log_requests(req: Request, next: axum::middleware::Next) -> Response {
     let method = req.method().clone();

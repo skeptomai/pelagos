@@ -9,6 +9,7 @@ const CONTAINERS_DIR: &str = "/run/pelagos/containers";
 // ── ContainerState (subset) ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ContainerState {
     pub name: String,
     #[serde(rename = "status")]
@@ -91,6 +92,7 @@ impl ContainerState {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
 pub struct SpawnConfig {
     #[serde(default)]
     pub image: Option<String>,
@@ -258,8 +260,7 @@ pub async fn list_images_json(bin: &str) -> Result<Vec<serde_json::Value>, Strin
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    let parsed: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
-        .unwrap_or_default();
+    let parsed: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
     Ok(parsed)
 }
 
